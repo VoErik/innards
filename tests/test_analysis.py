@@ -169,3 +169,33 @@ def test_latent_attribution_token_mask(setup):
     assert not attr.keep[:, 0].any() and not attr.keep[:, 5].any() and attr.keep[:, 1].all()
     assert (attr.acts[:, 5] == 0).all() and (attr.error_attribution[:, 0] == 0).all()
     torch.testing.assert_close(attr.target, vit(x)[:, 3].detach(), atol=1e-5, rtol=1e-5)
+
+
+def test_analyze_dataset_chunking_is_exact(setup):
+    vit, _, loader, _, sae = setup
+    full = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude_positions=(0,))
+    chunked = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude_positions=(0,), chunk_tokens=7)
+    torch.testing.assert_close(chunked.stats.frequency, full.stats.frequency)
+    torch.testing.assert_close(chunked.stats.max_activation, full.stats.max_activation)
+    torch.testing.assert_close(chunked.top.values, full.top.values)
+    filled = full.top.values != 0
+    assert torch.equal(chunked.top.example[filled], full.top.example[filled])
+    assert (full.top.position[~filled] == -1).all()
+
+
+@pytest.mark.parametrize("bs", [64, 1000])  # 1000 > shard size: a batch spans several shards
+def test_cached_activations_order_and_prefetch(tmp_path, bs):
+    x = torch.arange(5000 * 3, dtype=torch.float32).view(5000, 3)
+    path = cache_activations([x[i : i + 300] for i in range(0, 5000, 300)], tmp_path / "c", shard_tokens=700,
+                             dtype=torch.float32)
+    ordered = list(CachedActivations(path, batch_tokens=bs, shuffle=False))
+    assert all(b.shape == (bs, 3) for b in ordered)
+    torch.testing.assert_close(torch.cat(ordered), x[: len(ordered) * bs])
+
+    cached = CachedActivations(path, batch_tokens=bs, seed=1)
+    for _ in range(2):  # each epoch serves distinct tokens, in a new order
+        rows = torch.cat(list(cached))[:, 0].long() // 3
+        assert rows.unique().numel() == rows.numel() == 5000 // bs * bs
+    for i, _ in enumerate(cached):  # stopping mid-epoch shuts the loader thread down cleanly
+        if i == 1:
+            break

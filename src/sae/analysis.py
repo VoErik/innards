@@ -111,7 +111,8 @@ class TopExamples:
         example: Index of the input in loader order, ``(d_sae, n_top)``; -1 for
             empty slots.
         position: Token position within that input (in the ``(batch, tokens,
-            d)`` layout, counting excluded positions), ``(d_sae, n_top)``.
+            d)`` layout, counting excluded positions), ``(d_sae, n_top)``;
+            -1 for empty slots.
     """
 
     values: Tensor
@@ -309,12 +310,15 @@ def analyze_dataset(
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
     device: str | torch.device | None = None,
     max_batches: int | None = None,
+    chunk_tokens: int = 4096,
 ) -> DatasetAnalysis:
     """
     One pass over a dataset collecting latent statistics and top examples.
 
     The loader must be deterministic (``shuffle=False``) so that
-    ``TopExamples.example`` indices can be mapped back to inputs.
+    ``TopExamples.example`` indices can be mapped back to inputs. Only kept
+    tokens are encoded, ``chunk_tokens`` at a time, so memory is bounded by
+    ``chunk_tokens * d_sae`` whatever the batch size and sequence length.
 
     Args:
         sae: The SAE.
@@ -329,6 +333,7 @@ def analyze_dataset(
         input_fn: Maps a batch to model ``(args, kwargs)``.
         device: Device to run on; defaults to the SAE's device.
         max_batches: Optional cap on the number of batches.
+        chunk_tokens: Tokens encoded at once.
 
     Returns:
         A :class:`DatasetAnalysis`.
@@ -344,32 +349,37 @@ def analyze_dataset(
     n_tokens = 0
     offset = 0
 
+    sae.eval()
+    model.eval()
     for i, batch in enumerate(input_loader):
         if max_batches is not None and i >= max_batches:
             break
         batch = _to_device(batch, device)
-        acts = encode_inputs(sae, model, hook_module, batch, layout, input_fn).float()
-        b, t, _ = acts.shape
-        keep = token_keep_mask(acts, exclude_positions, token_mask_fn, batch)
-        acts = acts * keep.unsqueeze(-1)
-        flat = rearrange(acts, "b t s -> (b t) s").abs()
+        tokens = to_tokens(run_capture(model, hook_module, batch, input_fn, stop=True), layout)
+        b, t, _ = tokens.shape
+        keep = token_keep_mask(tokens, exclude_positions, token_mask_fn, batch)
+        flat_idx = rearrange(keep, "b t -> (b t)").nonzero().squeeze(-1)  # into the (b t) grid
+        kept = tokens[keep].to(sae.w_enc.dtype)
+        n_tokens += kept.shape[0]
 
-        active = flat > 0
-        count += active.sum(0)
-        total += flat.sum(0)
-        peak = torch.maximum(peak, flat.max(0).values)
-        n_tokens += int(keep.sum())
+        for start in range(0, kept.shape[0], chunk_tokens):
+            acts = sae.encode(kept[start : start + chunk_tokens]).float()
+            mags = acts.abs()
+            count += (mags > 0).sum(0)
+            total += mags.sum(0)
+            peak = torch.maximum(peak, mags.max(0).values)
 
-        v, idx = flat.topk(min(n_top, flat.shape[0]), dim=0)
-        signed = rearrange(acts, "b t s -> (b t) s").gather(0, idx)
-        cand_v = torch.cat([top_v, signed])
-        cand_e = torch.cat([top_e, offset + idx // t])
-        cand_p = torch.cat([top_p, idx % t])
-        sel = cand_v.abs().topk(min(n_top, cand_v.shape[0]), dim=0).indices
-        top_v, top_e, top_p = cand_v.gather(0, sel), cand_e.gather(0, sel), cand_p.gather(0, sel)
+            _, idx = mags.topk(min(n_top, mags.shape[0]), dim=0)
+            where = flat_idx[start + idx]
+            cand_v = torch.cat([top_v, acts.gather(0, idx)])
+            cand_e = torch.cat([top_e, offset + where // t])
+            cand_p = torch.cat([top_p, where % t])
+            sel = cand_v.abs().topk(min(n_top, cand_v.shape[0]), dim=0).indices
+            top_v, top_e, top_p = cand_v.gather(0, sel), cand_e.gather(0, sel), cand_p.gather(0, sel)
         offset += b
 
-    top_e = torch.where(top_v != 0, top_e, torch.full_like(top_e, -1))
+    empty = top_v == 0
+    top_e, top_p = top_e.masked_fill(empty, -1), top_p.masked_fill(empty, -1)
     stats = LatentStats(
         frequency=(count / max(n_tokens, 1)).cpu(),
         mean_activation=(total / count.clamp_min(1)).cpu(),
