@@ -24,7 +24,7 @@ jobs:
           path: docs/_build/html
 
   deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'  # push or manual run on main
     needs: build
     runs-on: ubuntu-latest
     permissions:
