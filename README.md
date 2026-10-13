@@ -236,6 +236,11 @@ Each runs the full workflow: harvest → cache → train → evaluate → KL
 fine-tune → save/load → dictionary analysis → latent dashboards →
 attribution.
 
+## Roadmap
+
+Open work (frozen-attention graphs, KL fine-tuning for CLTs, ...) is tracked in
+[TODO.md](TODO.md).
+
 ## Tests
 
 ```bash
