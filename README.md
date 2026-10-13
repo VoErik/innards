@@ -188,6 +188,30 @@ with splice_clt(clt, ins, outs):                                    # run the re
     logits = model(**inputs)
 ```
 
+## Attribution graphs
+
+Which latents drive an output, and through which other latents? Splice
+dictionaries in at several sites; latents and error terms become graph
+nodes, edges are direct effects between them (Marks et al., 2024; Ameisen et
+al., 2025):
+
+```python
+from sae import attribution_graph, clt_site, sae_site
+
+sites = [sae_site(tcs[i], ins[i], outs[i], name=f"tc{i}") for i in range(n_layers)]  # transcoders
+# or [clt_site(clt, ins, outs)], or residual SAEs: sae_site(sae, model.blocks[i])
+graph = attribution_graph(model, sites, input_ids, lambda out, _: out.logits[0, -1, target_id])
+graph.top_nodes(10)                 # latents with the largest effect on the logit
+pruned = graph.prune(node_fraction=0.8)
+pruned.edges(threshold=0.01)        # (source, target, weight), strongest first
+json.dump(pruned.to_dict(), f)      # for a graph viewer
+```
+
+Where the model is linear between sites (MLPs replaced by transcoders or a
+CLT and a linear readout) attributions and edges are exact; through
+attention and layer norms they are the local linearization at the input
+(Ameisen et al. additionally freeze attention patterns and norms).
+
 ## SAELens interop
 
 ```python
