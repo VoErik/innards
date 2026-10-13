@@ -157,3 +157,15 @@ def test_viz_smoke(setup):
     viz.plot_top_images(imgs, maps, values=[1.0, 2.0, 3.0], suptitle="latent 0")
     html = viz.text_examples_html([(["a", "b<", "c"], [0.0, 1.0, -0.5], 1)], title="latent 0", context=1)
     assert "b&lt;" in html and "rgba(220,60,50,1.000)" in html
+
+
+def test_latent_attribution_token_mask(setup):
+    vit, images, *_, sae = setup
+    x = images[:2]
+    mask_fn = lambda batch: torch.arange(17)[None].expand(batch.shape[0], -1) != 5  # drop patch 5
+    attr = A.latent_attribution(sae, vit, vit.block, x, lambda o, _: o[:, 3], exclude_positions=(0,),
+                                token_mask_fn=mask_fn)
+    assert attr.acts.shape == (2, 17, sae.cfg.d_sae)
+    assert not attr.keep[:, 0].any() and not attr.keep[:, 5].any() and attr.keep[:, 1].all()
+    assert (attr.acts[:, 5] == 0).all() and (attr.error_attribution[:, 0] == 0).all()
+    torch.testing.assert_close(attr.target, vit(x)[:, 3].detach(), atol=1e-5, rtol=1e-5)

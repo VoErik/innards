@@ -241,6 +241,40 @@ def replace_activation(module: nn.Module, fn: Callable[[Tensor], Tensor]) -> Ite
         handle.remove()
 
 
+def patch_kept_tokens(
+    act: Tensor,
+    fn: Callable[[Tensor], Tensor],
+    layout: str = "btd",
+    exclude_positions: Sequence[int] = (),
+    token_mask_fn: Callable[[Any], Tensor] | None = None,
+    batch: Any = None,
+) -> Tensor:
+    """
+    Applies ``fn`` to the kept tokens of a captured activation.
+
+    Used as the body of a :func:`replace_activation` hook to splice an SAE
+    into a model: excluded positions (CLS, BOS, ...) and tokens masked out by
+    ``token_mask_fn`` (e.g. padding) pass through unchanged.
+
+    Args:
+        act: Module output in ``layout``.
+        fn: Maps kept tokens ``(n, d)`` to replacements ``(n, d)``.
+        layout: Activation layout.
+        exclude_positions: Positions left unchanged.
+        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
+            tokens to replace.
+        batch: The model input batch passed to ``token_mask_fn``.
+
+    Returns:
+        The patched activation, in ``layout``.
+    """
+    tokens = to_tokens(act, layout)
+    keep = token_keep_mask(tokens, exclude_positions, token_mask_fn, batch)
+    patched = tokens.clone()
+    patched[keep] = fn(tokens[keep]).to(tokens.dtype)
+    return from_tokens(patched, layout, act)
+
+
 def run_capture(
     model: nn.Module,
     hook_module: nn.Module,

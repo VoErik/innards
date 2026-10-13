@@ -13,6 +13,7 @@ from torch.utils.data import (
 from sae.data import (
     ActivationStore,
     from_tokens,
+    patch_kept_tokens,
     to_tokens
 )
 from sae.optim import (
@@ -284,3 +285,22 @@ def test_conv_layout_kl(tmp_path):
     kl_cfg = KLFinetuneConfig(steps=10, layout="bchw", log_every=5)
     tr.finetune_kl(cnn, cnn[1], img_loader, kl_cfg)
     assert tr.evaluate_downstream(cnn, cnn[1], img_loader, kl_cfg)["downstream/top1_agreement"] > 0.3
+
+
+def test_patch_kept_tokens_respects_masks():
+    act = torch.randn(2, 6, 4)
+    mask_fn = lambda batch: batch
+    batch = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.bool)  # padding in row 0
+    out = patch_kept_tokens(act, torch.zeros_like, "btd", exclude_positions=(0,), token_mask_fn=mask_fn,
+                            batch=batch)
+    assert torch.equal(out[:, 0], act[:, 0]) and torch.equal(out[0, 4:], act[0, 4:])
+    assert (out[0, 1:4] == 0).all() and (out[1, 1:] == 0).all()
+
+
+def test_streaming_without_total_tokens_raises(tmp_path):
+    net = nn.Sequential(nn.Linear(8, 16), nn.ReLU())
+    store = ActivationStore(net, net[1], [torch.randn(4, 10, 8) for _ in range(8)], batch_tokens=32,
+                            buffer_tokens=128)
+    tr = SAETrainer(TopKSAE(d_in=16, d_sae=64, k=4), tcfg(tmp_path))
+    with pytest.raises(ValueError, match="total_tokens"):
+        tr.train(store)

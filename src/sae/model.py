@@ -799,6 +799,22 @@ class TopKSAE(nn.Module):
         [recon] = unpack(recon, ps, "* d_in")
         return recon
 
+    def reconstruct(self, x: Tensor) -> Tensor:
+        """
+        Encodes and decodes without computing the loss.
+
+        Args:
+            x: Activations, shape ``(..., d_in)``.
+
+        Returns:
+            Reconstruction, shape ``(..., d_in)``, in input units and dtype.
+        """
+        flat_x, ps = pack([x], "* d_in")
+        code = self._select(self._pre_acts(self._scale_in(flat_x)))
+        recon_s = self._decode_sparse(code.cols, code.vals, code.offsets) + self.b_dec
+        [recon] = unpack((recon_s / self.input_scale).to(x.dtype), ps, "* d_in")
+        return recon
+
     def forward(self, x: Tensor, return_acts: bool = True) -> SAEOutput:
         """
         Encodes, decodes and computes the training objective.

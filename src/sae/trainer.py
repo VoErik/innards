@@ -64,10 +64,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from .data import (
     _to_device,
     default_input_fn,
-    from_tokens,
-    keep_positions,
+    patch_kept_tokens,
     replace_activation,
-    to_tokens,
 )
 from .optim import (
     build_optimizers,
@@ -184,6 +182,9 @@ class KLFinetuneConfig:
         layout: Activation layout at the hook (see ``sae.data.LAYOUTS``).
         exclude_positions: Token positions left unpatched (e.g. CLS / BOS),
             consistent with the positions excluded during training.
+        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
+            tokens to patch, e.g. non-padding tokens; others pass through
+            unchanged and do not enter the SAE loss.
         input_fn: Maps a loader batch to model ``(args, kwargs)``.
         output_fn: Maps the model output to logits ``(..., n_classes)``; e.g.
             ``lambda out: out.logits`` for Hugging Face models.
@@ -197,6 +198,7 @@ class KLFinetuneConfig:
     lr_scale: float = 0.25
     layout: str = "btd"
     exclude_positions: Sequence[int] = ()
+    token_mask_fn: Callable[[Any], Tensor] | None = None
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn
     output_fn: Callable[[Any], Tensor] = lambda out: out
     kl_mask_fn: Callable[[Any], Tensor] | None = None
@@ -498,7 +500,12 @@ class SAETrainer:
                 first, _ = pack([_unwrap_batch(next(iter(dataloader)))], "* d_in")
                 batch_tokens = first.shape[0]
             return math.ceil(self.cfg.total_tokens / batch_tokens)
-        return len(dataloader) * self.cfg.num_epochs  # type: ignore[arg-type]
+        if not hasattr(dataloader, "__len__"):
+            raise ValueError(
+                f"{type(dataloader).__name__} has no len(), so the number of steps per epoch is unknown; "
+                "set TrainerConfig.total_tokens when streaming (e.g. from an ActivationStore)"
+            )
+        return len(dataloader) * self.cfg.num_epochs
 
     def train(self, dataloader: Iterable) -> TopKSAE:
         """
@@ -615,14 +622,13 @@ class SAETrainer:
                 args, kwargs = kc.input_fn(batch)
                 captured: dict[str, Any] = {}
 
+                def reconstruct(x: Tensor) -> Tensor:
+                    captured["out"] = sae(x, return_acts=False)
+                    return captured["out"].recon
+
                 def patch(act: Tensor) -> Tensor:
-                    tokens = to_tokens(act, kc.layout)
-                    pos = keep_positions(tokens.shape[1], kc.exclude_positions, tokens.device)
-                    out = sae(tokens[:, pos], return_acts=False)
-                    captured["out"] = out
-                    patched = tokens.clone()
-                    patched[:, pos] = out.recon.to(tokens.dtype)
-                    return from_tokens(patched, kc.layout, act)
+                    return patch_kept_tokens(act, reconstruct, kc.layout, kc.exclude_positions,
+                                             kc.token_mask_fn, batch)
 
                 with self._autocast():
                     with torch.no_grad():
@@ -726,8 +732,8 @@ class SAETrainer:
             model: The model the activations come from.
             hook_module: The module whose output the SAE reconstructs.
             input_loader: Iterable of model inputs.
-            kl_cfg: Supplies ``layout``, ``exclude_positions``, ``input_fn``,
-                ``output_fn`` and ``kl_mask_fn``.
+            kl_cfg: Supplies ``layout``, ``exclude_positions``,
+                ``token_mask_fn``, ``input_fn``, ``output_fn`` and ``kl_mask_fn``.
             max_batches: Optional cap on the number of batches.
 
         Returns:
@@ -741,18 +747,16 @@ class SAETrainer:
         kl_sum = agree = rows = 0.0
         n_batches = 0
 
-        def patch(act: Tensor) -> Tensor:
-            tokens = to_tokens(act, kc.layout)
-            pos = keep_positions(tokens.shape[1], kc.exclude_positions, tokens.device)
-            patched = tokens.clone()
-            patched[:, pos] = sae(tokens[:, pos], return_acts=False).recon.to(tokens.dtype)
-            return from_tokens(patched, kc.layout, act)
-
         for i, batch in enumerate(input_loader):
             if max_batches is not None and i >= max_batches:
                 break
             batch = _to_device(batch, self.device)
             args, kwargs = kc.input_fn(batch)
+
+            def patch(act: Tensor) -> Tensor:
+                return patch_kept_tokens(act, sae.reconstruct, kc.layout, kc.exclude_positions,
+                                         kc.token_mask_fn, batch)
+
             with self._autocast():
                 clean = kc.output_fn(model(*args, **kwargs)).float()
                 with replace_activation(hook_module, patch):

@@ -42,7 +42,8 @@ store = ActivationStore(
 cache_activations(store, "activations/model_block6")
 acts = CachedActivations("activations/model_block6", batch_tokens=4096, device="cuda")
 
-# 3. Train (or pass `store` directly to stream without caching).
+# 3. Train (or pass `store` directly to stream without caching; streaming
+#    needs TrainerConfig(total_tokens=...) since a store has no length).
 sae = TopKSAE(
     d_in=model.embed_dim, 
     d_sae=16 * model.embed_dim, # SAE expansion
