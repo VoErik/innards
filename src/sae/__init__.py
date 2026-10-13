@@ -7,6 +7,7 @@ Core modules:
   new architectures register here.
 * :mod:`sae.decoders`: unit-norm linear and Archetypal dictionaries.
 * :mod:`sae.trainer`: training, KL fine-tuning and evaluation.
+* :mod:`sae.group`: one SAE per hook point, trained from a single pass.
 * :mod:`sae.data`: activation harvesting from vision and language models.
 * :mod:`sae.cache`: caching harvested activations to disk.
 * :mod:`sae.optim`: Adam, Muon and Signum (I only use Adam, but sparsify use Muon / Signum as well)
@@ -41,6 +42,7 @@ from .decoders import (
     DECODERS,
     Decoder
 )
+from .group import SAEGroup
 from .latent_cache import (
     LatentCache,
     cache_latents
@@ -67,6 +69,7 @@ __all__ = [
     "LatentCache",
     "SAE",
     "SAEConfig",
+    "SAEGroup",
     "SAEOutput",
     "SAETrainer",
     "TrainerConfig",

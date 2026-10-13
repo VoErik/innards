@@ -55,6 +55,7 @@ from dataclasses import (
     fields
 )
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -84,6 +85,15 @@ from .decoders import DECODERS
 
 FORMAT_NAME = "sae"
 FORMAT_VERSION = "2"
+
+# Model classes the trainer can rebuild from a checkpoint, by class name.
+MODEL_TYPES: dict[str, type[nn.Module]] = {}
+
+
+def register_model_type(cls: type[nn.Module]) -> type[nn.Module]:
+    """Class decorator registering a trainable model for :meth:`sae.trainer.SAETrainer.from_checkpoint`."""
+    MODEL_TYPES[cls.__name__] = cls
+    return cls
 
 
 @dataclass
@@ -255,14 +265,17 @@ class SAEOutput:
         metrics: Detached scalar metrics (``nmse``, ``l0``, ``loss`` and,
             when active, ``sparsity_loss``, ``aux_loss``, ``matryoshka_loss``,
             ``multi_topk_nmse``).
-        latent_counts: Number of tokens each latent fired on, shape ``(d_sae,)``.
+        latent_counts: Number of tokens each latent fired on, shape ``(d_sae,)``
+            (for models with several dictionaries, the counts of all of them).
+        parts: Per-member outputs of models made of several dictionaries.
     """
 
     acts: Tensor | None
-    recon: Tensor
+    recon: Tensor | None
     loss: Tensor
     metrics: dict[str, Tensor]
     latent_counts: Tensor
+    parts: dict[str, "SAEOutput"] | None = None
 
 
 def normalized_mse(recon: Tensor, target: Tensor, denom: Tensor | None = None) -> Tensor:
@@ -316,6 +329,7 @@ def geometric_median(points: Tensor, max_iter: int = 100, tol: float = 1e-6) -> 
     return median
 
 
+@register_model_type
 class SAE(nn.Module):
     """
     Sparse autoencoder with a pluggable activation and decoder.
@@ -504,6 +518,94 @@ class SAE(nn.Module):
     def post_optimizer_step(self) -> None:
         """Constraint projections to run after every optimizer step."""
         self.decoder.post_step()
+
+    # ---- trainer protocol (see sae.trainer.SAETrainer) ----
+
+    def batch_tensors(self, batch: Any) -> tuple[Tensor, ...]:
+        """
+        Turns a data batch into the tensors :meth:`forward` takes, flattened to tokens.
+
+        Args:
+            batch: A tensor, an ``(input, target)`` pair, a ``(tensor,)``
+                tuple (``TensorDataset``) or a dict with ``"activations"``
+                (and ``"targets"``).
+
+        Returns:
+            ``(x,)`` for an SAE, ``(x, y)`` for a transcoder.
+
+        Raises:
+            ValueError: If a transcoder gets no targets.
+            TypeError: For unsupported batch types.
+        """
+        if isinstance(batch, Tensor):
+            x, y = batch, None
+        elif isinstance(batch, (tuple, list)):
+            x, y = batch[0], (batch[1] if len(batch) > 1 else None)
+        elif isinstance(batch, dict):
+            x, y = batch["activations"], batch.get("targets")
+        else:
+            raise TypeError(f"unsupported batch type {type(batch)}")
+        x = pack([x], "* d_in")[0]
+        if not self.cfg.transcoder:
+            return (x,)
+        if y is None:
+            raise ValueError("a transcoder needs (input, target) batches, e.g. ActivationStore(target_module=...)")
+        return x, pack([y], "* d_out")[0]
+
+    @property
+    def min_init_tokens(self) -> int:
+        """Minimum number of tokens :meth:`initialize_from_data` needs."""
+        return self.decoder.min_init_tokens
+
+    @property
+    def uses_k(self) -> bool:
+        """Whether the activation selects a fixed number ``k`` of latents."""
+        return self.activation.uses_k
+
+    @property
+    def lr_d_sae(self) -> int:
+        """Dictionary size that sets the default learning rate."""
+        return self.cfg.d_sae
+
+    def anneal_k(self, progress: float, k_initial: int | None = None) -> None:
+        """
+        Sets k for linear k annealing.
+
+        Args:
+            progress: Fraction of the annealing done, in ``[0, 1]``.
+            k_initial: Starting k; ``None`` uses ``min(d_sae, 10 * d_in)`` as
+                in ``sparsify``.
+        """
+        if self.uses_k:
+            k0 = k_initial or min(self.cfg.d_sae, 10 * self.cfg.d_in)
+            self.set_k(round(k0 * (1 - progress) + self.cfg.k * progress))
+
+    def config_json(self) -> str:
+        """The configuration as JSON (see :meth:`from_config_json`)."""
+        return self.cfg.to_json()
+
+    @classmethod
+    def from_config_json(cls, s: str) -> "SAE":
+        """Builds an untrained model from :meth:`config_json` output."""
+        return cls(SAEConfig.from_json(s))
+
+    @torch.no_grad()
+    def eval_sums(self, out: SAEOutput, *tensors: Tensor) -> dict[str, tuple[float, float, float]]:
+        """
+        Sums for dataset-level evaluation of one batch.
+
+        Args:
+            out: Output of ``forward(*tensors)``.
+            *tensors: The batch tensors.
+
+        Returns:
+            ``{"": (squared error, total sum of squares, active latents)}``;
+            models with several dictionaries return one entry per member.
+        """
+        y = tensors[-1].float()
+        sse = ((out.recon.float() - y) ** 2).sum().item()
+        sst = ((y - reduce(y, "n d -> 1 d", "mean")) ** 2).sum().item()
+        return {"": (sse, sst, out.latent_counts.sum().item())}
 
     def set_k(self, k: int) -> None:
         """

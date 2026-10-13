@@ -129,6 +129,26 @@ Override `update_stats` for running statistics and `fold_` for thresholds
 that must be rescaled when saving. New decoder parametrizations subclass
 `Decoder` and go into `sae.decoders.DECODERS`.
 
+## Many layers at once
+
+Harvesting is usually the expensive part, so capture several hook points in
+one pass and train one SAE per hook in the same loop:
+
+```python
+from sae import SAEGroup
+
+hooks = {f"block{i}": model.blocks[i] for i in range(12)}
+store = ActivationStore(model, hooks, loader, exclude_positions=(0,))  # dict batches
+group = SAEGroup({name: SAE(d_in=768, d_sae=16384, k=32) for name in hooks})
+trainer = SAETrainer(group, TrainerConfig(total_tokens=200_000_000))
+trainer.train(store)              # or cache_activations(store, ...) first
+trainer.evaluate(val_store)       # eval/block0/fve, ...
+group["block3"].save("block3.safetensors")
+```
+
+Tokens from all hooks are shuffled jointly, so every batch holds the same
+tokens at every layer (cross-layer models rely on this).
+
 ## Transcoders
 
 A transcoder reads one activation and predicts another, e.g. an MLP's output
