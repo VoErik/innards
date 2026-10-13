@@ -1,7 +1,7 @@
 [project]
-name = "topk-sae"
-version = "0.1.0"
-description = "TopK / BatchTopK sparse autoencoders built around einops, for vision and language models"
+name = "sae"
+version = "0.2.0"
+description = "Sparse autoencoders (TopK, BatchTopK, JumpReLU, ReLU; Matryoshka, Archetypal) for vision and language models"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -25,7 +25,7 @@ vision = ["timm>=1.0", "torchvision>=0.17", "pillow>=10"]
 language = ["transformers>=4.40", "datasets>=2.18"]
 # Everything the example notebooks need.
 notebooks = [
-    "topk-sae[viz,vision,language,tensorboard]",
+    "sae[viz,vision,language,tensorboard]",
     "jupyterlab>=4",
     "ipykernel>=6",
 ]
@@ -33,7 +33,7 @@ notebooks = [
 [dependency-groups]
 dev = [
     "pytest>=8",
-    "topk-sae[viz,tensorboard]",
+    "sae[viz,tensorboard]",
     "jupytext>=1.16",
     "nbclient>=0.10",
     "ipykernel>=6",

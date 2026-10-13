@@ -13,7 +13,7 @@ from sae import analysis as A
 from sae import viz
 from sae.cache import CachedActivations, cache_activations
 from sae.data import ActivationStore
-from sae.model import TopKSAE
+from sae.model import SAE
 from sae.trainer import SAETrainer, TrainerConfig
 
 
@@ -41,7 +41,7 @@ def setup(tmp_path_factory):
     images = torch.randn(96, 3, 16, 16)
     loader = DataLoader(TensorDataset(images), batch_size=16, shuffle=False)
     store = ActivationStore(vit, vit.block, loader, batch_tokens=128, buffer_tokens=512, exclude_positions=(0,))
-    sae = TopKSAE(d_in=32, d_sae=64, k=4)
+    sae = SAE(d_in=32, d_sae=64, k=4)
     out = tmp_path_factory.mktemp("ck")
     SAETrainer(sae, TrainerConfig(total_tokens=20_000, device="cpu", log_every=10**6, output_dir=str(out))).train(store)
     return vit, images, loader, store, sae.eval()
@@ -96,7 +96,7 @@ def test_dictionary_geometry(setup):
 def test_output_effects(setup):
     vit, *_, sae = setup
     eff = A.output_effects(sae, vit.head.weight, latents=[0, 5], n=3)
-    direct = sae.w_dec[5] @ vit.head.weight.T
+    direct = sae.decoder_weight()[5] @ vit.head.weight.T
     assert eff.top_values.shape == (2, 3)
     assert eff.top_values[1, 0].item() == pytest.approx(direct.max().item(), rel=1e-5)
 

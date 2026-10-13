@@ -61,7 +61,7 @@ from .data import (
     to_tokens,
     token_keep_mask,
 )
-from .model import TopKSAE
+from .model import SAE
 
 
 @dataclass
@@ -268,7 +268,7 @@ def tokens_to_grid(values: Tensor, grid: tuple[int, int] | None = None) -> Tenso
 
 @torch.no_grad()
 def encode_inputs(
-    sae: TopKSAE,
+    sae: SAE,
     model: nn.Module,
     hook_module: nn.Module,
     batch: Any,
@@ -298,7 +298,7 @@ def encode_inputs(
 
 @torch.no_grad()
 def analyze_dataset(
-    sae: TopKSAE,
+    sae: SAE,
     model: nn.Module,
     hook_module: nn.Module,
     input_loader: Iterable,
@@ -385,12 +385,12 @@ def analyze_dataset(
 
 
 @torch.no_grad()
-def _unit_atoms(sae: TopKSAE) -> Tensor:
+def _unit_atoms(sae: SAE) -> Tensor:
     return F.normalize(sae.decoder_weight().detach().float(), dim=-1)
 
 
 @torch.no_grad()
-def max_cosine_similarity(sae: TopKSAE, chunk: int = 4096) -> tuple[Tensor, Tensor]:
+def max_cosine_similarity(sae: SAE, chunk: int = 4096) -> tuple[Tensor, Tensor]:
     """
     Highest cosine similarity of each decoder atom to any other atom.
 
@@ -416,7 +416,7 @@ def max_cosine_similarity(sae: TopKSAE, chunk: int = 4096) -> tuple[Tensor, Tens
 
 
 @torch.no_grad()
-def nearest_latents(sae: TopKSAE, latent: int, n: int = 10) -> tuple[Tensor, Tensor]:
+def nearest_latents(sae: SAE, latent: int, n: int = 10) -> tuple[Tensor, Tensor]:
     """
     Latents whose decoder atoms are most similar to ``latent``'s.
 
@@ -436,7 +436,7 @@ def nearest_latents(sae: TopKSAE, latent: int, n: int = 10) -> tuple[Tensor, Ten
 
 
 @torch.no_grad()
-def decoder_similarity_matrix(sae: TopKSAE, latents: Sequence[int] | Tensor) -> Tensor:
+def decoder_similarity_matrix(sae: SAE, latents: Sequence[int] | Tensor) -> Tensor:
     """
     Pairwise cosine similarity of a subset of decoder atoms.
 
@@ -452,7 +452,7 @@ def decoder_similarity_matrix(sae: TopKSAE, latents: Sequence[int] | Tensor) -> 
 
 
 @torch.no_grad()
-def encoder_decoder_cosine(sae: TopKSAE) -> Tensor:
+def encoder_decoder_cosine(sae: SAE) -> Tensor:
     """
     Cosine similarity between each latent's encoder and decoder direction.
 
@@ -470,7 +470,7 @@ def encoder_decoder_cosine(sae: TopKSAE) -> Tensor:
 
 
 @torch.no_grad()
-def dictionary_embedding(sae: TopKSAE, method: str = "pca", n_components: int = 2, seed: int = 0) -> Tensor:
+def dictionary_embedding(sae: SAE, method: str = "pca", n_components: int = 2, seed: int = 0) -> Tensor:
     """
     Low-dimensional embedding of the unit-normalised decoder atoms.
 
@@ -509,7 +509,7 @@ def dictionary_embedding(sae: TopKSAE, method: str = "pca", n_components: int = 
 
 @torch.no_grad()
 def output_effects(
-    sae: TopKSAE,
+    sae: SAE,
     readout: Tensor,
     latents: Sequence[int] | Tensor | None = None,
     n: int = 10,
@@ -546,7 +546,7 @@ def output_effects(
 
 
 def latent_attribution(
-    sae: TopKSAE,
+    sae: SAE,
     model: nn.Module,
     hook_module: nn.Module,
     batch: Any,
@@ -621,7 +621,7 @@ def latent_attribution(
 
 
 def input_attribution(
-    sae: TopKSAE,
+    sae: SAE,
     model: nn.Module,
     hook_module: nn.Module,
     inputs: Tensor,
@@ -645,7 +645,7 @@ def input_attribution(
         layout: Activation layout at the hook.
         exclude_positions: Positions to ignore.
         use_preactivation: Differentiate the encoder pre-activation instead of
-            the post-TopK activation, so the map is informative even where
+            the post-activation value, so the map is informative even where
             the latent is not selected.
 
     Returns:
@@ -667,7 +667,7 @@ def input_attribution(
 
 @torch.no_grad()
 def latent_patch_maps(
-    sae: TopKSAE,
+    sae: SAE,
     model: nn.Module,
     hook_module: nn.Module,
     images: Tensor,

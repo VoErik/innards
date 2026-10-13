@@ -5668,6 +5668,105 @@ wheels = [
 ]
 
 [[package]]
+name = "sae"
+version = "0.2.0"
+source = { editable = "." }
+dependencies = [
+    { name = "einops" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "safetensors" },
+    { name = "torch" },
+]
+
+[package.optional-dependencies]
+language = [
+    { name = "datasets" },
+    { name = "transformers" },
+]
+mlflow = [
+    { name = "mlflow" },
+]
+notebooks = [
+    { name = "datasets" },
+    { name = "ipykernel", version = "7.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "ipykernel", version = "7.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "ipython", version = "8.39.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "ipython", version = "9.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "jupyterlab" },
+    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "matplotlib", version = "3.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pillow" },
+    { name = "tensorboard" },
+    { name = "timm" },
+    { name = "torchvision" },
+    { name = "transformers" },
+]
+tensorboard = [
+    { name = "tensorboard" },
+]
+umap = [
+    { name = "umap-learn" },
+]
+vision = [
+    { name = "pillow" },
+    { name = "timm" },
+    { name = "torchvision" },
+]
+viz = [
+    { name = "ipython", version = "8.39.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "ipython", version = "9.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "matplotlib", version = "3.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+wandb = [
+    { name = "wandb" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "ipykernel", version = "7.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "ipykernel", version = "7.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "jupytext" },
+    { name = "nbclient" },
+    { name = "pytest" },
+    { name = "sae", extra = ["tensorboard", "viz"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "datasets", marker = "extra == 'language'", specifier = ">=2.18" },
+    { name = "einops", specifier = ">=0.7" },
+    { name = "ipykernel", marker = "extra == 'notebooks'", specifier = ">=6" },
+    { name = "ipython", marker = "extra == 'viz'", specifier = ">=8" },
+    { name = "jupyterlab", marker = "extra == 'notebooks'", specifier = ">=4" },
+    { name = "matplotlib", marker = "extra == 'viz'", specifier = ">=3.8" },
+    { name = "mlflow", marker = "extra == 'mlflow'", specifier = ">=2.10" },
+    { name = "numpy", specifier = ">=1.24" },
+    { name = "pillow", marker = "extra == 'vision'", specifier = ">=10" },
+    { name = "sae", extras = ["viz", "vision", "language", "tensorboard"], marker = "extra == 'notebooks'" },
+    { name = "safetensors", specifier = ">=0.4" },
+    { name = "tensorboard", marker = "extra == 'tensorboard'", specifier = ">=2.15" },
+    { name = "timm", marker = "extra == 'vision'", specifier = ">=1.0" },
+    { name = "torch", specifier = ">=2.2" },
+    { name = "torchvision", marker = "extra == 'vision'", specifier = ">=0.17" },
+    { name = "transformers", marker = "extra == 'language'", specifier = ">=4.40" },
+    { name = "umap-learn", marker = "extra == 'umap'", specifier = ">=0.5" },
+    { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.16" },
+]
+provides-extras = ["wandb", "mlflow", "tensorboard", "viz", "umap", "vision", "language", "notebooks"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "ipykernel", specifier = ">=6" },
+    { name = "jupytext", specifier = ">=1.16" },
+    { name = "nbclient", specifier = ">=0.10" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "sae", extras = ["viz", "tensorboard"] },
+]
+
+[[package]]
 name = "safetensors"
 version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -6507,105 +6606,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/1c/b8/63a75cfb27a17c38550e44025d3a6e7be64516fd8608a3b75703bf37d81b/tomli-2.5.0-cp315-cp315t-win_amd64.whl", hash = "sha256:f3fcbc57b1791fa6cbe5d8434179d51de12be1a4811469529f47f6e7487a2571", size = 117281, upload-time = "2026-10-07T12:23:34.648Z" },
     { url = "https://files.pythonhosted.org/packages/72/01/e8c1debb2173973372934c68fc8e46170ab60ef23ed4592dff4dec6e8993/tomli-2.5.0-cp315-cp315t-win_arm64.whl", hash = "sha256:d2ba24db8a9376921b5e87b4762b9adb0f3f1deaea68f2b8b0bb2c11efb9c3e7", size = 115069, upload-time = "2026-10-07T12:23:35.77Z" },
     { url = "https://files.pythonhosted.org/packages/60/3f/3e3f8fd0919249b0200c80fbc4f9a1e70be19f9883da71dfb7f8b9ab8aca/tomli-2.5.0-py3-none-any.whl", hash = "sha256:32a7b79ac57a2e83670ce329ccf675798bc5a2094783a63676866b70503f2e2b", size = 14765, upload-time = "2026-10-07T12:23:36.875Z" },
-]
-
-[[package]]
-name = "topk-sae"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "einops" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
-    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "safetensors" },
-    { name = "torch" },
-]
-
-[package.optional-dependencies]
-language = [
-    { name = "datasets" },
-    { name = "transformers" },
-]
-mlflow = [
-    { name = "mlflow" },
-]
-notebooks = [
-    { name = "datasets" },
-    { name = "ipykernel", version = "7.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "ipykernel", version = "7.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "ipython", version = "8.39.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "ipython", version = "9.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "jupyterlab" },
-    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "matplotlib", version = "3.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "pillow" },
-    { name = "tensorboard" },
-    { name = "timm" },
-    { name = "torchvision" },
-    { name = "transformers" },
-]
-tensorboard = [
-    { name = "tensorboard" },
-]
-umap = [
-    { name = "umap-learn" },
-]
-vision = [
-    { name = "pillow" },
-    { name = "timm" },
-    { name = "torchvision" },
-]
-viz = [
-    { name = "ipython", version = "8.39.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "ipython", version = "9.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "matplotlib", version = "3.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-]
-wandb = [
-    { name = "wandb" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "ipykernel", version = "7.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "ipykernel", version = "7.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "jupytext" },
-    { name = "nbclient" },
-    { name = "pytest" },
-    { name = "topk-sae", extra = ["tensorboard", "viz"] },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "datasets", marker = "extra == 'language'", specifier = ">=2.18" },
-    { name = "einops", specifier = ">=0.7" },
-    { name = "ipykernel", marker = "extra == 'notebooks'", specifier = ">=6" },
-    { name = "ipython", marker = "extra == 'viz'", specifier = ">=8" },
-    { name = "jupyterlab", marker = "extra == 'notebooks'", specifier = ">=4" },
-    { name = "matplotlib", marker = "extra == 'viz'", specifier = ">=3.8" },
-    { name = "mlflow", marker = "extra == 'mlflow'", specifier = ">=2.10" },
-    { name = "numpy", specifier = ">=1.24" },
-    { name = "pillow", marker = "extra == 'vision'", specifier = ">=10" },
-    { name = "safetensors", specifier = ">=0.4" },
-    { name = "tensorboard", marker = "extra == 'tensorboard'", specifier = ">=2.15" },
-    { name = "timm", marker = "extra == 'vision'", specifier = ">=1.0" },
-    { name = "topk-sae", extras = ["viz", "vision", "language", "tensorboard"], marker = "extra == 'notebooks'" },
-    { name = "torch", specifier = ">=2.2" },
-    { name = "torchvision", marker = "extra == 'vision'", specifier = ">=0.17" },
-    { name = "transformers", marker = "extra == 'language'", specifier = ">=4.40" },
-    { name = "umap-learn", marker = "extra == 'umap'", specifier = ">=0.5" },
-    { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.16" },
-]
-provides-extras = ["wandb", "mlflow", "tensorboard", "viz", "umap", "vision", "language", "notebooks"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "ipykernel", specifier = ">=6" },
-    { name = "jupytext", specifier = ">=1.16" },
-    { name = "nbclient", specifier = ">=0.10" },
-    { name = "pytest", specifier = ">=8" },
-    { name = "topk-sae", extras = ["viz", "tensorboard"] },
 ]
 
 [[package]]
