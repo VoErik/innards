@@ -71,9 +71,13 @@ from .optim import (
     build_optimizers,
     default_lr
 )
-from .model import SAE
+from .model import (
+    SAE,
+    SAEConfig
+)
 
 LOGGING_BACKENDS: set = {"wandb", "mlflow", "tensorboard"}
+CHECKPOINT_FORMAT = "sae-trainer-checkpoint"
 
 @dataclass
 class TrainerConfig:
@@ -124,7 +128,11 @@ class TrainerConfig:
         dense_threshold: Latents firing on more than this fraction of tokens
             are counted as dense.
         output_dir: Checkpoint directory.
-        save_every: Steps between checkpoints; ``None`` saves only at the end.
+        save_every: Steps between exported SAE files (``sae_step*.safetensors``);
+            ``None`` saves only the final one.
+        checkpoint_every: Steps between full training checkpoints
+            (``checkpoint.pt``, overwritten each time, plus one at the end) for
+            :meth:`SAETrainer.from_checkpoint`; ``None`` disables them.
     """
 
     total_tokens: int | None = None
@@ -163,6 +171,7 @@ class TrainerConfig:
 
     output_dir: str = "checkpoints"
     save_every: int | None = None
+    checkpoint_every: int | None = None
 
 # TODO: maybe merge this into the training config?
 @dataclass
@@ -475,6 +484,78 @@ class SAETrainer:
         meta = {"step": str(self.step), "tokens_seen": str(self.tokens_seen), **metadata}
         return self.export_model().save(path, extra_metadata=meta)
 
+    def save_checkpoint(self, path: str | Path | None = None) -> Path:
+        """
+        Saves everything needed to resume :meth:`train`.
+
+        Unlike :meth:`save`, the weights are stored unfolded together with
+        optimizer states, EMA weights, step counters, the outlier-filter
+        median and the RNG state. The file is written atomically.
+
+        Args:
+            path: Destination; defaults to ``output_dir/checkpoint.pt``.
+
+        Returns:
+            The path written.
+        """
+        path = Path(path) if path is not None else Path(self.cfg.output_dir) / "checkpoint.pt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "format": CHECKPOINT_FORMAT,
+            "sae_config": self.model.cfg.to_json(),
+            "trainer_config": asdict(self.cfg),
+            "model": self.model.state_dict(),
+            "optimizers": [opt.state_dict() for opt, _ in self.optimizers],
+            "ema": self.ema,
+            "step": self.step,
+            "tokens_seen": self.tokens_seen,
+            "median_norm": self.median_norm,
+            "rng": torch.get_rng_state(),
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        torch.save(state, tmp)
+        tmp.replace(path)
+        return path
+
+    @classmethod
+    def from_checkpoint(cls, path: str | Path, cfg: TrainerConfig | None = None) -> "SAETrainer":
+        """
+        Restores a trainer written by :meth:`save_checkpoint`.
+
+        Call :meth:`train` with the same data and ``total_tokens`` /
+        ``num_epochs`` to continue: the learning-rate schedule, k annealing
+        and sparsity warmup resume at the saved step. The data stream starts
+        again from its beginning, so with shuffled sources the remaining steps
+        see a fresh pass rather than the exact continuation.
+
+        Args:
+            path: Checkpoint file.
+            cfg: Trainer configuration; ``None`` reuses the saved one. Keep the
+                optimizer and schedule settings unchanged.
+
+        Returns:
+            The restored trainer.
+
+        Raises:
+            ValueError: If the file is not a trainer checkpoint.
+        """
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(state, dict) or state.get("format") != CHECKPOINT_FORMAT:
+            raise ValueError(f"{path} is not a trainer checkpoint")
+        model = SAE(SAEConfig.from_json(state["sae_config"]))
+        model.load_state_dict(state["model"])
+        trainer = cls(model, cfg if cfg is not None else TrainerConfig(**state["trainer_config"]))
+        for (opt, _), opt_state in zip(trainer.optimizers, state["optimizers"], strict=True):
+            opt.load_state_dict(opt_state)
+        if trainer.ema is not None and state["ema"] is not None:
+            for name, value in state["ema"].items():
+                trainer.ema[name].copy_(value)
+        trainer.step = state["step"]
+        trainer.tokens_seen = state["tokens_seen"]
+        trainer.median_norm = state["median_norm"]
+        torch.set_rng_state(state["rng"])
+        return trainer
+
     def _k_at(self, step: int) -> int:
         """k at ``step`` under linear k annealing."""
         cfg, mcfg = self.cfg, self.model.cfg
@@ -523,15 +604,18 @@ class SAETrainer:
 
         Returns:
             The trained model (EMA weights if enabled). A final checkpoint is
-            written to ``output_dir/sae.safetensors``.
+            written to ``output_dir/sae.safetensors``. A trainer restored with
+            :meth:`from_checkpoint` continues from its saved step.
         """
         cfg, model = self.cfg, self.model
         if self.median_norm is None:
             self.initialize(dataloader)
         total_steps = self._total_steps(dataloader)
         warmup = max(1, min(cfg.warmup_steps, total_steps // 20)) # 5% cap
+        # last_epoch resumes the schedule after from_checkpoint (-1 on a fresh run).
         schedulers = [
-            LambdaLR(opt, _linear_schedule(total_steps, warmup if use_warmup else 0, cfg.decay_frac))
+            LambdaLR(opt, _linear_schedule(total_steps, warmup if use_warmup else 0, cfg.decay_frac),
+                     last_epoch=self.step - 1)
             for opt, use_warmup in self.optimizers
         ]
 
@@ -570,12 +654,16 @@ class SAETrainer:
 
                 if cfg.save_every and self.step % cfg.save_every == 0:
                     self.save(Path(cfg.output_dir) / f"sae_step{self.step}.safetensors")
+                if cfg.checkpoint_every and self.step % cfg.checkpoint_every == 0:
+                    self.save_checkpoint()
         finally:
             if uses_k:
                 model.set_k(model.cfg.k)
             model.sparsity_scale = 1.0
             logger.close()
 
+        if cfg.checkpoint_every:
+            self.save_checkpoint()
         self.save(Path(cfg.output_dir) / "sae.safetensors")
         return self.export_model()
 

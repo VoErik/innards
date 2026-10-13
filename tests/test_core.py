@@ -381,3 +381,49 @@ def test_custom_activation_plugs_in(tmp_path):
         torch.testing.assert_close(loaded.encode(x[:64]), m.encode(x[:64]), atol=1e-4, rtol=1e-4)
     finally:
         ACTIVATIONS.pop("shifted_relu")
+
+
+class _Interrupt(Exception):
+    pass
+
+
+class _Batches:
+    """Fixed list of activation batches that can simulate a crash after ``fail_after`` batches."""
+
+    def __init__(self, x, bs=256, fail_after=None):
+        self.batches, self.fail_after, self.served = list(x.split(bs)), fail_after, 0
+        self.batch_tokens = bs
+
+    def __iter__(self):
+        for b in self.batches:
+            if self.fail_after is not None and self.served >= self.fail_after:
+                raise _Interrupt
+            self.served += 1
+            yield b
+
+
+@pytest.mark.parametrize("kw", [dict(activation="topk", k=8), dict(activation="jumprelu")])
+def test_checkpoint_resume(tmp_path, kw):
+    torch.manual_seed(0)
+    x = synthetic(n=8192)
+    cfg = tcfg(tmp_path, total_tokens=60 * 256, warmup_steps=20, checkpoint_every=10, ema_decay=0.9,
+               sparsity_warmup_steps=30, k_decay_steps=30 if "k" in kw else 0)
+    tr = SAETrainer(SAE(d_in=32, d_sae=128, **kw), cfg)
+    with pytest.raises(_Interrupt):
+        # initialization consumes batches too, so the crash lands mid-training
+        tr.train(_Batches(x, fail_after=60))
+    saved_step = (tr.step // 10) * 10
+    assert 10 <= saved_step < 60
+
+    resumed = SAETrainer.from_checkpoint(tmp_path / "checkpoint.pt")
+    assert resumed.step == saved_step and resumed.median_norm == tr.median_norm
+    assert resumed.tokens_seen == saved_step * 256
+    adam = resumed.optimizers[0][0]
+    assert all(adam.state[p]["step"] == saved_step for p in resumed.model.parameters())
+
+    resumed.train(_Batches(x))
+    assert resumed.step == 60
+    lr_end = resumed.optimizers[0][0].param_groups[0]["lr"]
+    assert lr_end == pytest.approx(0.0, abs=1e-12)  # linear decay finished on schedule
+    assert resumed.evaluate(_Batches(x))["eval/fve"] > 0.5
+    assert SAE.load(tmp_path / "sae.safetensors").cfg == resumed.model.cfg
