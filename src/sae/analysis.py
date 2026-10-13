@@ -536,7 +536,7 @@ def output_effects(
         sae: The SAE.
         readout: Readout matrix of shape ``(n_outputs, d_in)``.
         latents: Latents to analyse; ``None`` means all.
-        n: Number of top and bottom outputs per latent.
+        n: Number of top and bottom outputs per latent (at most the number of outputs).
 
     Returns:
         An :class:`OutputEffects`.
@@ -544,6 +544,7 @@ def output_effects(
     idx = torch.arange(sae.cfg.d_sae) if latents is None else torch.as_tensor(latents)
     atoms = sae.decoder_weight().detach().float()[idx.to(sae.device)]
     effects = einsum(atoms, readout.to(atoms), "l d, o d -> l o")
+    n = min(n, effects.shape[-1])
     top_v, top_i = effects.topk(n, dim=-1)
     bot_v, bot_i = effects.topk(n, dim=-1, largest=False)
     return OutputEffects(
