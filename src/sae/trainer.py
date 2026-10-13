@@ -48,6 +48,7 @@ from dataclasses import (
     asdict,
     dataclass
 )
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,10 @@ from .data import (
 from .optim import (
     build_optimizers,
     default_lr
+)
+from .clt import (
+    CrossLayerTranscoder,
+    splice_clt
 )
 from .model import (
     MODEL_TYPES,
@@ -835,7 +840,10 @@ class SAETrainer:
             ablation: Baseline replacing the kept tokens for ``L_ablated``:
                 ``"zero"``, or ``"mean"`` (mean of the batch's kept tokens).
             target_module: For transcoders: the module whose output the
-                transcoder replaces (``hook_module`` is its input).
+                transcoder replaces (``hook_module`` is its input). For a
+                :class:`~sae.clt.CrossLayerTranscoder`, ``hook_module`` and
+                ``target_module`` are the per-layer lists of MLP inputs and
+                MLPs, which are all replaced (or ablated) together.
 
         Returns:
             ``downstream/kl`` and ``downstream/top1_agreement``; with
@@ -845,8 +853,9 @@ class SAETrainer:
         Raises:
             ValueError: If ``ablation`` is unknown.
         """
-        if not isinstance(self.model, SAE):
-            raise TypeError("evaluate_downstream supports single SAEs and transcoders")
+        is_clt = isinstance(self.model, CrossLayerTranscoder)
+        if not isinstance(self.model, SAE) and not is_clt:
+            raise TypeError("evaluate_downstream supports single SAEs, transcoders and cross-layer transcoders")
         if ablation not in ("zero", "mean"):
             raise ValueError(f"ablation must be 'zero' or 'mean', got {ablation!r}")
         kc = kl_cfg or KLFinetuneConfig()
@@ -867,16 +876,27 @@ class SAETrainer:
             batch = _to_device(batch, self.device)
             args, kwargs = kc.input_fn(batch)
 
-            def spliced(fn: Callable[[Tensor, Tensor], Tensor]):
-                return splice(hook_module, fn, target_module, kc.layout, kc.exclude_positions, kc.token_mask_fn,
-                              batch)
+            def replaced():
+                if is_clt:
+                    return splice_clt(sae, hook_module, target_module, layout=kc.layout,
+                                      exclude_positions=kc.exclude_positions, token_mask_fn=kc.token_mask_fn,
+                                      batch=batch)
+                return splice(hook_module, lambda x, y: sae.reconstruct(x), target_module, kc.layout,
+                              kc.exclude_positions, kc.token_mask_fn, batch)
+
+            def ablated():
+                stack = ExitStack()
+                for m in (target_module if is_clt else [target_module or hook_module]):
+                    stack.enter_context(splice(m, ablate, None, kc.layout, kc.exclude_positions, kc.token_mask_fn,
+                                               batch))
+                return stack
 
             with self._autocast():
                 clean_out = model(*args, **kwargs)
-                with spliced(lambda x, y: sae.reconstruct(x)):
+                with replaced():
                     patched_out = model(*args, **kwargs)
                 if loss_fn is not None:
-                    with spliced(ablate):
+                    with ablated():
                         ablated_out = model(*args, **kwargs)
             clean, patched = kc.output_fn(clean_out).float(), kc.output_fn(patched_out).float()
             mask = kc.kl_mask_fn(batch) if kc.kl_mask_fn else None

@@ -79,6 +79,7 @@ from torch import (
 from .activations import (
     ACTIVATIONS,
     SparseCode,
+    decode_code,
     rowwise_topk
 )
 from .decoders import DECODERS
@@ -301,6 +302,23 @@ def normalized_mse(recon: Tensor, target: Tensor, denom: Tensor | None = None) -
     return mse / denom.clamp_min(1e-8)
 
 
+def calibration_scale(recon: Tensor, target: Tensor, match_magnitude: bool) -> Tensor:
+    """
+    Encoder scale for :meth:`SAE.calibrate_encoder_scale_`.
+
+    Args:
+        recon: Initial prediction (without biases), ``(n, d)``.
+        target: What it should predict, ``(n, d)``.
+        match_magnitude: Match norms instead of the least-squares fit.
+
+    Returns:
+        The scalar (callers ignore non-positive values).
+    """
+    if match_magnitude:
+        return (target.pow(2).sum() / recon.pow(2).sum().clamp_min(1e-8)).sqrt()
+    return (recon * target).sum() / (recon * recon).sum().clamp_min(1e-8)
+
+
 @torch.no_grad()
 def geometric_median(points: Tensor, max_iter: int = 100, tol: float = 1e-6) -> Tensor:
     """
@@ -487,10 +505,17 @@ class SAE(nn.Module):
 
         Uses the least-squares optimal scalar. With ``b_enc = 0``, TopK-style
         selection and ReLU are equivariant to a positive rescaling of the
-        encoder, so only activation magnitudes change (JumpReLU approximately,
-        since its initial threshold is small). Gao et al. (2024, App. A.1) use
-        the same initialization; it removes the large initial overshoot of the
-        tied initialization.
+        encoder, so only activation magnitudes change. Gao et al. (2024, App.
+        A.1) use the same initialization; it removes the large initial
+        overshoot of the tied initialization.
+
+        A transcoder's encoder is not tied to its decoder, so its random
+        initial prediction is uncorrelated with the target and the
+        least-squares scalar is close to 0. That still suits TopK-style
+        activations (selection is unchanged, and small initial activations
+        trained fastest in our tests), but would push every pre-activation of
+        a ReLU / JumpReLU transcoder below its threshold, so those match the
+        prediction's magnitude to the target's instead.
 
         Args:
             x_s: Activations in scaled units, shape ``(n, d_in)``.
@@ -502,7 +527,7 @@ class SAE(nn.Module):
         self.train()  # training-mode selection
         target = (x_s if y_s is None else y_s) - self.b_dec - self._skip(x_s)
         recon = self._decode(self.activation(self._pre_acts(x_s), self.k_current), self.decoder_weight())
-        alpha = (recon * target).sum() / (recon * recon).sum().clamp_min(1e-8)
+        alpha = calibration_scale(recon, target, match_magnitude=self.cfg.transcoder and not self.uses_k)
         if alpha > 0:
             self.w_enc.mul_(alpha)
         self.train(was_training)
@@ -644,24 +669,8 @@ class SAE(nn.Module):
         return einsum(x_s.to(self.w_skip.dtype), self.w_skip, "n d_in, d_in d_out -> n d_out")
 
     def _decode(self, code: SparseCode, weight: Tensor, latent_mask: Tensor | None = None) -> Tensor:
-        """
-        Decodes without bias, returning ``(n, d_in)``.
-
-        Codes without a dense tensor touch only active rows of the dictionary
-        (Gao et al., 2024, App. D.2 motivate sparse kernels; ``embedding_bag``
-        is our portable substitute). Dense codes use a matmul so that latents
-        just below a JumpReLU threshold still receive gradients.
-
-        Args:
-            code: The sparse code.
-            weight: The dictionary.
-            latent_mask: Optional ``(d_sae,)`` multiplier, e.g. a Matryoshka group.
-        """
-        if code.dense is not None:
-            acts = code.dense if latent_mask is None else code.dense * latent_mask
-            return einsum(acts.to(weight.dtype), weight, "n d_sae, d_sae d_in -> n d_in")
-        vals = code.vals if latent_mask is None else code.vals * latent_mask[code.cols]
-        return F.embedding_bag(code.cols, weight, code.offsets, mode="sum", per_sample_weights=vals.to(weight.dtype))
+        """Decodes without bias, returning ``(n, d_out)`` (see :func:`~sae.activations.decode_code`)."""
+        return decode_code(code, weight, latent_mask)
 
     def _to_dense(self, code: SparseCode) -> Tensor:
         if code.dense is not None:

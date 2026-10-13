@@ -48,6 +48,7 @@ from typing import (
 import torch
 import torch.nn.functional as F
 from einops import (
+    einsum,
     rearrange,
     repeat
 )
@@ -134,6 +135,30 @@ def rowwise_topk(pre: Tensor, score: Tensor, k: int, signed: bool, mask: Tensor 
         offsets=torch.arange(0, n * k, k, device=pre.device),
         n=n,
     )
+
+
+def decode_code(code: SparseCode, weight: Tensor, latent_mask: Tensor | None = None) -> Tensor:
+    """
+    Decodes a code with a dictionary, without bias.
+
+    Sparse codes touch only active rows of the dictionary (Gao et al., 2024,
+    App. D.2 motivate sparse kernels; ``embedding_bag`` is our portable
+    substitute). Dense codes use a matmul so that latents just below a
+    JumpReLU threshold still receive gradients.
+
+    Args:
+        code: The code of ``n`` tokens.
+        weight: The dictionary, ``(d_sae, d_out)``.
+        latent_mask: Optional ``(d_sae,)`` multiplier, e.g. a Matryoshka group.
+
+    Returns:
+        Shape ``(n, d_out)``.
+    """
+    if code.dense is not None:
+        acts = code.dense if latent_mask is None else code.dense * latent_mask
+        return einsum(acts.to(weight.dtype), weight, "n d_sae, d_sae d_out -> n d_out")
+    vals = code.vals if latent_mask is None else code.vals * latent_mask[code.cols]
+    return F.embedding_bag(code.cols, weight, code.offsets, mode="sum", per_sample_weights=vals.to(weight.dtype))
 
 
 ACTIVATIONS: dict[str, type[Activation]] = {}

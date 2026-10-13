@@ -167,6 +167,27 @@ trainer.train(store)
 trainer.evaluate_downstream(model, ln, loader, kl_cfg, target_module=mlp)
 ```
 
+## Cross-layer transcoders
+
+A CLT replaces every MLP at once: latents read layer `l`'s MLP input and
+write to the MLP outputs of layers `l, l+1, ...` (Ameisen et al., 2025), so
+a feature computed once can explain the same output across layers.
+
+```python
+from sae import CrossLayerTranscoder, clt_hooks, splice_clt
+
+layers = model.gpt_neox.layers
+ins, outs = [l.post_attention_layernorm for l in layers], [l.mlp for l in layers]
+store = ActivationStore(model, clt_hooks(ins, outs), loader)       # aligned inputs/outputs of all MLPs
+clt = CrossLayerTranscoder(n_layers=len(layers), d_in=512, d_sae=4096, activation="topk", k=32)
+trainer = SAETrainer(clt, TrainerConfig(total_tokens=100_000_000))
+trainer.train(store)
+trainer.evaluate(val_store)                                         # eval/fve, eval/layer3/fve, ...
+trainer.evaluate_downstream(model, ins, loader, kl_cfg, target_module=outs, loss_fn=...)
+with splice_clt(clt, ins, outs):                                    # run the replacement model
+    logits = model(**inputs)
+```
+
 ## SAELens interop
 
 ```python

@@ -8,6 +8,7 @@ Core modules:
 * :mod:`sae.decoders`: unit-norm linear and Archetypal dictionaries.
 * :mod:`sae.trainer`: training, KL fine-tuning and evaluation.
 * :mod:`sae.group`: one SAE per hook point, trained from a single pass.
+* :mod:`sae.clt`: cross-layer transcoders replacing all MLPs at once.
 * :mod:`sae.data`: activation harvesting from vision and language models.
 * :mod:`sae.cache`: caching harvested activations to disk.
 * :mod:`sae.optim`: Adam, Muon and Signum (I only use Adam, but sparsify use Muon / Signum as well)
@@ -37,6 +38,12 @@ from .cache import (
     CachedActivations,
     cache_activations
 )
+from .clt import (
+    CLTConfig,
+    CrossLayerTranscoder,
+    clt_hooks,
+    splice_clt
+)
 from .data import ActivationStore
 from .decoders import (
     DECODERS,
@@ -63,6 +70,8 @@ __all__ = [
     "DECODERS",
     "Activation",
     "ActivationStore",
+    "CLTConfig",
+    "CrossLayerTranscoder",
     "CachedActivations",
     "Decoder",
     "KLFinetuneConfig",
@@ -76,10 +85,12 @@ __all__ = [
     "analyze_dataset",
     "cache_activations",
     "cache_latents",
+    "clt_hooks",
     "latent_attribution",
     "latent_patch_maps",
     "max_cosine_similarity",
     "output_effects",
     "register_activation",
+    "splice_clt",
 ]
 __version__ = "0.2.0"
