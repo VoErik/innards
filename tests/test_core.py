@@ -278,6 +278,13 @@ def test_vision_store_train_and_kl_finetune(tmp_path):
     tr.finetune_kl(vit, vit.block1, img_loader, kl_cfg)
     after = tr.evaluate_downstream(vit, vit.block1, img_loader, kl_cfg)
     assert after["downstream/kl"] < before["downstream/kl"], (before, after)
+    ce = lambda out, batch: nn.functional.cross_entropy(out, batch[1].long() % out.shape[-1])
+    full = tr.evaluate_downstream(vit, vit.block1, img_loader, kl_cfg, loss_fn=ce, ablation="mean")
+    assert full["downstream/kl"] == pytest.approx(after["downstream/kl"], rel=1e-5)
+    assert full["downstream/loss_ablated"] > full["downstream/loss_sae"]
+    # KL is ~1e-4, so the spliced model is nearly as good as the clean one; with arbitrary labels it
+    # can even be marginally better, so the ratio may slightly exceed 1.
+    assert abs(full["downstream/loss_recovered"] - 1.0) < 0.05, full
     assert all(p.requires_grad for p in vit.parameters())  # requires_grad flags restored
     assert (tmp_path / "sae_kl.safetensors").exists()
 

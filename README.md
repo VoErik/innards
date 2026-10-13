@@ -62,8 +62,35 @@ sae.save("sae.safetensors")
 sae = SAE.load("sae.safetensors", device="cuda")
 ```
 
-Then analyze it with `sae.analysis` (latent statistics, top-activating  examples, dictionary geometry, 
-output effects, attributions) and plot with `sae.viz`.
+## Analysis and interventions
+
+```python
+import torch.nn.functional as F
+from sae import LatentCache, cache_latents
+from sae.interventions import clamp, splice_sae, steer, zero_ablate
+
+# Encode a (deterministic) dataset once, then analyse without the model.
+cache = LatentCache(cache_latents(sae, model, model.blocks[6], val_loader, "latents/block6",
+                                  exclude_positions=(0,)))
+stats = cache.stats()                       # frequency, mean / max activation
+top = cache.top_examples(n_top=20)          # (value, example, position) per latent
+bins = cache.quantile_examples(latent=42)   # samples across activation quantiles
+co = cache.cooccurrence([42, 7, 1001])      # pairwise co-firing counts
+
+# Causal edits: the SAE error term is kept, so only the edit changes the model.
+with splice_sae(sae, model.blocks[6], zero_ablate([42]), exclude_positions=(0,)):
+    ablated_logits = model(images)
+with steer(model.blocks[6], sae.decoder_weight()[42], alpha=8.0):
+    steered_logits = model(images)
+
+# Downstream fidelity: KL, top-1 agreement and fraction of loss recovered.
+trainer.evaluate_downstream(model, model.blocks[6], val_loader, kl_cfg,
+                            loss_fn=lambda out, batch: F.cross_entropy(out, batch[1]))
+```
+
+`sae.analysis` covers the rest (single-pass `analyze_dataset`, dictionary
+geometry, output effects / logit lens, attribution patching, patch maps),
+and `sae.viz` plots it.
 
 ## Architectures
 

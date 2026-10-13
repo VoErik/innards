@@ -199,3 +199,88 @@ def test_cached_activations_order_and_prefetch(tmp_path, bs):
     for i, _ in enumerate(cached):  # stopping mid-epoch shuts the loader thread down cleanly
         if i == 1:
             break
+
+
+def test_interventions(setup):
+    from sae.data import capture_activation, patch_kept_tokens, replace_activation
+    from sae.interventions import clamp, mean_ablate, scale, splice_sae, steer, zero_ablate
+
+    vit, images, *_, sae = setup
+    x = images[:4]
+    with torch.no_grad():
+        clean = vit(x)
+        with splice_sae(sae, vit.block, exclude_positions=(0,)):  # error kept, no edit: unchanged
+            torch.testing.assert_close(vit(x), clean, atol=1e-5, rtol=1e-5)
+        with splice_sae(sae, vit.block, keep_error=False, exclude_positions=(0,)):
+            spliced = vit(x)
+        with replace_activation(vit.block, lambda a: patch_kept_tokens(a, sae.reconstruct, exclude_positions=(0,))):
+            torch.testing.assert_close(spliced, vit(x), atol=1e-5, rtol=1e-5)
+
+        lat = int(sae.encode(vit.block(vit.embed(x).flatten(2).transpose(1, 2))).abs().sum((0, 1)).argmax())
+        outs = {}
+        for name, edit in [("zero", zero_ablate(lat)), ("clamp0", clamp([lat], 0.0)), ("scale0", scale(lat, 0.0)),
+                           ("mean0", mean_ablate(lat, torch.zeros(sae.cfg.d_sae)))]:
+            with splice_sae(sae, vit.block, edit, exclude_positions=(0,)):
+                outs[name] = vit(x)
+        assert not torch.allclose(outs["zero"], clean, atol=1e-4)
+        for name in ("clamp0", "scale0", "mean0"):
+            torch.testing.assert_close(outs[name], outs["zero"])
+
+        # The block output moves by exactly -a * d at every patch token where the latent fired.
+        with capture_activation(vit.block) as ref:
+            vit(x)
+        with splice_sae(sae, vit.block, zero_ablate(lat), exclude_positions=(0,)), capture_activation(vit.block) as got:
+            vit(x)
+        a = sae.encode(ref["act"])[..., lat]
+        expected = ref["act"] - a.unsqueeze(-1) * sae.decoder_weight()[lat]
+        torch.testing.assert_close(got["act"][:, 1:], expected[:, 1:], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(got["act"][:, 0], ref["act"][:, 0])
+
+        direction = sae.decoder_weight()[lat]
+        with steer(vit.block, direction, alpha=3.0, exclude_positions=(0,)), capture_activation(vit.block) as st:
+            vit(x)
+        torch.testing.assert_close(st["act"][:, 1:], ref["act"][:, 1:] + 3.0 * direction)
+        torch.testing.assert_close(st["act"][:, 0], ref["act"][:, 0])
+
+
+def test_latent_cache_matches_analysis(tmp_path, setup):
+    from sae.latent_cache import LatentCache, cache_latents
+
+    vit, images, loader, _, sae = setup
+    # Small shards and chunks so merging across shards is exercised.
+    path = cache_latents(sae, vit, vit.block, loader, tmp_path / "lat", exclude_positions=(0,), shard_tokens=200,
+                         chunk_tokens=50, metadata={"hook": "block"})
+    cache = LatentCache(path)
+    assert len(cache.meta["shards"]) > 3 and cache.meta["metadata"]["hook"] == "block"
+    ref = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude_positions=(0,))
+    stats = cache.stats()
+    assert stats.n_tokens == ref.stats.n_tokens == 96 * 16
+    for f in ("frequency", "mean_activation", "max_activation"):
+        torch.testing.assert_close(getattr(stats, f), getattr(ref.stats, f))
+    top = cache.top_examples(5)
+    torch.testing.assert_close(top.values, ref.top.values)
+    filled = ref.top.values != 0
+    assert torch.equal(top.example[filled], ref.top.example[filled])
+    assert torch.equal(top.position[filled], ref.top.position[filled])
+
+    # Dense reference over the whole dataset: (examples, tokens, d_sae) with CLS zeroed.
+    dense = A.encode_inputs(sae, vit, vit.block, images)
+    dense[:, 0] = 0
+    lat = int(stats.frequency.argmax())
+    tokens, values = cache.latent_activations(lat)
+    example, position = cache.token_index(tokens)
+    torch.testing.assert_close(values, dense[example, position, lat])
+    assert values.numel() == int((dense[..., lat] != 0).sum())
+
+    bins = cache.quantile_examples(lat, n_bins=4, per_bin=3)
+    assert len(bins) == 4 and all(len(b) == 3 for b in bins)
+    mags = [[abs(v) for v, _, _ in b] for b in bins]
+    assert all(max(mags[i]) <= min(mags[i + 1]) + 1e-6 for i in range(3))  # bins ordered by magnitude
+    for v, e, p in bins[-1]:
+        assert dense[e, p, lat].item() == pytest.approx(v, rel=1e-5)
+
+    latents = [0, 3, lat, 10]
+    active = (dense.reshape(-1, sae.cfg.d_sae)[:, latents] != 0).float()
+    expected = active.T @ active
+    torch.testing.assert_close(cache.cooccurrence(latents), expected)
+    torch.testing.assert_close(cache.cooccurrence(latents, chunk_tokens=7), expected)
