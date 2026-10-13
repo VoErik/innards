@@ -37,7 +37,6 @@ napoleon_use_ivar = True  # attributes as fields, so dataclass members are not d
 
 html_theme = "furo"
 html_title = "sae"
-html_static_path = ["_static"]
 html_theme_options = {
     "source_repository": "https://github.com/VoErik/sparse-autoencoder",
     "source_branch": "main",
