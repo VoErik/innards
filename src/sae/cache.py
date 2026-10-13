@@ -29,6 +29,7 @@ from collections.abc import (
     Iterable,
     Iterator
 )
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -124,7 +125,10 @@ class CachedActivations:
     Each epoch visits the shards in a random order and shuffles tokens within
     each shard. Leftovers carry over to the next shard, so every batch has
     exactly ``batch_tokens`` tokens (last partial batch is dropped).
-    Only one shard is in memory at a time.
+
+    A background thread loads (and shuffles) the next shard while the current
+    one is served, so at most two shards are in memory. For CUDA devices the
+    shards are pinned, so the copies to the GPU are asynchronous.
 
     Args:
         cache_dir: Directory written by :func:`cache_activations`.
@@ -170,20 +174,41 @@ class CachedActivations:
     def __len__(self) -> int:
         return self.n_tokens // self.batch_tokens
 
+    def _load_shard(self, name: str, g: torch.Generator) -> Tensor:
+        data = load_file(str(self.cache_dir / name))["activations"]
+        if self.shuffle:
+            data = data[torch.randperm(data.shape[0], generator=g)]
+        if self.device.type == "cuda":
+            data = data.pin_memory()
+        return data
+
+    def _serve(self, batch: Tensor) -> Tensor:
+        batch = batch.to(self.device, non_blocking=True)
+        return batch.to(self.dtype) if self.dtype is not None else batch
+
     def __iter__(self) -> Iterator[Tensor]:
         g = torch.Generator().manual_seed(self.seed + self._epoch)
         self._epoch += 1
         shards = self.meta["shards"]
-        order = torch.randperm(len(shards), generator=g).tolist() if self.shuffle else range(len(shards))
+        order = torch.randperm(len(shards), generator=g).tolist() if self.shuffle else list(range(len(shards)))
+        bs = self.batch_tokens
         carry: Tensor | None = None
-        for i in order:
-            data = load_file(str(self.cache_dir / shards[i]["file"]))["activations"]
-            if self.shuffle:
-                data = data[torch.randperm(data.shape[0], generator=g)]
-            if carry is not None:
-                data = torch.cat([carry, data])
-            n_full = data.shape[0] // self.batch_tokens * self.batch_tokens
-            for j in range(0, n_full, self.batch_tokens):
-                batch = data[j : j + self.batch_tokens].to(self.device, non_blocking=True)
-                yield batch.to(self.dtype) if self.dtype is not None else batch
-            carry = data[n_full:]
+        # One worker, so shards are loaded and shuffled (drawing from ``g``) in order.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = [pool.submit(self._load_shard, shards[i]["file"], g) for i in order[:1]]
+            for pos in range(len(order)):
+                data = pending.pop().result()
+                if pos + 1 < len(order):
+                    pending.append(pool.submit(self._load_shard, shards[order[pos + 1]]["file"], g))
+                start = 0
+                if carry is not None and carry.shape[0] > 0:
+                    need = bs - carry.shape[0]
+                    if data.shape[0] < need:
+                        carry = torch.cat([carry, data])
+                        continue
+                    yield self._serve(torch.cat([carry, data[:need]]))
+                    start = need
+                end = start + (data.shape[0] - start) // bs * bs
+                for j in range(start, end, bs):
+                    yield self._serve(data[j : j + bs])
+                carry = data[end:]
