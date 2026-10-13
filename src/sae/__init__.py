@@ -10,6 +10,7 @@ Core modules:
 * :mod:`sae.group`: one SAE per hook point, trained from a single pass.
 * :mod:`sae.clt`: cross-layer transcoders replacing all MLPs at once.
 * :mod:`sae.graph`: attribution graphs over spliced SAEs, transcoders and CLTs.
+* :mod:`sae.dashboard`: self-contained HTML latent dashboards and graph viewers.
 * :mod:`sae.data`: activation harvesting from vision and language models.
 * :mod:`sae.cache`: caching harvested activations to disk.
 * :mod:`sae.optim`: Adam, Muon and Signum (I only use Adam, but sparsify use Muon / Signum as well)

@@ -246,7 +246,7 @@ class Node:
     attribution: float
 
     def label(self) -> str:
-        what = f"#{self.latent}" if self.kind == "latent" else "error"
+        what = f"#{self.latent}" if self.kind == "latent" else " error"
         return f"{self.site}{what}@{self.position}" + (f"[{self.example}]" if self.example else "")
 
 

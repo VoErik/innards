@@ -149,6 +149,26 @@ group["block3"].save("block3.safetensors")
 Tokens from all hooks are shuffled jointly, so every batch holds the same
 tokens at every layer (cross-layer models rely on this).
 
+## Dashboards
+
+Self-contained HTML files (no server, no network): a latent browser built on
+the latent cache, and an interactive viewer for attribution graphs.
+
+```python
+from sae.dashboard import image_renderer, save_graph_html, save_latent_dashboard, text_renderer
+
+save_latent_dashboard("dashboard.html", cache, text_renderer(val_tokens),  # or image_renderer(images, n_prefix=1)
+                      sae=sae, readout=unembed, output_labels=vocab)       # nearest latents, output effects
+save_graph_html(graph.prune(0.8), "graph.html", tokens=prompt_tokens, metric_label='logit(" Paris")')
+```
+
+The dashboard lists every latent (searchable, sortable) and shows per latent
+its activation histogram, top examples, examples sampled across activation
+quantiles, nearest latents by decoder direction and output effects. The
+graph viewer draws sites as rows and token positions as columns; filter
+edges by strength, hover for details, click a node to trace its inputs and
+outputs.
+
 ## Transcoders
 
 A transcoder reads one activation and predicts another, e.g. an MLP's output
@@ -235,6 +255,11 @@ directions against the `sae_lens` package when it is installed
 Each runs the full workflow: harvest → cache → train → evaluate → KL
 fine-tune → save/load → dictionary analysis → latent dashboards →
 attribution.
+
+## Roadmap
+
+Open work (frozen-attention graphs, KL fine-tuning for CLTs, ...) is tracked in
+[TODO.md](TODO.md).
 
 ## Tests
 
