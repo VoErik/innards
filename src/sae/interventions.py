@@ -41,10 +41,7 @@ from torch import (
     nn
 )
 
-from .data import (
-    patch_kept_tokens,
-    replace_activation
-)
+from .data import splice
 from .model import SAE
 
 Edit = Callable[[Tensor], Tensor]
@@ -151,6 +148,7 @@ def splice_sae(
     exclude_positions: Sequence[int] = (),
     token_mask_fn: Callable[[Any], Tensor] | None = None,
     batch: Any = None,
+    target_module: nn.Module | None = None,
 ) -> Iterator[None]:
     """
     Splices the SAE into ``hook_module``, optionally editing its latents.
@@ -160,7 +158,9 @@ def splice_sae(
     the error kept and no edit the model is unchanged; with an edit, the
     output moves by exactly the edited latents' decoder contributions.
     Without the error term and without an edit, the model runs on the SAE
-    reconstruction.
+    reconstruction. For a transcoder (``target_module`` set) the latents are
+    read from ``hook_module`` and ``target_module``'s output ``y`` is replaced
+    by ``decode(edit(encode(x))) + skip(x)`` plus the error ``y - (decode(encode(x)) + skip(x))``.
 
     Args:
         sae: The SAE (should be in eval mode).
@@ -173,22 +173,21 @@ def splice_sae(
         token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
             tokens to change, e.g. non-padding tokens.
         batch: The model input batch passed to ``token_mask_fn``.
+        target_module: For transcoders: the module whose output is replaced.
 
     Yields:
         None.
     """
 
-    def fn(x: Tensor) -> Tensor:
-        x = x.to(sae.w_enc.dtype)
+    def fn(x: Tensor, y: Tensor) -> Tensor:
+        x, y = x.to(sae.w_enc.dtype), y.to(sae.w_enc.dtype)
         acts = sae.encode(x)
-        recon = sae.decode(acts)
-        new = sae.decode(edit(acts)) if edit is not None else recon
-        return new + (x - recon) if keep_error else new
+        skip = sae.skip(x)
+        recon = sae.decode(acts) + skip
+        new = sae.decode(edit(acts)) + skip if edit is not None else recon
+        return new + (y - recon) if keep_error else new
 
-    def hook(act: Tensor) -> Tensor:
-        return patch_kept_tokens(act, fn, layout, exclude_positions, token_mask_fn, batch)
-
-    with replace_activation(hook_module, hook):
+    with splice(hook_module, fn, target_module, layout, exclude_positions, token_mask_fn, batch):
         yield
 
 
@@ -226,9 +225,6 @@ def steer(
     """
     direction = direction.detach()
 
-    def hook(act: Tensor) -> Tensor:
-        return patch_kept_tokens(act, lambda x: x + alpha * direction.to(x), layout, exclude_positions,
-                                 token_mask_fn, batch)
-
-    with replace_activation(hook_module, hook):
+    with splice(hook_module, lambda x, y: y + alpha * direction.to(y), None, layout, exclude_positions,
+                token_mask_fn, batch):
         yield

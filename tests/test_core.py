@@ -233,7 +233,7 @@ def test_outlier_filter():
     x[::50] *= 100
     tr = SAETrainer(SAE(d_in=32, d_sae=64, k=4), TrainerConfig(device="cpu"))
     tr.initialize(loader(x, shuffle=False))
-    assert tr._prepare(x[:500]).shape[0] == 490
+    assert tr._prepare(x[:500])[0].shape[0] == 490
 
 
 class ToyViT(nn.Module):
@@ -308,7 +308,7 @@ def test_patch_kept_tokens_respects_masks():
     act = torch.randn(2, 6, 4)
     mask_fn = lambda batch: batch
     batch = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.bool)  # padding in row 0
-    out = patch_kept_tokens(act, torch.zeros_like, "btd", exclude_positions=(0,), token_mask_fn=mask_fn,
+    out = patch_kept_tokens(act, lambda x, y: torch.zeros_like(y), "btd", exclude_positions=(0,), token_mask_fn=mask_fn,
                             batch=batch)
     assert torch.equal(out[:, 0], act[:, 0]) and torch.equal(out[0, 4:], act[0, 4:])
     assert (out[0, 1:4] == 0).all() and (out[1, 1:] == 0).all()
@@ -434,3 +434,134 @@ def test_checkpoint_resume(tmp_path, kw):
     assert lr_end == pytest.approx(0.0, abs=1e-12)  # linear decay finished on schedule
     assert resumed.evaluate(_Batches(x))["eval/fve"] > 0.5
     assert SAE.load(tmp_path / "sae.safetensors").cfg == resumed.model.cfg
+
+
+def synthetic_pairs(n=20_000, d_in=32, d_out=24, n_true=128, active=4, seed=0, linear_part=False):
+    """Input and target share a sparse code (as an MLP's input and output would); optional linear map."""
+    g = torch.Generator().manual_seed(seed)
+    dx = torch.nn.functional.normalize(torch.randn(n_true, d_in, generator=g), dim=-1)
+    dy = torch.nn.functional.normalize(torch.randn(n_true, d_out, generator=g), dim=-1)
+    z = (torch.rand(n, n_true, generator=g) < active / n_true) * torch.rand(n, n_true, generator=g) * 3
+    x = z @ dx + 0.5
+    y = z @ dy * 40.0 + 3.0  # very different scale than x, to exercise separate scales
+    if linear_part:
+        y = y + x @ torch.randn(d_in, d_out, generator=g) * 10.0
+    return x * 5.0, y
+
+
+def pair_loader(x, y, bs=512):
+    return DataLoader(TensorDataset(x, y), batch_size=bs, shuffle=True, drop_last=True)
+
+
+def _linear_fve(x, y):
+    xb = torch.cat([x, torch.ones(len(x), 1)], 1)
+    r = y - xb @ torch.linalg.lstsq(xb, y).solution
+    return 1 - (r**2).sum().item() / ((y - y.mean(0)) ** 2).sum().item()
+
+
+def _train_transcoder(tmp_path, x, y, **kw):
+    torch.manual_seed(0)
+    tc = SAE(d_in=32, d_out=24, d_sae=256, transcoder=True, dead_tokens_threshold=20_000, **kw)
+    tr = SAETrainer(tc, tcfg(tmp_path, num_epochs=10, lr=3e-3, sparsity_warmup_steps=50))
+    tr.train(pair_loader(x, y))
+    assert tc.target_scale.item() != pytest.approx(tc.input_scale.item(), rel=0.1)
+    return tr.evaluate(pair_loader(x, y))["eval/fve"]
+
+
+@pytest.mark.parametrize("kw", [dict(activation="topk", k=8), dict(activation="batchtopk", k=8),
+                                dict(activation="jumprelu", sparsity_coeff=1e-2)])
+def test_transcoder_beats_linear_map(tmp_path, kw):
+    x, y = synthetic_pairs()  # target is a sparse, non-linear function of the input
+    linear = _linear_fve(x, y)
+    assert _train_transcoder(tmp_path, x, y, **kw) > linear + 0.2, linear
+
+
+def test_transcoder_skip_connection(tmp_path):
+    x, y = synthetic_pairs(linear_part=True)  # target = sparse part + linear map of the input
+    plain = _train_transcoder(tmp_path, x, y, activation="topk", k=8)
+    skip = _train_transcoder(tmp_path, x, y, activation="topk", k=8, skip_connection=True)
+    assert skip > plain + 0.05 and skip > _linear_fve(x, y), (plain, skip)
+
+
+@pytest.mark.parametrize("kw", [dict(activation="topk", k=6), dict(activation="batchtopk", k=6, matryoshka=True),
+                                dict(activation="jumprelu"), dict(activation="topk", k=6, skip_connection=True),
+                                dict(activation="topk", k=6, decoder="archetypal", archetypal_n_candidates=64)])
+def test_transcoder_folding_roundtrip(tmp_path, kw):
+    torch.manual_seed(0)
+    x, y = synthetic_pairs(n=4096, linear_part=True)
+    m = SAE(d_in=32, d_out=24, d_sae=128, transcoder=True, **kw)
+    m.initialize_from_data(x, y)
+    if kw.get("skip_connection"):
+        torch.nn.init.normal_(m.w_skip, std=0.1)
+    m.train()
+    for chunk in x.split(512):
+        m(chunk, target=y[: chunk.shape[0]])  # BatchTopK threshold
+    m.eval()
+    ref = m(x, target=y)
+    loaded = SAE.load(m.save(tmp_path / "tc.safetensors"))
+    got = loaded(x, target=y)
+    assert loaded.input_scale.item() == 1.0 and loaded.target_scale.item() == 1.0
+    for a, b in [(got.recon, ref.recon), (got.acts, ref.acts), (loaded.reconstruct(x), ref.recon)]:
+        assert torch.isclose(a, b, atol=1e-3, rtol=1e-4).all(-1).float().mean() > 0.995
+    torch.testing.assert_close(got.metrics["nmse"], ref.metrics["nmse"], atol=1e-3, rtol=1e-3)
+
+
+def test_transcoder_config_and_target_checks():
+    with pytest.raises(ValueError, match="transcoder"):
+        SAEConfig(d_in=8, d_out=16, d_sae=32, k=4)
+    with pytest.raises(ValueError, match="transcoder"):
+        SAEConfig(d_in=8, d_sae=32, k=4, skip_connection=True)
+    tc = SAE(d_in=8, d_out=16, d_sae=32, k=4, transcoder=True)
+    with pytest.raises(ValueError, match="target"):
+        tc(torch.randn(4, 8))
+    with pytest.raises(ValueError, match="target"):
+        SAE(d_in=8, d_sae=32, k=4)(torch.randn(4, 8), target=torch.randn(4, 8))
+    with pytest.raises(ValueError, match="target"):
+        tc.initialize_from_data(torch.randn(64, 8))
+
+
+def test_transcoder_store_cache_kl_and_interventions(tmp_path):
+    from sae.cache import CachedActivations, cache_activations
+    from sae.interventions import splice_sae, zero_ablate
+
+    torch.manual_seed(0)
+    vit = ToyViT()
+    images = torch.randn(256, 3, 16, 16)
+    img_loader = DataLoader(TensorDataset(images, torch.zeros(256)), batch_size=32)
+    ln, mlp = vit.block1[0], vit.block1  # transcoder: LayerNorm output -> block output
+    store = ActivationStore(vit, ln, img_loader, batch_tokens=256, buffer_tokens=2048, exclude_positions=(0,),
+                            target_module=mlp)
+    x, y = next(iter(store))
+    assert x.shape == y.shape == (256, 32)
+    with torch.no_grad():  # pairs stay aligned through the shuffle
+        torch.testing.assert_close(mlp[2](mlp[1](x)), y, atol=1e-5, rtol=1e-5)
+
+    path = cache_activations(store, tmp_path / "pairs", shard_tokens=1000, dtype=torch.float32)
+    cx, cy = next(iter(CachedActivations(path, batch_tokens=128)))
+    with torch.no_grad():
+        torch.testing.assert_close(mlp[2](mlp[1](cx)), cy, atol=1e-5, rtol=1e-5)
+
+    tc = SAE(d_in=32, d_sae=128, k=8, transcoder=True)
+    tr = SAETrainer(tc, tcfg(tmp_path, total_tokens=60_000))
+    tr.train(CachedActivations(path, batch_tokens=256))
+    assert tr.evaluate(CachedActivations(path, batch_tokens=256))["eval/fve"] > 0.5
+
+    kl_cfg = KLFinetuneConfig(steps=30, exclude_positions=(0,), log_every=10)
+    before = tr.evaluate_downstream(vit, ln, img_loader, kl_cfg, target_module=mlp)
+    tr.finetune_kl(vit, ln, img_loader, kl_cfg, target_module=mlp)
+    after = tr.evaluate_downstream(vit, ln, img_loader, kl_cfg, target_module=mlp)
+    assert after["downstream/kl"] < before["downstream/kl"], (before, after)
+
+    tc = tr.model.eval()
+    with torch.no_grad():
+        clean = vit(images[:4])
+        with splice_sae(tc, ln, target_module=mlp, exclude_positions=(0,)):
+            torch.testing.assert_close(vit(images[:4]), clean, atol=1e-5, rtol=1e-5)
+        with splice_sae(tc, ln, zero_ablate(list(range(128))), target_module=mlp, exclude_positions=(0,)):
+            assert not torch.allclose(vit(images[:4]), clean, atol=1e-3)
+
+    from sae.analysis import latent_attribution
+    attr = latent_attribution(tc, vit, ln, images[:1], lambda o, _: o[:, 2], exclude_positions=(0,),
+                              target_module=mlp)
+    torch.testing.assert_close(attr.target, clean[:1, 2], atol=1e-5, rtol=1e-5)
+    assert attr.acts.shape == (1, 17, 128) and not attr.keep[0, 0]

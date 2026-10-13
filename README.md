@@ -101,6 +101,7 @@ An `SAE` is assembled from independent parts, chosen in `SAEConfig`:
 | `activation` | `"topk"`, `"batchtopk"` (both with optional `abs_topk`), `"jumprelu"`, `"relu"` (L1) | `sae.activations` |
 | `decoder` | `"linear"` (unit-norm atoms), `"archetypal"` | `sae.decoders` |
 | loss terms | AuxK, `matryoshka`, `multi_topk` (TopK variants) | `sae.model` |
+| target | the input (SAE), or another activation with `transcoder=True` (+ `skip_connection`) | `sae.model` |
 
 ```python
 SAE(d_in=768, d_sae=16384, activation="topk", k=64, matryoshka=True)
@@ -127,6 +128,24 @@ class MyActivation(Activation):
 Override `update_stats` for running statistics and `fold_` for thresholds
 that must be rescaled when saving. New decoder parametrizations subclass
 `Decoder` and go into `sae.decoders.DECODERS`.
+
+## Transcoders
+
+A transcoder reads one activation and predicts another, e.g. an MLP's output
+from its input, so its latents explain what the MLP computes. Pass the
+input and output modules; batches become `(input, target)` pairs, and
+everything that splices the model takes a `target_module`:
+
+```python
+mlp = model.gpt_neox.layers[3].mlp
+ln = model.gpt_neox.layers[3].post_attention_layernorm   # the MLP's input
+store = ActivationStore(model, ln, loader, target_module=mlp)  # yields (x, y)
+tc = SAE(d_in=512, d_sae=8192, activation="topk", k=32, transcoder=True,
+         skip_connection=True)                              # optional linear skip
+trainer = SAETrainer(tc, TrainerConfig(total_tokens=50_000_000))
+trainer.train(store)
+trainer.evaluate_downstream(model, ln, loader, kl_cfg, target_module=mlp)
+```
 
 ## Notebooks
 
