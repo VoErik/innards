@@ -169,10 +169,13 @@ def test_kmeans_recovers_clusters():
     assert torch.cdist(centers, found).min(-1).values.max() < 0.5
 
 
-def test_k_annealing_schedule(tmp_path):
+def test_k_annealing_schedule():
     sae = SAE(d_in=32, d_sae=256, k=8)
-    tr = SAETrainer(sae, tcfg(tmp_path, k_decay_steps=100))
-    assert tr._k_at(0) == 256 and tr._k_at(50) == round(256 * 0.5 + 8 * 0.5) and tr._k_at(100) == 8
+    ks = []
+    for progress in (0.0, 0.5, 1.0):
+        sae.anneal_k(progress)
+        ks.append(sae.k_current)
+    assert ks == [256, round(256 * 0.5 + 8 * 0.5), 8]
 
 
 def test_signum_and_muon_build():
@@ -423,7 +426,7 @@ def test_checkpoint_resume(tmp_path, kw):
     assert 10 <= saved_step < 60
 
     resumed = SAETrainer.from_checkpoint(tmp_path / "checkpoint.pt")
-    assert resumed.step == saved_step and resumed.median_norm == tr.median_norm
+    assert resumed.step == saved_step and all(torch.equal(a, b) for a, b in zip(resumed.median_norms, tr.median_norms))
     assert resumed.tokens_seen == saved_step * 256
     adam = resumed.optimizers[0][0]
     assert all(adam.state[p]["step"] == saved_step for p in resumed.model.parameters())

@@ -336,6 +336,29 @@ def splice(
         yield
 
 
+def split_fields(
+    flat: Tensor, kind: str, names: Sequence[str], widths: Sequence[int]
+) -> Tensor | tuple[Tensor, ...] | dict[str, Tensor]:
+    """
+    Splits feature-concatenated activations into the batch structure ``kind``.
+
+    Args:
+        flat: Tensor ``(n, sum(widths))``.
+        kind: ``"tensor"``, ``"pair"`` (input, target) or ``"dict"``.
+        names: Field names, in order.
+        widths: Field widths, in order.
+
+    Returns:
+        A tensor, a tuple of tensors, or a dict name -> tensor.
+    """
+    parts = flat.split(list(widths), dim=-1)
+    if kind == "tensor":
+        return parts[0]
+    if kind == "pair":
+        return tuple(parts)
+    return dict(zip(names, parts))
+
+
 def run_capture(
     model: nn.Module,
     hook_module: nn.Module,
@@ -356,13 +379,54 @@ def run_capture(
     Returns:
         The captured activation.
     """
+    return run_capture_many(model, [hook_module], batch, input_fn, stop)[0]
+
+
+def run_capture_many(
+    model: nn.Module,
+    modules: Sequence[nn.Module],
+    batch: Any,
+    input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
+    stop: bool = True,
+) -> list[Tensor]:
+    """
+    Runs ``model`` once and returns the outputs of several modules.
+
+    Args:
+        model: The model.
+        modules: Modules whose outputs to capture (tuple outputs are reduced
+            to their first element).
+        batch: Input batch (already on the right device).
+        input_fn: Maps the batch to ``(args, kwargs)``.
+        stop: Stop the forward pass once every module has run.
+
+    Returns:
+        The captured activations, in the order of ``modules``.
+
+    Raises:
+        RuntimeError: If a module did not run.
+    """
+    store: dict[int, Tensor] = {}
+
+    def make_hook(i: int):
+        def hook(_mod, _inp, out):
+            store[i] = out[0] if isinstance(out, (tuple, list)) else out
+            if stop and len(store) == len(modules):
+                raise _StopForward
+        return hook
+
+    handles = [m.register_forward_hook(make_hook(i)) for i, m in enumerate(modules)]
     args, kwargs = input_fn(batch)
-    with capture_activation(hook_module, stop=stop) as store:
-        try:
-            model(*args, **kwargs)
-        except _StopForward:
-            pass
-    return store["act"]
+    try:
+        model(*args, **kwargs)
+    except _StopForward:
+        pass
+    finally:
+        for h in handles:
+            h.remove()
+    if len(store) != len(modules):
+        raise RuntimeError("some hooked modules did not run during the forward pass")
+    return [store[i] for i in range(len(modules))]
 
 
 class ActivationStore:
@@ -370,7 +434,10 @@ class ActivationStore:
     Iterable of shuffled activation batches harvested from a frozen model.
 
     For transcoders, set ``target_module`` to also capture the output to
-    predict; batches are then ``(input, target)`` pairs.
+    predict; batches are then ``(input, target)`` pairs. To train on several
+    hook points at once, pass a dict of modules as ``hook_module``; batches
+    are then dicts of the same keys. All hooks are captured in one forward
+    pass and shuffled jointly, so row ``i`` of every entry is the same token.
 
     Fills a buffer of ``buffer_tokens`` tokens, shuffles it, serves batches
     until half of it is used, then refills, so consecutive batches mix tokens
@@ -380,7 +447,8 @@ class ActivationStore:
     Args:
         model: Frozen model; run under ``torch.no_grad`` and in eval mode.
         hook_module: Module whose output is the activation to train on (the
-            transcoder input when ``target_module`` is set).
+            transcoder input when ``target_module`` is set), or a dict of
+            name -> module for several hook points with the same token grid.
         input_loader: Iterable of model inputs (images, token dicts, ...).
         batch_tokens: Tokens per served batch.
         buffer_tokens: Shuffle-buffer size in tokens.
@@ -411,7 +479,7 @@ class ActivationStore:
     def __init__(
         self,
         model: nn.Module,
-        hook_module: nn.Module,
+        hook_module: nn.Module | dict[str, nn.Module],
         input_loader: Iterable,
         batch_tokens: int = 4096,
         buffer_tokens: int = 2**19,
@@ -441,7 +509,15 @@ class ActivationStore:
         self.autocast_dtype = autocast_dtype
         self.generator = torch.Generator().manual_seed(seed)
         self.target_module = target_module
-        self._d_in: int | None = None
+        if isinstance(hook_module, dict):
+            if target_module is not None:
+                raise ValueError("pass either a dict of hook modules or target_module, not both")
+            self.kind, self.names, self.modules = "dict", list(hook_module), list(hook_module.values())
+        elif target_module is not None:
+            self.kind, self.names, self.modules = "pair", ["activations", "targets"], [hook_module, target_module]
+        else:
+            self.kind, self.names, self.modules = "tensor", ["activations"], [hook_module]
+        self._widths: list[int] = []
 
     @torch.no_grad()
     def harvest(self, batch: Any) -> Tensor:
@@ -451,34 +527,23 @@ class ActivationStore:
             batch: A batch from ``input_loader``.
 
         Returns:
-            Activations of the kept tokens, ``(n, d)``; with ``target_module``
-            the input and target concatenated along the last dimension.
+            Activations of the kept tokens, ``(n, d)``; with several hooks
+            (or ``target_module``) their activations concatenated along the
+            last dimension.
         """
         self.model.eval()
         batch = _to_device(batch, self.device)
         with torch.autocast(self.device.type, dtype=self.autocast_dtype or torch.float32,
                             enabled=self.autocast_dtype is not None):
-            if self.target_module is None:
-                acts = [run_capture(self.model, self.hook_module, batch, self.input_fn, stop=True)]
-            else:
-                args, kwargs = self.input_fn(batch)
-                with capture_activation(self.hook_module) as src, \
-                        capture_activation(self.target_module, stop=True) as tgt:
-                    try:
-                        self.model(*args, **kwargs)
-                    except _StopForward:
-                        pass
-                acts = [src["act"], tgt["act"]]
+            acts = run_capture_many(self.model, self.modules, batch, self.input_fn, stop=True)
         tokens = [to_tokens(a, self.layout) for a in acts]
         keep = token_keep_mask(tokens[0], self.exclude_positions, self.token_mask_fn, batch)
-        self._d_in = tokens[0].shape[-1]
+        self._widths = [t.shape[-1] for t in tokens]
         flat = torch.cat([t[keep].to(tokens[0].dtype) for t in tokens], -1)
         return flat.to(self.storage_dtype) if self.storage_dtype else flat
 
-    def _serve(self, batch: Tensor) -> Tensor | tuple[Tensor, Tensor]:
-        if self.target_module is None:
-            return batch
-        return batch[:, : self._d_in], batch[:, self._d_in :]
+    def _serve(self, batch: Tensor) -> Tensor | tuple[Tensor, Tensor] | dict[str, Tensor]:
+        return split_fields(batch, self.kind, self.names, self._widths)
 
     def __iter__(self) -> Iterator[Tensor]:
         buffer: list[Tensor] = []

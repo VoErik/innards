@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import json
 import math
 import time
 from collections.abc import (
@@ -47,16 +48,13 @@ from dataclasses import (
     asdict,
     dataclass
 )
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn.functional as F
-from einops import (
-    pack,
-    rearrange,
-    reduce
-)
+from einops import rearrange
 from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
@@ -70,9 +68,13 @@ from .optim import (
     build_optimizers,
     default_lr
 )
+from .clt import (
+    CrossLayerTranscoder,
+    splice_clt
+)
 from .model import (
-    SAE,
-    SAEConfig
+    MODEL_TYPES,
+    SAE
 )
 
 LOGGING_BACKENDS: set = {"wandb", "mlflow", "tensorboard"}
@@ -274,7 +276,7 @@ class MetricLogger:
             for k, v in metrics.items():
                 self._tb.add_scalar(k, v, step)
         shown = ("loss", "fve", "l0", "sparsity_loss", "aux_loss", "kl", "dead_frac", "dense_frac", "k", "lr")
-        parts = [f"{k.split('/')[-1]} {v:.4g}" for k, v in metrics.items() if k.split("/")[-1] in shown]
+        parts = [f"{k.split('/', 1)[-1]} {v:.4g}" for k, v in metrics.items() if k.split("/")[-1] in shown]
         step_str = f"step {step:>7d} | " + " | ".join(parts)
         print("-" * len(step_str), flush=True)
         print(step_str, flush=True)
@@ -315,21 +317,6 @@ def _flatten(d: dict, prefix: str = "") -> dict[str, Any]:
         else:
             out[key] = v
     return out
-
-
-def _unwrap_batch(batch: Any, paired: bool = False) -> tuple[Tensor, Tensor | None]:
-    """Returns ``(x, y)`` with ``y`` the transcoder target (``None`` unless ``paired``)."""
-    if isinstance(batch, Tensor):
-        x, y = batch, None
-    elif isinstance(batch, (tuple, list)):
-        x, y = batch[0], (batch[1] if len(batch) > 1 else None)
-    elif isinstance(batch, dict):
-        x, y = batch["activations"], batch.get("targets")
-    else:
-        raise TypeError(f"unsupported batch type {type(batch)}")
-    if paired and y is None:
-        raise ValueError("a transcoder needs (input, target) batches, e.g. ActivationStore(target_module=...)")
-    return x, (y if paired else None)
 
 
 def _linear_schedule(total_steps: int, warmup: int, decay_frac: float) -> Callable[[int], float]:
@@ -378,7 +365,7 @@ class SAETrainer:
             ac = "bfloat16" if self.device.type == "cuda" and torch.cuda.is_bf16_supported() else None
         self.autocast_dtype = getattr(torch, ac) if ac else None
 
-        self.lr = self.cfg.lr or default_lr(self.cfg.optimizer, model.cfg.d_sae)
+        self.lr = self.cfg.lr or default_lr(self.cfg.optimizer, model.lr_d_sae)
         self.optimizers = build_optimizers(model, self.cfg.optimizer, self.lr, self.cfg.adam_betas, self.cfg.adam_eps)
         self.forward = torch.compile(model, dynamic=True) if self.cfg.compile else model
 
@@ -388,28 +375,25 @@ class SAETrainer:
 
         self.step = 0
         self.tokens_seen = 0
-        self.median_norm: float | None = None
-        self.median_norm_target: float | None = None
+        self.median_norms: list[Tensor] | None = None  # per batch tensor (per layer for stacked ones)
 
     def _autocast(self):
         return torch.autocast(self.device.type, dtype=self.autocast_dtype or torch.float32,
                               enabled=self.autocast_dtype is not None)
 
-    def _filter(self, x: Tensor, y: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
-        """Drops tokens whose input (or target) norm exceeds ``outlier_norm_factor`` times the median."""
-        if self.cfg.outlier_norm_factor is None or self.median_norm is None:
-            return x, y
-        keep = x.float().norm(dim=-1) <= self.cfg.outlier_norm_factor * self.median_norm
-        if y is not None and self.median_norm_target is not None:
-            keep &= y.float().norm(dim=-1) <= self.cfg.outlier_norm_factor * self.median_norm_target
-        return x[keep], (None if y is None else y[keep])
+    def _filter(self, tensors: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
+        """Drops tokens where any tensor's norm exceeds ``outlier_norm_factor`` times its median."""
+        if self.cfg.outlier_norm_factor is None or self.median_norms is None:
+            return tensors
+        keep = torch.ones(tensors[0].shape[0], dtype=torch.bool, device=tensors[0].device)
+        for t, med in zip(tensors, self.median_norms):
+            ok = t.float().norm(dim=-1) <= self.cfg.outlier_norm_factor * med.to(t.device)
+            keep &= ok.reshape(ok.shape[0], -1).all(-1)
+        return tuple(t[keep] for t in tensors)
 
-    def _prepare(self, batch: Any) -> tuple[Tensor, Tensor | None]:
-        x, y = _unwrap_batch(batch, self.model.cfg.transcoder)
-        x, _ = pack([x.to(self.device, non_blocking=True)], "* d_in")
-        if y is not None:
-            y, _ = pack([y.to(self.device, non_blocking=True)], "* d_out")
-        return self._filter(x, y)
+    def _prepare(self, batch: Any) -> tuple[Tensor, ...]:
+        tensors = self.model.batch_tensors(batch)
+        return self._filter(tuple(t.to(self.device, non_blocking=True) for t in tensors))
 
     def _optimizer_step(self, loss: Tensor, optimizers: list[tuple[Optimizer, bool]],
                         schedulers: list[LambdaLR]) -> Tensor:
@@ -432,31 +416,26 @@ class SAETrainer:
 
     @torch.no_grad()
     def initialize(self, dataloader: Iterable) -> None:
-        """Data-dependent initialization of the SAE.
+        """Data-dependent initialization of the model.
 
-        Estimates the median token norm for the outlier filter, then calls
-        :meth:`sae.model.SAE.initialize_from_data` on the filtered sample.
+        Estimates the median token norms for the outlier filter, then calls
+        the model's ``initialize_from_data`` on the filtered sample.
 
         Args:
             dataloader: Iterable of activation batches.
         """
-        needed = max(self.cfg.init_tokens, self.model.decoder.min_init_tokens)
-        xs, ys, n = [], [], 0
+        needed = max(self.cfg.init_tokens, self.model.min_init_tokens)
+        chunks: list[tuple[Tensor, ...]] = []
+        n = 0
         for batch in dataloader:
-            x, y = _unwrap_batch(batch, self.model.cfg.transcoder)
-            xs.append(pack([x.float()], "* d_in")[0])
-            if y is not None:
-                ys.append(pack([y.float()], "* d_out")[0])
-            n += xs[-1].shape[0]
+            chunks.append(tuple(t.float() for t in self.model.batch_tensors(batch)))
+            n += chunks[-1][0].shape[0]
             if n >= needed:
                 break
-        x = torch.cat(xs)[:needed].to(self.device)
-        y = torch.cat(ys)[:needed].to(self.device) if ys else None
-        self.median_norm = x.norm(dim=-1).median().item()
-        if y is not None:
-            self.median_norm_target = y.norm(dim=-1).median().item()
-        x, y = self._filter(x, y)
-        self.model.initialize_from_data(x, y, normalize_input=self.cfg.normalize_input,
+        sample = tuple(torch.cat(parts)[:needed].to(self.device) for parts in zip(*chunks))
+        self.median_norms = [t.norm(dim=-1).median(dim=0).values for t in sample]
+        sample = self._filter(sample)
+        self.model.initialize_from_data(*sample, normalize_input=self.cfg.normalize_input,
                                         b_dec_init=self.cfg.b_dec_init)
         if self.ema is not None:
             for name, p in self.model.named_parameters():
@@ -518,15 +497,15 @@ class SAETrainer:
         path.parent.mkdir(parents=True, exist_ok=True)
         state = {
             "format": CHECKPOINT_FORMAT,
-            "sae_config": self.model.cfg.to_json(),
+            "model_type": type(self.model).__name__,
+            "model_config": self.model.config_json(),
             "trainer_config": asdict(self.cfg),
             "model": self.model.state_dict(),
             "optimizers": [opt.state_dict() for opt, _ in self.optimizers],
             "ema": self.ema,
             "step": self.step,
             "tokens_seen": self.tokens_seen,
-            "median_norm": self.median_norm,
-            "median_norm_target": self.median_norm_target,
+            "median_norms": self.median_norms,
             "rng": torch.get_rng_state(),
         }
         tmp = path.with_name(path.name + ".tmp")
@@ -559,7 +538,7 @@ class SAETrainer:
         state = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(state, dict) or state.get("format") != CHECKPOINT_FORMAT:
             raise ValueError(f"{path} is not a trainer checkpoint")
-        model = SAE(SAEConfig.from_json(state["sae_config"]))
+        model = MODEL_TYPES[state["model_type"]].from_config_json(state["model_config"])
         model.load_state_dict(state["model"])
         trainer = cls(model, cfg if cfg is not None else TrainerConfig(**state["trainer_config"]))
         for (opt, _), opt_state in zip(trainer.optimizers, state["optimizers"], strict=True):
@@ -569,21 +548,11 @@ class SAETrainer:
                 trainer.ema[name].copy_(value)
         trainer.step = state["step"]
         trainer.tokens_seen = state["tokens_seen"]
-        trainer.median_norm = state["median_norm"]
-        trainer.median_norm_target = state["median_norm_target"]
+        trainer.median_norms = state["median_norms"]
         torch.set_rng_state(state["rng"])
         return trainer
 
-    def _k_at(self, step: int) -> int:
-        """k at ``step`` under linear k annealing."""
-        cfg, mcfg = self.cfg, self.model.cfg
-        if cfg.k_decay_steps <= 0 or step >= cfg.k_decay_steps:
-            return mcfg.k
-        k0 = cfg.k_initial or min(mcfg.d_sae, 10 * mcfg.d_in)
-        progress = step / cfg.k_decay_steps
-        return round(k0 * (1 - progress) + mcfg.k * progress)
-
-    def _batches(self, dataloader: Iterable, total_steps: int) -> Iterator[Tensor]:
+    def _batches(self, dataloader: Iterable, total_steps: int) -> Iterator[tuple[Tensor, ...]]:
         if self.cfg.total_tokens is not None:
             source = itertools.chain.from_iterable(itertools.repeat(dataloader))
         else:
@@ -591,16 +560,15 @@ class SAETrainer:
         for batch in source:
             if self.step >= total_steps:
                 return
-            x, y = self._prepare(batch)
-            if x.shape[0] > 1:
-                yield x, y
+            tensors = self._prepare(batch)
+            if tensors[0].shape[0] > 1:
+                yield tensors
 
     def _total_steps(self, dataloader: Iterable) -> int:
         if self.cfg.total_tokens is not None:
             batch_tokens = getattr(dataloader, "batch_tokens", None)
             if batch_tokens is None:
-                first, _ = pack([_unwrap_batch(next(iter(dataloader)))[0]], "* d_in")
-                batch_tokens = first.shape[0]
+                batch_tokens = self.model.batch_tensors(next(iter(dataloader)))[0].shape[0]
             return math.ceil(self.cfg.total_tokens / batch_tokens)
         if not hasattr(dataloader, "__len__"):
             raise ValueError(
@@ -609,16 +577,16 @@ class SAETrainer:
             )
         return len(dataloader) * self.cfg.num_epochs
 
-    def train(self, dataloader: Iterable) -> SAE:
+    def train(self, dataloader: Iterable) -> nn.Module:
         """
-        Trains the SAE on reconstruction.
+        Trains the model on reconstruction.
 
         Args:
-            dataloader: Iterable of activation batches ``(..., d_in)``: a
-                :class:`~sae.data.ActivationStore`, or a ``DataLoader`` yielding
-                tensors, tuples (first element used) or dicts with an
-                ``"activations"`` key. Needs ``len()`` unless
-                ``total_tokens`` is set.
+            dataloader: Iterable of activation batches: a
+                :class:`~sae.data.ActivationStore`, cached activations, or a
+                ``DataLoader``, yielding whatever the model's ``batch_tensors``
+                accepts (tensors, ``(input, target)`` pairs, dicts). Needs
+                ``len()`` unless ``total_tokens`` is set.
 
         Returns:
             The trained model (EMA weights if enabled). A final checkpoint is
@@ -626,7 +594,7 @@ class SAETrainer:
             :meth:`from_checkpoint` continues from its saved step.
         """
         cfg, model = self.cfg, self.model
-        if self.median_norm is None:
+        if self.median_norms is None:
             self.initialize(dataloader)
         total_steps = self._total_steps(dataloader)
         warmup = max(1, min(cfg.warmup_steps, total_steps // 20)) # 5% cap
@@ -638,26 +606,26 @@ class SAETrainer:
         ]
 
         run_name = cfg.run_name or time.strftime("sae-%Y%m%d-%H%M%S")
-        full_config = {"sae": asdict(model.cfg), "trainer": asdict(cfg), "lr_resolved": self.lr,
+        full_config = {"model": json.loads(model.config_json()), "trainer": asdict(cfg), "lr_resolved": self.lr,
                        "total_steps": total_steps}
         logger = MetricLogger(cfg.loggers, cfg.project, run_name, cfg.log_dir, full_config)
 
-        window = _Window(model.cfg.d_sae, self.device)
-        uses_k = model.activation.uses_k
+        window = _Window(model.tokens_since_active.shape, self.device)
+        uses_k = model.uses_k
         model.train()
         try:
-            for flat, target in self._batches(dataloader, total_steps):
-                if uses_k:
-                    model.set_k(self._k_at(self.step))
+            for tensors in self._batches(dataloader, total_steps):
+                if uses_k and cfg.k_decay_steps > 0:
+                    model.anneal_k(min(1.0, self.step / cfg.k_decay_steps), cfg.k_initial)
                 if cfg.sparsity_warmup_steps > 0:
                     model.sparsity_scale = min(1.0, (self.step + 1) / cfg.sparsity_warmup_steps)
                 with self._autocast():
-                    out = self.forward(flat, target=target, return_acts=False)
+                    out = self.forward(*tensors, return_acts=False)
                 grad_norm = self._optimizer_step(out.loss, self.optimizers, schedulers)
 
                 self.step += 1
-                self.tokens_seen += flat.shape[0]
-                window.add(out, grad_norm, flat.shape[0])
+                self.tokens_seen += tensors[0].shape[0]
+                window.add(out, grad_norm, tensors[0].shape[0])
 
                 if self.step % cfg.log_every == 0 or self.step == total_steps:
                     metrics = window.summary(model, cfg.dense_threshold)
@@ -675,8 +643,7 @@ class SAETrainer:
                 if cfg.checkpoint_every and self.step % cfg.checkpoint_every == 0:
                     self.save_checkpoint()
         finally:
-            if uses_k:
-                model.set_k(model.cfg.k)
+            model.anneal_k(1.0)  # back to the configured k
             model.sparsity_scale = 1.0
             logger.close()
 
@@ -717,6 +684,8 @@ class SAETrainer:
             The fine-tuned model (EMA weights if enabled). A checkpoint is
             written to ``output_dir/sae_kl.safetensors``.
         """
+        if not isinstance(self.model, SAE):
+            raise TypeError("finetune_kl supports single SAEs and transcoders")
         kc = kl_cfg or KLFinetuneConfig()
         sae = self.sae_for_finetune()
         lr = kc.lr or self.lr * kc.lr_scale
@@ -808,26 +777,32 @@ class SAETrainer:
             max_batches: Optional cap on the number of batches.
 
         Returns:
-            ``eval/nmse``, ``eval/fve`` and ``eval/l0``.
+            ``eval/nmse``, ``eval/fve`` and ``eval/l0``; for models with
+            several dictionaries one set per member (``eval/<name>/nmse``, ...).
         """
         model = self.export_model()
         was_training = model.training
         model.eval()
-        sse = sst = l0 = n = 0.0
+        sums: dict[str, list[float]] = {}
+        n = 0
         for i, batch in enumerate(dataloader):
             if max_batches is not None and i >= max_batches:
                 break
-            flat, target = self._prepare(batch)
+            tensors = self._prepare(batch)
             with self._autocast():
-                out = model(flat, target=target, return_acts=False)
-            y = (flat if target is None else target).float()
-            sse += ((out.recon.float() - y) ** 2).sum().item()
-            sst += ((y - reduce(y, "n d -> 1 d", "mean")) ** 2).sum().item()
-            l0 += out.latent_counts.sum().item()
-            n += flat.shape[0]
+                out = model(*tensors, return_acts=False)
+            for name, parts in model.eval_sums(out, *tensors).items():
+                acc = sums.setdefault(name, [0.0, 0.0, 0.0])
+                for j, v in enumerate(parts):
+                    acc[j] += v
+            n += tensors[0].shape[0]
         model.train(was_training)
-        nmse = sse / max(sst, 1e-8)
-        return {"eval/nmse": nmse, "eval/fve": 1 - nmse, "eval/l0": l0 / max(n, 1)}
+        result = {}
+        for name, (sse, sst, active) in sums.items():
+            prefix = f"eval/{name}/" if name else "eval/"
+            nmse = sse / max(sst, 1e-8)
+            result.update({f"{prefix}nmse": nmse, f"{prefix}fve": 1 - nmse, f"{prefix}l0": active / max(n, 1)})
+        return result
 
     @torch.no_grad()
     def evaluate_downstream(
@@ -865,7 +840,10 @@ class SAETrainer:
             ablation: Baseline replacing the kept tokens for ``L_ablated``:
                 ``"zero"``, or ``"mean"`` (mean of the batch's kept tokens).
             target_module: For transcoders: the module whose output the
-                transcoder replaces (``hook_module`` is its input).
+                transcoder replaces (``hook_module`` is its input). For a
+                :class:`~sae.clt.CrossLayerTranscoder`, ``hook_module`` and
+                ``target_module`` are the per-layer lists of MLP inputs and
+                MLPs, which are all replaced (or ablated) together.
 
         Returns:
             ``downstream/kl`` and ``downstream/top1_agreement``; with
@@ -875,6 +853,9 @@ class SAETrainer:
         Raises:
             ValueError: If ``ablation`` is unknown.
         """
+        is_clt = isinstance(self.model, CrossLayerTranscoder)
+        if not isinstance(self.model, SAE) and not is_clt:
+            raise TypeError("evaluate_downstream supports single SAEs, transcoders and cross-layer transcoders")
         if ablation not in ("zero", "mean"):
             raise ValueError(f"ablation must be 'zero' or 'mean', got {ablation!r}")
         kc = kl_cfg or KLFinetuneConfig()
@@ -895,16 +876,27 @@ class SAETrainer:
             batch = _to_device(batch, self.device)
             args, kwargs = kc.input_fn(batch)
 
-            def spliced(fn: Callable[[Tensor, Tensor], Tensor]):
-                return splice(hook_module, fn, target_module, kc.layout, kc.exclude_positions, kc.token_mask_fn,
-                              batch)
+            def replaced():
+                if is_clt:
+                    return splice_clt(sae, hook_module, target_module, layout=kc.layout,
+                                      exclude_positions=kc.exclude_positions, token_mask_fn=kc.token_mask_fn,
+                                      batch=batch)
+                return splice(hook_module, lambda x, y: sae.reconstruct(x), target_module, kc.layout,
+                              kc.exclude_positions, kc.token_mask_fn, batch)
+
+            def ablated():
+                stack = ExitStack()
+                for m in (target_module if is_clt else [target_module or hook_module]):
+                    stack.enter_context(splice(m, ablate, None, kc.layout, kc.exclude_positions, kc.token_mask_fn,
+                                               batch))
+                return stack
 
             with self._autocast():
                 clean_out = model(*args, **kwargs)
-                with spliced(lambda x, y: sae.reconstruct(x)):
+                with replaced():
                     patched_out = model(*args, **kwargs)
                 if loss_fn is not None:
-                    with spliced(ablate):
+                    with ablated():
                         ablated_out = model(*args, **kwargs)
             clean, patched = kc.output_fn(clean_out).float(), kc.output_fn(patched_out).float()
             mask = kc.kl_mask_fn(batch) if kc.kl_mask_fn else None
@@ -940,8 +932,8 @@ class SAETrainer:
 class _Window:
     """Accumulates metrics between log steps."""
 
-    def __init__(self, d_sae: int, device: torch.device):
-        self.counts = torch.zeros(d_sae, dtype=torch.long, device=device)
+    def __init__(self, shape: tuple[int, ...], device: torch.device):
+        self.counts = torch.zeros(shape, dtype=torch.long, device=device)
         self.reset()
 
     def reset(self) -> None:
@@ -961,10 +953,11 @@ class _Window:
     def log_density(self) -> Tensor:
         return torch.log10(self.counts.float() / max(self.tokens, 1) + 1e-10)
 
-    def summary(self, model: SAE, dense_threshold: float) -> dict[str, float]:
+    def summary(self, model: nn.Module, dense_threshold: float) -> dict[str, float]:
         s = max(self.steps, 1)
         m = {f"train/{k}": v / s for k, v in self.sums.items()}
-        m["train/fve"] = 1.0 - m["train/nmse"]
+        for k in [k for k in m if k.split("/")[-1] == "nmse"]:
+            m[k.removesuffix("nmse") + "fve"] = 1.0 - m[k]
         density = self.counts.float() / max(self.tokens, 1)
         m["train/dense_frac"] = (density > dense_threshold).float().mean().item()
         m["train/dead_frac"] = model.dead_mask.float().mean().item()
