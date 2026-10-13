@@ -147,6 +147,21 @@ trainer.train(store)
 trainer.evaluate_downstream(model, ln, loader, kl_cfg, target_module=mlp)
 ```
 
+## SAELens interop
+
+```python
+from sae.interop import load_saelens, save_saelens
+
+save_saelens(sae, "export/blocks.6", metadata={"model_name": "vit_tiny", "hook_name": "blocks.6"})
+gemma_scope_sae, cfg = load_saelens("path/to/saelens/sae")  # then use sae.analysis etc. on it
+```
+
+Supported: TopK, AbsTopK, BatchTopK (exported as JumpReLU with a constant
+threshold), JumpReLU and ReLU SAEs; ReLU / JumpReLU / BatchTopK transcoders
+with or without skip connection. `tests/test_interop.py` cross-checks both
+directions against the `sae_lens` package when it is installed
+(`uv run --group dev --with sae-lens pytest tests/test_interop.py`).
+
 ## Notebooks
 
 * `notebooks/vision_vit.ipynb`: ViT-Tiny (timm) on Imagenette.

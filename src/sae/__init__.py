@@ -15,6 +15,7 @@ Core modules:
 * :mod:`sae.interventions`: ablating, clamping and steering latents.
 * :mod:`sae.latent_cache`: encoding a dataset once and analysing the cached
   latents (statistics, top / quantile examples, co-occurrence).
+* :mod:`sae.interop`: reading and writing the SAELens format.
 
 Optional: :mod:`sae.viz` (plots and HTML views; ``viz`` extra).
 """
