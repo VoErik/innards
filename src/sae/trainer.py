@@ -1,5 +1,5 @@
 """
-Trainer for :class:`sae.model.TopKSAE`
+Trainer for :class:`sae.model.SAE`.
 
 Two phases:
 
@@ -64,16 +64,14 @@ from torch.optim.lr_scheduler import LambdaLR
 from .data import (
     _to_device,
     default_input_fn,
-    from_tokens,
-    keep_positions,
+    patch_kept_tokens,
     replace_activation,
-    to_tokens,
 )
 from .optim import (
     build_optimizers,
     default_lr
 )
-from .model import TopKSAE
+from .model import SAE
 
 LOGGING_BACKENDS: set = {"wandb", "mlflow", "tensorboard"}
 
@@ -98,9 +96,13 @@ class TrainerConfig:
             ``None`` disables clipping.
         ema_decay: Weight-EMA decay, e.g. 0.999 (Gao et al., 2024); ``None``
             disables it.
-        k_decay_steps: Steps of linear k annealing; 0 disables it.
+        k_decay_steps: Steps of linear k annealing (TopK-style activations);
+            0 disables it.
         k_initial: Starting k for annealing; ``None`` uses
             ``min(d_sae, 10 * d_in)`` as in ``sparsify``.
+        sparsity_warmup_steps: Steps over which the sparsity penalty of
+            penalty-based activations (JumpReLU, ReLU) ramps linearly from 0
+            to its full weight (Conerly et al., 2024); 0 disables it.
         init_tokens: Tokens used for the data-dependent initialisation. The
             Archetypal decoder uses at least ``4 * n_candidates``.
         normalize_input: Estimate the input scale (Conerly et al., 2024).
@@ -139,6 +141,7 @@ class TrainerConfig:
 
     k_decay_steps: int = 0
     k_initial: int | None = None
+    sparsity_warmup_steps: int = 0
 
     init_tokens: int = 65_536
     normalize_input: bool = True
@@ -184,6 +187,9 @@ class KLFinetuneConfig:
         layout: Activation layout at the hook (see ``sae.data.LAYOUTS``).
         exclude_positions: Token positions left unpatched (e.g. CLS / BOS),
             consistent with the positions excluded during training.
+        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
+            tokens to patch, e.g. non-padding tokens; others pass through
+            unchanged and do not enter the SAE loss.
         input_fn: Maps a loader batch to model ``(args, kwargs)``.
         output_fn: Maps the model output to logits ``(..., n_classes)``; e.g.
             ``lambda out: out.logits`` for Hugging Face models.
@@ -197,6 +203,7 @@ class KLFinetuneConfig:
     lr_scale: float = 0.25
     layout: str = "btd"
     exclude_positions: Sequence[int] = ()
+    token_mask_fn: Callable[[Any], Tensor] | None = None
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn
     output_fn: Callable[[Any], Tensor] = lambda out: out
     kl_mask_fn: Callable[[Any], Tensor] | None = None
@@ -258,7 +265,7 @@ class MetricLogger:
         if self._tb:
             for k, v in metrics.items():
                 self._tb.add_scalar(k, v, step)
-        shown = ("loss", "fve", "l0", "aux_loss", "kl", "dead_frac", "dense_frac", "k", "lr")
+        shown = ("loss", "fve", "l0", "sparsity_loss", "aux_loss", "kl", "dead_frac", "dense_frac", "k", "lr")
         parts = [f"{k.split('/')[-1]} {v:.4g}" for k, v in metrics.items() if k.split("/")[-1] in shown]
         step_str = f"step {step:>7d} | " + " | ".join(parts)
         print("-" * len(step_str), flush=True)
@@ -327,7 +334,7 @@ def _linear_schedule(total_steps: int, warmup: int, decay_frac: float) -> Callab
 
 class SAETrainer:
     """
-    Trains a :class:`sae.model.TopKSAE`.
+    Trains a :class:`sae.model.SAE`.
 
     Args:
         model: The SAE.
@@ -342,7 +349,7 @@ class SAETrainer:
         tokens_seen: Tokens consumed in :meth:`train`.
     """
 
-    def __init__(self, model: TopKSAE, cfg: TrainerConfig | None = None):
+    def __init__(self, model: SAE, cfg: TrainerConfig | None = None):
         self.cfg = cfg or TrainerConfig()
         self.model = model
         torch.manual_seed(self.cfg.seed)
@@ -409,14 +416,12 @@ class SAETrainer:
         """Data-dependent initialization of the SAE.
 
         Estimates the median token norm for the outlier filter, then calls
-        :meth:`sae.model.TopKSAE.initialize_from_data` on the filtered sample.
+        :meth:`sae.model.SAE.initialize_from_data` on the filtered sample.
 
         Args:
             dataloader: Iterable of activation batches.
         """
-        needed = self.cfg.init_tokens
-        if self.model.cfg.archetypal:
-            needed = max(needed, 4 * self.model.cfg.archetypal_n_candidates)
+        needed = max(self.cfg.init_tokens, self.model.decoder.min_init_tokens)
         chunks, n = [], 0
         for batch in dataloader:
             flat, _ = pack([_unwrap_batch(batch).float()], "* d_in")
@@ -439,7 +444,7 @@ class SAETrainer:
         for name, p in self.model.named_parameters():
             self.ema[name].lerp_(p.detach(), 1 - self.cfg.ema_decay)
 
-    def export_model(self) -> TopKSAE:
+    def export_model(self) -> SAE:
         """
         Returns the model to evaluate or save.
 
@@ -471,7 +476,7 @@ class SAETrainer:
         return self.export_model().save(path, extra_metadata=meta)
 
     def _k_at(self, step: int) -> int:
-        """For k annealing."""
+        """k at ``step`` under linear k annealing."""
         cfg, mcfg = self.cfg, self.model.cfg
         if cfg.k_decay_steps <= 0 or step >= cfg.k_decay_steps:
             return mcfg.k
@@ -498,9 +503,14 @@ class SAETrainer:
                 first, _ = pack([_unwrap_batch(next(iter(dataloader)))], "* d_in")
                 batch_tokens = first.shape[0]
             return math.ceil(self.cfg.total_tokens / batch_tokens)
-        return len(dataloader) * self.cfg.num_epochs  # type: ignore[arg-type]
+        if not hasattr(dataloader, "__len__"):
+            raise ValueError(
+                f"{type(dataloader).__name__} has no len(), so the number of steps per epoch is unknown; "
+                "set TrainerConfig.total_tokens when streaming (e.g. from an ActivationStore)"
+            )
+        return len(dataloader) * self.cfg.num_epochs
 
-    def train(self, dataloader: Iterable) -> TopKSAE:
+    def train(self, dataloader: Iterable) -> SAE:
         """
         Trains the SAE on reconstruction.
 
@@ -531,10 +541,14 @@ class SAETrainer:
         logger = MetricLogger(cfg.loggers, cfg.project, run_name, cfg.log_dir, full_config)
 
         window = _Window(model.cfg.d_sae, self.device)
+        uses_k = model.activation.uses_k
         model.train()
         try:
             for flat in self._batches(dataloader, total_steps):
-                model.set_k(self._k_at(self.step))
+                if uses_k:
+                    model.set_k(self._k_at(self.step))
+                if cfg.sparsity_warmup_steps > 0:
+                    model.sparsity_scale = min(1.0, (self.step + 1) / cfg.sparsity_warmup_steps)
                 with self._autocast():
                     out = self.forward(flat, return_acts=False)
                 grad_norm = self._optimizer_step(out.loss, self.optimizers, schedulers)
@@ -546,7 +560,8 @@ class SAETrainer:
                 if self.step % cfg.log_every == 0 or self.step == total_steps:
                     metrics = window.summary(model, cfg.dense_threshold)
                     metrics["lr"] = schedulers[0].get_last_lr()[0]
-                    metrics["train/k"] = float(model.k_current)
+                    if uses_k:
+                        metrics["train/k"] = float(model.k_current)
                     metrics["tokens_seen"] = float(self.tokens_seen)
                     logger.log(metrics, self.step)
                     if self.step % cfg.hist_every == 0:
@@ -556,7 +571,9 @@ class SAETrainer:
                 if cfg.save_every and self.step % cfg.save_every == 0:
                     self.save(Path(cfg.output_dir) / f"sae_step{self.step}.safetensors")
         finally:
-            model.set_k(model.cfg.k)
+            if uses_k:
+                model.set_k(model.cfg.k)
+            model.sparsity_scale = 1.0
             logger.close()
 
         self.save(Path(cfg.output_dir) / "sae.safetensors")
@@ -568,7 +585,7 @@ class SAETrainer:
         hook_module: nn.Module,
         input_loader: Iterable,
         kl_cfg: KLFinetuneConfig | None = None,
-    ) -> TopKSAE:
+    ) -> SAE:
         """
         Fine-tunes the SAE spliced into ``model`` on KL + reconstruction.
 
@@ -615,14 +632,13 @@ class SAETrainer:
                 args, kwargs = kc.input_fn(batch)
                 captured: dict[str, Any] = {}
 
+                def reconstruct(x: Tensor) -> Tensor:
+                    captured["out"] = sae(x, return_acts=False)
+                    return captured["out"].recon
+
                 def patch(act: Tensor) -> Tensor:
-                    tokens = to_tokens(act, kc.layout)
-                    pos = keep_positions(tokens.shape[1], kc.exclude_positions, tokens.device)
-                    out = sae(tokens[:, pos], return_acts=False)
-                    captured["out"] = out
-                    patched = tokens.clone()
-                    patched[:, pos] = out.recon.to(tokens.dtype)
-                    return from_tokens(patched, kc.layout, act)
+                    return patch_kept_tokens(act, reconstruct, kc.layout, kc.exclude_positions,
+                                             kc.token_mask_fn, batch)
 
                 with self._autocast():
                     with torch.no_grad():
@@ -656,7 +672,7 @@ class SAETrainer:
                   kl_steps=str(step))
         return self.export_model()
 
-    def sae_for_finetune(self) -> TopKSAE:
+    def sae_for_finetune(self) -> SAE:
         """Merges EMA weights into SAE."""
         if self.ema is not None:
             with torch.no_grad():
@@ -726,8 +742,8 @@ class SAETrainer:
             model: The model the activations come from.
             hook_module: The module whose output the SAE reconstructs.
             input_loader: Iterable of model inputs.
-            kl_cfg: Supplies ``layout``, ``exclude_positions``, ``input_fn``,
-                ``output_fn`` and ``kl_mask_fn``.
+            kl_cfg: Supplies ``layout``, ``exclude_positions``,
+                ``token_mask_fn``, ``input_fn``, ``output_fn`` and ``kl_mask_fn``.
             max_batches: Optional cap on the number of batches.
 
         Returns:
@@ -741,18 +757,16 @@ class SAETrainer:
         kl_sum = agree = rows = 0.0
         n_batches = 0
 
-        def patch(act: Tensor) -> Tensor:
-            tokens = to_tokens(act, kc.layout)
-            pos = keep_positions(tokens.shape[1], kc.exclude_positions, tokens.device)
-            patched = tokens.clone()
-            patched[:, pos] = sae(tokens[:, pos], return_acts=False).recon.to(tokens.dtype)
-            return from_tokens(patched, kc.layout, act)
-
         for i, batch in enumerate(input_loader):
             if max_batches is not None and i >= max_batches:
                 break
             batch = _to_device(batch, self.device)
             args, kwargs = kc.input_fn(batch)
+
+            def patch(act: Tensor) -> Tensor:
+                return patch_kept_tokens(act, sae.reconstruct, kc.layout, kc.exclude_positions,
+                                         kc.token_mask_fn, batch)
+
             with self._autocast():
                 clean = kc.output_fn(model(*args, **kwargs)).float()
                 with replace_activation(hook_module, patch):
@@ -795,7 +809,7 @@ class _Window:
     def log_density(self) -> Tensor:
         return torch.log10(self.counts.float() / max(self.tokens, 1) + 1e-10)
 
-    def summary(self, model: TopKSAE, dense_threshold: float) -> dict[str, float]:
+    def summary(self, model: SAE, dense_threshold: float) -> dict[str, float]:
         s = max(self.steps, 1)
         m = {f"train/{k}": v / s for k, v in self.sums.items()}
         m["train/fve"] = 1.0 - m["train/nmse"]

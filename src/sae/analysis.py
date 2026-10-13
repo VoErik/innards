@@ -54,14 +54,14 @@ from .data import (
     _to_device,
     capture_activation,
     default_input_fn,
-    from_tokens,
     keep_positions,
+    patch_kept_tokens,
     replace_activation,
     run_capture,
     to_tokens,
     token_keep_mask,
 )
-from .model import TopKSAE
+from .model import SAE
 
 
 @dataclass
@@ -196,20 +196,21 @@ class Attribution:
     Result of :func:`latent_attribution`.
 
     Attributes:
-        acts: Latent activations on the kept positions, ``(batch, tokens, d_sae)``.
+        acts: Latent activations, ``(batch, tokens, d_sae)``; zero at
+            tokens that were not patched.
         attribution: ``acts * d target / d acts``, same shape: the
             first-order estimate of how much the target drops if the latent
             is zero-ablated at that position. TODO: also add median ablation
         error_attribution: Attribution of the SAE error term, summed over
             ``d_in``, shape ``(batch, tokens)``.
-        positions: Kept token positions (indices into the full sequence).
+        keep: Boolean ``(batch, tokens)`` mask of the patched tokens.
         target: The target values, shape ``(batch,)``.
     """
 
     acts: Tensor
     attribution: Tensor
     error_attribution: Tensor
-    positions: Tensor
+    keep: Tensor
     target: Tensor
 
     def top_latents(self, example: int = 0, n: int = 10) -> tuple[Tensor, Tensor]:
@@ -267,7 +268,7 @@ def tokens_to_grid(values: Tensor, grid: tuple[int, int] | None = None) -> Tenso
 
 @torch.no_grad()
 def encode_inputs(
-    sae: TopKSAE,
+    sae: SAE,
     model: nn.Module,
     hook_module: nn.Module,
     batch: Any,
@@ -297,7 +298,7 @@ def encode_inputs(
 
 @torch.no_grad()
 def analyze_dataset(
-    sae: TopKSAE,
+    sae: SAE,
     model: nn.Module,
     hook_module: nn.Module,
     input_loader: Iterable,
@@ -384,12 +385,12 @@ def analyze_dataset(
 
 
 @torch.no_grad()
-def _unit_atoms(sae: TopKSAE) -> Tensor:
+def _unit_atoms(sae: SAE) -> Tensor:
     return F.normalize(sae.decoder_weight().detach().float(), dim=-1)
 
 
 @torch.no_grad()
-def max_cosine_similarity(sae: TopKSAE, chunk: int = 4096) -> tuple[Tensor, Tensor]:
+def max_cosine_similarity(sae: SAE, chunk: int = 4096) -> tuple[Tensor, Tensor]:
     """
     Highest cosine similarity of each decoder atom to any other atom.
 
@@ -415,7 +416,7 @@ def max_cosine_similarity(sae: TopKSAE, chunk: int = 4096) -> tuple[Tensor, Tens
 
 
 @torch.no_grad()
-def nearest_latents(sae: TopKSAE, latent: int, n: int = 10) -> tuple[Tensor, Tensor]:
+def nearest_latents(sae: SAE, latent: int, n: int = 10) -> tuple[Tensor, Tensor]:
     """
     Latents whose decoder atoms are most similar to ``latent``'s.
 
@@ -435,7 +436,7 @@ def nearest_latents(sae: TopKSAE, latent: int, n: int = 10) -> tuple[Tensor, Ten
 
 
 @torch.no_grad()
-def decoder_similarity_matrix(sae: TopKSAE, latents: Sequence[int] | Tensor) -> Tensor:
+def decoder_similarity_matrix(sae: SAE, latents: Sequence[int] | Tensor) -> Tensor:
     """
     Pairwise cosine similarity of a subset of decoder atoms.
 
@@ -451,7 +452,7 @@ def decoder_similarity_matrix(sae: TopKSAE, latents: Sequence[int] | Tensor) -> 
 
 
 @torch.no_grad()
-def encoder_decoder_cosine(sae: TopKSAE) -> Tensor:
+def encoder_decoder_cosine(sae: SAE) -> Tensor:
     """
     Cosine similarity between each latent's encoder and decoder direction.
 
@@ -469,7 +470,7 @@ def encoder_decoder_cosine(sae: TopKSAE) -> Tensor:
 
 
 @torch.no_grad()
-def dictionary_embedding(sae: TopKSAE, method: str = "pca", n_components: int = 2, seed: int = 0) -> Tensor:
+def dictionary_embedding(sae: SAE, method: str = "pca", n_components: int = 2, seed: int = 0) -> Tensor:
     """
     Low-dimensional embedding of the unit-normalised decoder atoms.
 
@@ -508,7 +509,7 @@ def dictionary_embedding(sae: TopKSAE, method: str = "pca", n_components: int = 
 
 @torch.no_grad()
 def output_effects(
-    sae: TopKSAE,
+    sae: SAE,
     readout: Tensor,
     latents: Sequence[int] | Tensor | None = None,
     n: int = 10,
@@ -545,13 +546,14 @@ def output_effects(
 
 
 def latent_attribution(
-    sae: TopKSAE,
+    sae: SAE,
     model: nn.Module,
     hook_module: nn.Module,
     batch: Any,
     target_fn: Callable[[Any, Any], Tensor],
     layout: str = "btd",
     exclude_positions: Sequence[int] = (),
+    token_mask_fn: Callable[[Any], Tensor] | None = None,
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
 ) -> Attribution:
     """
@@ -573,6 +575,8 @@ def latent_attribution(
             next token at the last position.
         layout: Activation layout at the hook.
         exclude_positions: Positions left unpatched (e.g. CLS / BOS).
+        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
+            tokens to patch, e.g. non-padding tokens.
         input_fn: Maps the batch to model ``(args, kwargs)``.
 
     Returns:
@@ -582,36 +586,42 @@ def latent_attribution(
     model.eval()
     store: dict[str, Tensor] = {}
 
-    def patch(act: Tensor) -> Tensor:
-        tokens = to_tokens(act, layout)
-        pos = keep_positions(tokens.shape[1], exclude_positions, tokens.device)
-        x = tokens[:, pos].detach().to(sae.w_enc.dtype)
+    def splice(x: Tensor) -> Tensor:
+        x = x.detach().to(sae.w_enc.dtype)
         with torch.no_grad():
             acts = sae.encode(x)
         acts.requires_grad_(True)
         recon = sae.decode(acts)
         error = (x - recon.detach()).detach().requires_grad_(True)
-        store.update(acts=acts, error=error, pos=pos)
-        patched = tokens.clone()
-        patched[:, pos] = (recon + error).to(tokens.dtype)
-        return from_tokens(patched, layout, act)
+        store.update(acts=acts, error=error)
+        return recon + error
+
+    def patch(act: Tensor) -> Tensor:
+        store["keep"] = token_keep_mask(to_tokens(act, layout), exclude_positions, token_mask_fn, batch)
+        return patch_kept_tokens(act, splice, layout, exclude_positions, token_mask_fn, batch)
 
     args, kwargs = input_fn(batch)
     with _frozen(model, sae), replace_activation(hook_module, patch):
         target = target_fn(model(*args, **kwargs), batch)
         target.sum().backward()
-    acts, error = store["acts"], store["error"]
+    acts, error, keep = store["acts"], store["error"], store["keep"]
+
+    def scatter(values: Tensor) -> Tensor:
+        full = values.new_zeros(*keep.shape, *values.shape[1:])
+        full[keep] = values
+        return full
+
     return Attribution(
-        acts=acts.detach(),
-        attribution=(acts * acts.grad).detach(),
-        error_attribution=(error * error.grad).sum(-1).detach(),
-        positions=store["pos"],
+        acts=scatter(acts.detach()),
+        attribution=scatter((acts * acts.grad).detach()),
+        error_attribution=scatter((error * error.grad).sum(-1).detach()),
+        keep=keep,
         target=target.detach(),
     )
 
 
 def input_attribution(
-    sae: TopKSAE,
+    sae: SAE,
     model: nn.Module,
     hook_module: nn.Module,
     inputs: Tensor,
@@ -635,7 +645,7 @@ def input_attribution(
         layout: Activation layout at the hook.
         exclude_positions: Positions to ignore.
         use_preactivation: Differentiate the encoder pre-activation instead of
-            the post-TopK activation, so the map is informative even where
+            the post-activation value, so the map is informative even where
             the latent is not selected.
 
     Returns:
@@ -657,7 +667,7 @@ def input_attribution(
 
 @torch.no_grad()
 def latent_patch_maps(
-    sae: TopKSAE,
+    sae: SAE,
     model: nn.Module,
     hook_module: nn.Module,
     images: Tensor,

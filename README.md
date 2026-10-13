@@ -1,6 +1,7 @@
 # SAE
 
-TopK / BatchTopK sparse autoencoders for vision and  language models.
+Sparse autoencoders (TopK, BatchTopK, JumpReLU, ReLU + L1; Matryoshka, Archetypal) for vision
+and language models.
 
 ## Install
 
@@ -21,7 +22,7 @@ This assumes you have a *trained* (`torch`) vision or language model:
 
 ```python
 import torch
-from sae import (ActivationStore, CachedActivations, SAETrainer, TopKSAE,
+from sae import (SAE, ActivationStore, CachedActivations, SAETrainer,
                  TrainerConfig, cache_activations)
 
 # 0. Initialize the model and dataloaders etc.
@@ -42,12 +43,13 @@ store = ActivationStore(
 cache_activations(store, "activations/model_block6")
 acts = CachedActivations("activations/model_block6", batch_tokens=4096, device="cuda")
 
-# 3. Train (or pass `store` directly to stream without caching).
-sae = TopKSAE(
-    d_in=model.embed_dim, 
+# 3. Train (or pass `store` directly to stream without caching; streaming
+#    needs TrainerConfig(total_tokens=...) since a store has no length).
+sae = SAE(
+    d_in=model.embed_dim,
     d_sae=16 * model.embed_dim, # SAE expansion
-    k=32, # num active latents / sample
-    as_batchtopk=True
+    activation="batchtopk",     # see "Architectures" below
+    k=32,                       # num active latents / sample
 )
 trainer = SAETrainer(sae, TrainerConfig(num_epochs=5, loggers=("tensorboard",)))
 trainer.train(acts)
@@ -57,11 +59,47 @@ trainer.finetune_kl(model, model.blocks[6], loader)
 
 # 5. Save / load: one safetensors file, config in its metadata.
 sae.save("sae.safetensors")
-sae = TopKSAE.load("sae.safetensors", device="cuda")
+sae = SAE.load("sae.safetensors", device="cuda")
 ```
 
 Then analyze it with `sae.analysis` (latent statistics, top-activating  examples, dictionary geometry, 
 output effects, attributions) and plot with `sae.viz`.
+
+## Architectures
+
+An `SAE` is assembled from independent parts, chosen in `SAEConfig`:
+
+| Part | Options | Module |
+|---|---|---|
+| `activation` | `"topk"`, `"batchtopk"` (both with optional `abs_topk`), `"jumprelu"`, `"relu"` (L1) | `sae.activations` |
+| `decoder` | `"linear"` (unit-norm atoms), `"archetypal"` | `sae.decoders` |
+| loss terms | AuxK, `matryoshka`, `multi_topk` (TopK variants) | `sae.model` |
+
+```python
+SAE(d_in=768, d_sae=16384, activation="topk", k=64, matryoshka=True)
+SAE(d_in=768, d_sae=16384, activation="jumprelu", sparsity_coeff=1e-2)  # + TrainerConfig(sparsity_warmup_steps=...)
+SAE(d_in=768, d_sae=16384, activation="batchtopk", k=64, decoder="archetypal")
+```
+
+To add an architecture, subclass `Activation` and register it; the model,
+trainer, saving/loading and analysis code need no changes:
+
+```python
+from sae import Activation, register_activation
+from sae.activations import dense_code
+
+@register_activation("my_act")
+class MyActivation(Activation):
+    def forward(self, pre, k):               # (n, d_sae) pre-activations -> SparseCode
+        return dense_code(torch.relu(pre))
+
+    def penalty(self, pre, code, decoder_weight):  # optional sparsity loss
+        return self.cfg.sparsity_coeff * code.dense.sum(-1).mean()
+```
+
+Override `update_stats` for running statistics and `fold_` for thresholds
+that must be rescaled when saving. New decoder parametrizations subclass
+`Decoder` and go into `sae.decoders.DECODERS`.
 
 ## Notebooks
 

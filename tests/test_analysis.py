@@ -13,7 +13,7 @@ from sae import analysis as A
 from sae import viz
 from sae.cache import CachedActivations, cache_activations
 from sae.data import ActivationStore
-from sae.model import TopKSAE
+from sae.model import SAE
 from sae.trainer import SAETrainer, TrainerConfig
 
 
@@ -41,7 +41,7 @@ def setup(tmp_path_factory):
     images = torch.randn(96, 3, 16, 16)
     loader = DataLoader(TensorDataset(images), batch_size=16, shuffle=False)
     store = ActivationStore(vit, vit.block, loader, batch_tokens=128, buffer_tokens=512, exclude_positions=(0,))
-    sae = TopKSAE(d_in=32, d_sae=64, k=4)
+    sae = SAE(d_in=32, d_sae=64, k=4)
     out = tmp_path_factory.mktemp("ck")
     SAETrainer(sae, TrainerConfig(total_tokens=20_000, device="cpu", log_every=10**6, output_dir=str(out))).train(store)
     return vit, images, loader, store, sae.eval()
@@ -96,7 +96,7 @@ def test_dictionary_geometry(setup):
 def test_output_effects(setup):
     vit, *_, sae = setup
     eff = A.output_effects(sae, vit.head.weight, latents=[0, 5], n=3)
-    direct = sae.w_dec[5] @ vit.head.weight.T
+    direct = sae.decoder_weight()[5] @ vit.head.weight.T
     assert eff.top_values.shape == (2, 3)
     assert eff.top_values[1, 0].item() == pytest.approx(direct.max().item(), rel=1e-5)
 
@@ -157,3 +157,15 @@ def test_viz_smoke(setup):
     viz.plot_top_images(imgs, maps, values=[1.0, 2.0, 3.0], suptitle="latent 0")
     html = viz.text_examples_html([(["a", "b<", "c"], [0.0, 1.0, -0.5], 1)], title="latent 0", context=1)
     assert "b&lt;" in html and "rgba(220,60,50,1.000)" in html
+
+
+def test_latent_attribution_token_mask(setup):
+    vit, images, *_, sae = setup
+    x = images[:2]
+    mask_fn = lambda batch: torch.arange(17)[None].expand(batch.shape[0], -1) != 5  # drop patch 5
+    attr = A.latent_attribution(sae, vit, vit.block, x, lambda o, _: o[:, 3], exclude_positions=(0,),
+                                token_mask_fn=mask_fn)
+    assert attr.acts.shape == (2, 17, sae.cfg.d_sae)
+    assert not attr.keep[:, 0].any() and not attr.keep[:, 5].any() and attr.keep[:, 1].all()
+    assert (attr.acts[:, 5] == 0).all() and (attr.error_attribution[:, 0] == 0).all()
+    torch.testing.assert_close(attr.target, vit(x)[:, 3].detach(), atol=1e-5, rtol=1e-5)
