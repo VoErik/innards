@@ -39,6 +39,14 @@ dev = [
     "ipykernel>=6",
 ]
 
+docs = [
+    "sae[viz]",
+    "sphinx>=8",
+    "furo>=2024.8.6",
+    "myst-parser>=4",
+    "sphinx-copybutton>=0.5",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

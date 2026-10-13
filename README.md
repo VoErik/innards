@@ -3,6 +3,9 @@
 Sparse autoencoders (TopK, BatchTopK, JumpReLU, ReLU + L1; Matryoshka, Archetypal) for vision
 and language models.
 
+Documentation: <https://voerik.github.io/sparse-autoencoder/> (guides and API
+reference; build locally with `uv run --group docs sphinx-build docs docs/_build/html`).
+
 ## Install
 
 ```bash
