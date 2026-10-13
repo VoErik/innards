@@ -13,6 +13,8 @@ Core modules:
 * :mod:`sae.analysis`: latent statistics, top examples, dictionary
   geometry, output effects and attributions.
 * :mod:`sae.interventions`: ablating, clamping and steering latents.
+* :mod:`sae.latent_cache`: encoding a dataset once and analysing the cached
+  latents (statistics, top / quantile examples, co-occurrence).
 
 Optional: :mod:`sae.viz` (plots and HTML views; ``viz`` extra).
 """
@@ -38,6 +40,10 @@ from .decoders import (
     DECODERS,
     Decoder
 )
+from .latent_cache import (
+    LatentCache,
+    cache_latents
+)
 from .model import (
     SAE,
     SAEConfig,
@@ -57,6 +63,7 @@ __all__ = [
     "CachedActivations",
     "Decoder",
     "KLFinetuneConfig",
+    "LatentCache",
     "SAE",
     "SAEConfig",
     "SAEOutput",
@@ -64,6 +71,7 @@ __all__ = [
     "TrainerConfig",
     "analyze_dataset",
     "cache_activations",
+    "cache_latents",
     "latent_attribution",
     "latent_patch_maps",
     "max_cosine_similarity",
