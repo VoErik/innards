@@ -819,12 +819,19 @@ class SAETrainer:
         input_loader: Iterable,
         kl_cfg: KLFinetuneConfig | None = None,
         max_batches: int | None = None,
+        loss_fn: Callable[[Any, Any], Tensor] | None = None,
+        ablation: str = "zero",
     ) -> dict[str, float]:
         """
-        KL between the clean model and the model with the SAE spliced in.
+        Downstream fidelity of the model with the SAE spliced in.
 
-        For classifiers, also reports top-1 agreement between the clean and
-        patched predictions.
+        Reports the KL between the clean and the spliced model and the top-1
+        agreement of their predictions. With ``loss_fn`` it also reports the
+        model's loss clean, spliced, and with the hooked activation ablated,
+        and the fraction of loss recovered
+        ``(L_ablated - L_sae) / (L_ablated - L_clean)`` (1 = no degradation,
+        0 = as bad as removing the layer's output; e.g. Bricken et al., 2023;
+        Gao et al., 2024).
 
         Args:
             model: The model the activations come from.
@@ -833,17 +840,33 @@ class SAETrainer:
             kl_cfg: Supplies ``layout``, ``exclude_positions``,
                 ``token_mask_fn``, ``input_fn``, ``output_fn`` and ``kl_mask_fn``.
             max_batches: Optional cap on the number of batches.
+            loss_fn: Optional ``fn(model_output, batch) -> scalar`` mean loss,
+                e.g. next-token cross-entropy for a language model or
+                classification cross-entropy for a vision model.
+            ablation: Baseline replacing the kept tokens for ``L_ablated``:
+                ``"zero"``, or ``"mean"`` (mean of the batch's kept tokens).
 
         Returns:
-            ``downstream/kl`` and ``downstream/top1_agreement``.
+            ``downstream/kl`` and ``downstream/top1_agreement``; with
+            ``loss_fn`` also ``downstream/loss_clean``, ``loss_sae``,
+            ``loss_ablated``, ``delta_loss`` and ``loss_recovered``.
+
+        Raises:
+            ValueError: If ``ablation`` is unknown.
         """
+        if ablation not in ("zero", "mean"):
+            raise ValueError(f"ablation must be 'zero' or 'mean', got {ablation!r}")
         kc = kl_cfg or KLFinetuneConfig()
         sae = self.export_model()
         was_training = sae.training
         sae.eval()
         model.eval()
-        kl_sum = agree = rows = 0.0
+        sums = dict(kl=0.0, loss_clean=0.0, loss_sae=0.0, loss_ablated=0.0)
+        agree = rows = 0.0
         n_batches = 0
+
+        def ablate(x: Tensor) -> Tensor:
+            return x.mean(0, keepdim=True).expand_as(x) if ablation == "mean" else torch.zeros_like(x)
 
         for i, batch in enumerate(input_loader):
             if max_batches is not None and i >= max_batches:
@@ -851,16 +874,20 @@ class SAETrainer:
             batch = _to_device(batch, self.device)
             args, kwargs = kc.input_fn(batch)
 
-            def patch(act: Tensor) -> Tensor:
-                return patch_kept_tokens(act, sae.reconstruct, kc.layout, kc.exclude_positions,
-                                         kc.token_mask_fn, batch)
+            def patcher(fn: Callable[[Tensor], Tensor]) -> Callable[[Tensor], Tensor]:
+                return lambda act: patch_kept_tokens(act, fn, kc.layout, kc.exclude_positions, kc.token_mask_fn,
+                                                     batch)
 
             with self._autocast():
-                clean = kc.output_fn(model(*args, **kwargs)).float()
-                with replace_activation(hook_module, patch):
-                    patched = kc.output_fn(model(*args, **kwargs)).float()
+                clean_out = model(*args, **kwargs)
+                with replace_activation(hook_module, patcher(sae.reconstruct)):
+                    patched_out = model(*args, **kwargs)
+                if loss_fn is not None:
+                    with replace_activation(hook_module, patcher(ablate)):
+                        ablated_out = model(*args, **kwargs)
+            clean, patched = kc.output_fn(clean_out).float(), kc.output_fn(patched_out).float()
             mask = kc.kl_mask_fn(batch) if kc.kl_mask_fn else None
-            kl_sum += self._kl(clean, patched, mask).item()
+            sums["kl"] += self._kl(clean, patched, mask).item()
             c = rearrange(clean, "... c -> (...) c").argmax(-1)
             p = rearrange(patched, "... c -> (...) c").argmax(-1)
             if mask is not None:
@@ -868,9 +895,25 @@ class SAETrainer:
                 c, p = c[keep], p[keep]
             agree += (c == p).sum().item()
             rows += c.numel()
+            if loss_fn is not None:
+                sums["loss_clean"] += float(loss_fn(clean_out, batch))
+                sums["loss_sae"] += float(loss_fn(patched_out, batch))
+                sums["loss_ablated"] += float(loss_fn(ablated_out, batch))
             n_batches += 1
         sae.train(was_training)
-        return {"downstream/kl": kl_sum / max(n_batches, 1), "downstream/top1_agreement": agree / max(rows, 1)}
+
+        n = max(n_batches, 1)
+        out = {"downstream/kl": sums["kl"] / n, "downstream/top1_agreement": agree / max(rows, 1)}
+        if loss_fn is not None:
+            clean_l, sae_l, abl_l = (sums[k] / n for k in ("loss_clean", "loss_sae", "loss_ablated"))
+            out.update({
+                "downstream/loss_clean": clean_l,
+                "downstream/loss_sae": sae_l,
+                "downstream/loss_ablated": abl_l,
+                "downstream/delta_loss": sae_l - clean_l,
+                "downstream/loss_recovered": (abl_l - sae_l) / (abl_l - clean_l) if abl_l != clean_l else float("nan"),
+            })
+        return out
 
 
 class _Window:

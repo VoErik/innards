@@ -12,6 +12,7 @@ Core modules:
 * :mod:`sae.optim`: Adam, Muon and Signum (I only use Adam, but sparsify use Muon / Signum as well)
 * :mod:`sae.analysis`: latent statistics, top examples, dictionary
   geometry, output effects and attributions.
+* :mod:`sae.interventions`: ablating, clamping and steering latents.
 
 Optional: :mod:`sae.viz` (plots and HTML views; ``viz`` extra).
 """
