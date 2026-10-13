@@ -169,3 +169,15 @@ def test_latent_attribution_token_mask(setup):
     assert not attr.keep[:, 0].any() and not attr.keep[:, 5].any() and attr.keep[:, 1].all()
     assert (attr.acts[:, 5] == 0).all() and (attr.error_attribution[:, 0] == 0).all()
     torch.testing.assert_close(attr.target, vit(x)[:, 3].detach(), atol=1e-5, rtol=1e-5)
+
+
+def test_analyze_dataset_chunking_is_exact(setup):
+    vit, _, loader, _, sae = setup
+    full = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude_positions=(0,))
+    chunked = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude_positions=(0,), chunk_tokens=7)
+    torch.testing.assert_close(chunked.stats.frequency, full.stats.frequency)
+    torch.testing.assert_close(chunked.stats.max_activation, full.stats.max_activation)
+    torch.testing.assert_close(chunked.top.values, full.top.values)
+    filled = full.top.values != 0
+    assert torch.equal(chunked.top.example[filled], full.top.example[filled])
+    assert (full.top.position[~filled] == -1).all()
