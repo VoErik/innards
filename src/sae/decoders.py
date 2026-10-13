@@ -95,7 +95,7 @@ class Decoder(nn.Module):
         self.cfg = cfg
 
     def weight(self) -> Tensor:
-        """The dictionary, shape ``(d_sae, d_in)``."""
+        """The dictionary, shape ``(d_sae, d_out)``."""
         raise NotImplementedError
 
     def reset_parameters(self) -> Tensor:
@@ -103,7 +103,7 @@ class Decoder(nn.Module):
         Data-free initialization.
 
         Returns:
-            Unit-norm directions ``(d_sae, d_in)`` to tie the encoder to.
+            Unit-norm directions ``(d_sae, d_out)`` to tie an SAE's encoder to.
         """
         raise NotImplementedError
 
@@ -112,7 +112,7 @@ class Decoder(nn.Module):
         Data-dependent initialization.
 
         Args:
-            centred: Scaled activations minus the decoder bias, ``(n, d_in)``.
+            centred: Scaled reconstruction targets minus the decoder bias, ``(n, d_out)``.
 
         Returns:
             New directions to tie the encoder to, or ``None`` to keep it.
@@ -144,7 +144,7 @@ class LinearDecoder(Decoder):
 
     def __init__(self, cfg: SAEConfig):
         super().__init__(cfg)
-        self.w_dec = nn.Parameter(torch.empty(cfg.d_sae, cfg.d_in))
+        self.w_dec = nn.Parameter(torch.empty(cfg.d_sae, cfg.d_out))
 
     def weight(self) -> Tensor:
         return self.w_dec
@@ -180,16 +180,16 @@ class ArchetypalDecoder(Decoder):
 
     def __init__(self, cfg: SAEConfig):
         super().__init__(cfg)
-        d_sae, d_in, n_cand = cfg.d_sae, cfg.d_in, cfg.archetypal_n_candidates
+        d_sae, d_out, n_cand = cfg.d_sae, cfg.d_out, cfg.archetypal_n_candidates
         self.arch_weight = nn.Parameter(torch.empty(d_sae, n_cand))
-        self.arch_relax = nn.Parameter(torch.zeros(d_sae, d_in))
+        self.arch_relax = nn.Parameter(torch.zeros(d_sae, d_out))
         if cfg.archetypal_learn_scale:
             self.arch_log_scale = nn.Parameter(torch.zeros(()))
         else:
             self.register_buffer("arch_log_scale", torch.zeros(()))
-        self.register_buffer("arch_points", torch.zeros(n_cand, d_in))
+        self.register_buffer("arch_points", torch.zeros(n_cand, d_out))
         self.register_buffer("arch_initialized", torch.zeros((), dtype=torch.bool))
-        self.register_buffer("w_dec", torch.zeros(d_sae, d_in))
+        self.register_buffer("w_dec", torch.zeros(d_sae, d_out))
 
     @property
     def min_init_tokens(self) -> int:  # type: ignore[override]
@@ -226,7 +226,7 @@ class ArchetypalDecoder(Decoder):
         self.arch_relax.zero_()
         self.arch_log_scale.zero_()
         self.post_step()
-        return F.normalize(torch.randn(d_sae, self.cfg.d_in), dim=-1)
+        return F.normalize(torch.randn(d_sae, self.cfg.d_out), dim=-1)
 
     @torch.no_grad()
     def initialize_from_data_(self, centred: Tensor) -> Tensor:

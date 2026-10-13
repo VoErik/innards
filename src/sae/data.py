@@ -243,36 +243,97 @@ def replace_activation(module: nn.Module, fn: Callable[[Tensor], Tensor]) -> Ite
 
 def patch_kept_tokens(
     act: Tensor,
-    fn: Callable[[Tensor], Tensor],
+    fn: Callable[[Tensor, Tensor], Tensor],
     layout: str = "btd",
     exclude_positions: Sequence[int] = (),
     token_mask_fn: Callable[[Any], Tensor] | None = None,
     batch: Any = None,
+    source: Tensor | None = None,
 ) -> Tensor:
     """
-    Applies ``fn`` to the kept tokens of a captured activation.
+    Replaces the kept tokens of a captured activation by ``fn(x, y)``.
 
-    Used as the body of a :func:`replace_activation` hook to splice an SAE
-    into a model: excluded positions (CLS, BOS, ...) and tokens masked out by
+    Excluded positions (CLS, BOS, ...) and tokens masked out by
     ``token_mask_fn`` (e.g. padding) pass through unchanged.
 
     Args:
-        act: Module output in ``layout``.
-        fn: Maps kept tokens ``(n, d)`` to replacements ``(n, d)``.
+        act: Module output in ``layout``; ``y`` are its kept tokens.
+        fn: Maps kept tokens ``x, y`` (both ``(n, d)``) to replacements for ``y``.
         layout: Activation layout.
         exclude_positions: Positions left unchanged.
         token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
             tokens to replace.
         batch: The model input batch passed to ``token_mask_fn``.
+        source: Optional activation (same layout and token grid) whose kept
+            tokens are ``x``, e.g. a transcoder's input; ``None`` uses ``act``.
 
     Returns:
         The patched activation, in ``layout``.
     """
     tokens = to_tokens(act, layout)
     keep = token_keep_mask(tokens, exclude_positions, token_mask_fn, batch)
+    y = tokens[keep]
+    x = y if source is None else to_tokens(source, layout)[keep]
     patched = tokens.clone()
-    patched[keep] = fn(tokens[keep]).to(tokens.dtype)
+    patched[keep] = fn(x, y).to(tokens.dtype)
     return from_tokens(patched, layout, act)
+
+
+@contextmanager
+def splice(
+    hook_module: nn.Module,
+    fn: Callable[[Tensor, Tensor], Tensor],
+    target_module: nn.Module | None = None,
+    layout: str = "btd",
+    exclude_positions: Sequence[int] = (),
+    token_mask_fn: Callable[[Any], Tensor] | None = None,
+    batch: Any = None,
+) -> Iterator[None]:
+    """
+    Replaces kept tokens of ``target_module``'s output by ``fn(x, y)`` during forward passes.
+
+    ``x`` are the kept tokens of ``hook_module``'s output and ``y`` those of
+    ``target_module``'s output. For an SAE both are the same module, so
+    ``x is y``; for a transcoder ``hook_module`` is the input (e.g. the norm
+    before an MLP) and ``target_module`` the output it predicts (the MLP).
+    ``hook_module`` must run before ``target_module``.
+
+    Args:
+        hook_module: Module whose output is read.
+        fn: Maps kept tokens ``x, y`` to replacements for ``y``.
+        target_module: Module whose output is replaced; ``None`` means
+            ``hook_module``.
+        layout: Activation layout at both modules.
+        exclude_positions: Positions left unchanged.
+        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
+            tokens to replace.
+        batch: The model input batch passed to ``token_mask_fn``.
+
+    Yields:
+        None.
+
+    Raises:
+        RuntimeError: If ``target_module`` runs before ``hook_module``.
+    """
+    if target_module is None or target_module is hook_module:
+        with replace_activation(hook_module, lambda act: patch_kept_tokens(
+                act, fn, layout, exclude_positions, token_mask_fn, batch)):
+            yield
+        return
+
+    store: dict[str, Tensor] = {}
+
+    def read(act: Tensor) -> Tensor:
+        store["x"] = act
+        return act
+
+    def write(act: Tensor) -> Tensor:
+        if "x" not in store:
+            raise RuntimeError("target_module ran before hook_module")
+        return patch_kept_tokens(act, fn, layout, exclude_positions, token_mask_fn, batch, source=store.pop("x"))
+
+    with replace_activation(hook_module, read), replace_activation(target_module, write):
+        yield
 
 
 def run_capture(
@@ -308,6 +369,9 @@ class ActivationStore:
     """
     Iterable of shuffled activation batches harvested from a frozen model.
 
+    For transcoders, set ``target_module`` to also capture the output to
+    predict; batches are then ``(input, target)`` pairs.
+
     Fills a buffer of ``buffer_tokens`` tokens, shuffles it, serves batches
     until half of it is used, then refills, so consecutive batches mix tokens
     from many inputs. One pass over ``input_loader`` is one epoch; iterate
@@ -315,7 +379,8 @@ class ActivationStore:
 
     Args:
         model: Frozen model; run under ``torch.no_grad`` and in eval mode.
-        hook_module: Module whose output is the activation to train on.
+        hook_module: Module whose output is the activation to train on (the
+            transcoder input when ``target_module`` is set).
         input_loader: Iterable of model inputs (images, token dicts, ...).
         batch_tokens: Tokens per served batch.
         buffer_tokens: Shuffle-buffer size in tokens.
@@ -332,6 +397,9 @@ class ActivationStore:
             memory. ``None`` keeps the model's dtype.
         autocast_dtype: Optional autocast dtype for the model forward.
         seed: Shuffle seed.
+        target_module: For transcoders: module whose output is the target.
+            Batches are then ``(x, y)`` tuples of matching tokens. It must run
+            after ``hook_module``; the forward pass stops after it.
 
     Attributes:
         batch_tokens: Tokens per served batch (read by the trainer).
@@ -355,6 +423,7 @@ class ActivationStore:
         storage_dtype: torch.dtype | None = None,
         autocast_dtype: torch.dtype | None = None,
         seed: int = 0,
+        target_module: nn.Module | None = None,
     ):
         if layout not in LAYOUTS:
             raise ValueError(f"unknown layout {layout!r}, expected one of {LAYOUTS}")
@@ -371,25 +440,45 @@ class ActivationStore:
         self.storage_dtype = storage_dtype
         self.autocast_dtype = autocast_dtype
         self.generator = torch.Generator().manual_seed(seed)
+        self.target_module = target_module
+        self._d_in: int | None = None
 
     @torch.no_grad()
     def harvest(self, batch: Any) -> Tensor:
-        """Returns the kept tokens of one input batch, shape ``(n, d)``.
+        """Returns the kept tokens of one input batch.
 
         Args:
             batch: A batch from ``input_loader``.
 
         Returns:
-            Flattened activations of the kept tokens.
+            Activations of the kept tokens, ``(n, d)``; with ``target_module``
+            the input and target concatenated along the last dimension.
         """
         self.model.eval()
         batch = _to_device(batch, self.device)
         with torch.autocast(self.device.type, dtype=self.autocast_dtype or torch.float32,
                             enabled=self.autocast_dtype is not None):
-            act = run_capture(self.model, self.hook_module, batch, self.input_fn, stop=True)
-        tokens = to_tokens(act, self.layout)
-        flat = tokens[token_keep_mask(tokens, self.exclude_positions, self.token_mask_fn, batch)]
+            if self.target_module is None:
+                acts = [run_capture(self.model, self.hook_module, batch, self.input_fn, stop=True)]
+            else:
+                args, kwargs = self.input_fn(batch)
+                with capture_activation(self.hook_module) as src, \
+                        capture_activation(self.target_module, stop=True) as tgt:
+                    try:
+                        self.model(*args, **kwargs)
+                    except _StopForward:
+                        pass
+                acts = [src["act"], tgt["act"]]
+        tokens = [to_tokens(a, self.layout) for a in acts]
+        keep = token_keep_mask(tokens[0], self.exclude_positions, self.token_mask_fn, batch)
+        self._d_in = tokens[0].shape[-1]
+        flat = torch.cat([t[keep].to(tokens[0].dtype) for t in tokens], -1)
         return flat.to(self.storage_dtype) if self.storage_dtype else flat
+
+    def _serve(self, batch: Tensor) -> Tensor | tuple[Tensor, Tensor]:
+        if self.target_module is None:
+            return batch
+        return batch[:, : self._d_in], batch[:, self._d_in :]
 
     def __iter__(self) -> Iterator[Tensor]:
         buffer: list[Tensor] = []
@@ -403,10 +492,10 @@ class ActivationStore:
                 data = data[torch.randperm(data.shape[0], generator=self.generator).to(data.device)]
                 n_serve = (data.shape[0] // 2) // self.batch_tokens * self.batch_tokens
                 for i in range(0, n_serve, self.batch_tokens):
-                    yield data[i : i + self.batch_tokens]
+                    yield self._serve(data[i : i + self.batch_tokens])
                 buffer, size = [data[n_serve:]], data.shape[0] - n_serve
         if size:
             data = torch.cat(buffer)
             data = data[torch.randperm(data.shape[0], generator=self.generator).to(data.device)]
             for i in range(0, data.shape[0] - self.batch_tokens + 1, self.batch_tokens):
-                yield data[i : i + self.batch_tokens]
+                yield self._serve(data[i : i + self.batch_tokens])

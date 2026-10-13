@@ -55,9 +55,9 @@ from .data import (
     capture_activation,
     default_input_fn,
     keep_positions,
-    patch_kept_tokens,
     replace_activation,
     run_capture,
+    splice,
     to_tokens,
     token_keep_mask,
 )
@@ -565,6 +565,7 @@ def latent_attribution(
     exclude_positions: Sequence[int] = (),
     token_mask_fn: Callable[[Any], Tensor] | None = None,
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
+    target_module: nn.Module | None = None,
 ) -> Attribution:
     """
     Attributes a scalar model output to SAE latents at every position.
@@ -588,6 +589,10 @@ def latent_attribution(
         token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
             tokens to patch, e.g. non-padding tokens.
         input_fn: Maps the batch to model ``(args, kwargs)``.
+        target_module: For transcoders: the module whose output the
+            transcoder replaces (``hook_module`` is its input). A skip
+            connection's contribution is kept out of both the latent and the
+            error attributions.
 
     Returns:
         An :class:`Attribution`.
@@ -596,22 +601,24 @@ def latent_attribution(
     model.eval()
     store: dict[str, Tensor] = {}
 
-    def splice(x: Tensor) -> Tensor:
-        x = x.detach().to(sae.w_enc.dtype)
+    def splice_fn(x: Tensor, y: Tensor) -> Tensor:
+        x, y = x.detach().to(sae.w_enc.dtype), y.detach().to(sae.w_enc.dtype)
         with torch.no_grad():
             acts = sae.encode(x)
+            skip = sae.skip(x)
         acts.requires_grad_(True)
         recon = sae.decode(acts)
-        error = (x - recon.detach()).detach().requires_grad_(True)
+        error = (y - recon.detach() - skip).detach().requires_grad_(True)
         store.update(acts=acts, error=error)
-        return recon + error
+        return recon + skip + error
 
-    def patch(act: Tensor) -> Tensor:
+    def read_keep(act: Tensor) -> Tensor:
         store["keep"] = token_keep_mask(to_tokens(act, layout), exclude_positions, token_mask_fn, batch)
-        return patch_kept_tokens(act, splice, layout, exclude_positions, token_mask_fn, batch)
+        return act
 
     args, kwargs = input_fn(batch)
-    with _frozen(model, sae), replace_activation(hook_module, patch):
+    with _frozen(model, sae), replace_activation(hook_module, read_keep), \
+            splice(hook_module, splice_fn, target_module, layout, exclude_positions, token_mask_fn, batch):
         target = target_fn(model(*args, **kwargs), batch)
         target.sum().backward()
     acts, error, keep = store["acts"], store["error"], store["keep"]

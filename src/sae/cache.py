@@ -56,9 +56,10 @@ def cache_activations(
     Writes activation batches to safetensors shards.
 
     Args:
-        source: Iterable of activation batches ``(..., d_in)``, e.g. an
+        source: Iterable of activation batches ``(..., d_in)``, or of
+            ``(input, target)`` pairs for transcoders, e.g. an
             :class:`~sae.data.ActivationStore` (whose batches are already
-            shuffled across inputs).
+            shuffled across inputs). Targets are stored under ``"targets"``.
         out_dir: Output directory; created if needed. Existing shards with the
             same names are overwritten.
         shard_tokens: Tokens per shard file.
@@ -79,7 +80,7 @@ def cache_activations(
     pending: list[Tensor] = []
     n_pending = n_total = 0
     shards: list[dict[str, Any]] = []
-    d_in = None
+    d_in = d_out = None
 
     def flush(final: bool) -> None:
         nonlocal pending, n_pending
@@ -87,15 +88,24 @@ def cache_activations(
         while data.shape[0] >= shard_tokens or (final and data.shape[0] > 0):
             chunk, data = data[:shard_tokens], data[shard_tokens:]
             name = f"shard_{len(shards):05d}.safetensors"
-            save_file({"activations": chunk.contiguous()}, str(out_dir / name))
+            tensors = {"activations": chunk[:, :d_in].contiguous()}
+            if d_out is not None:
+                tensors["targets"] = chunk[:, d_in:].contiguous()
+            save_file(tensors, str(out_dir / name))
             shards.append({"file": name, "n_tokens": int(chunk.shape[0])})
         pending, n_pending = [data], data.shape[0]
 
     for batch in source:
-        flat, _ = pack([batch.detach()], "* d_in")
+        if isinstance(batch, (tuple, list)):  # (input, target): kept side by side until written
+            x, _ = pack([batch[0].detach()], "* d_in")
+            y, _ = pack([batch[1].detach()], "* d_out")
+            d_in, d_out = x.shape[-1], y.shape[-1]
+            flat = torch.cat([x, y.to(x.dtype)], -1)
+        else:
+            flat, _ = pack([batch.detach()], "* d_in")
+            d_in = flat.shape[-1]
         if max_tokens is not None:
             flat = flat[: max_tokens - n_total]
-        d_in = flat.shape[-1]
         pending.append(flat.to("cpu", dtype))
         n_pending += flat.shape[0]
         n_total += flat.shape[0]
@@ -109,6 +119,7 @@ def cache_activations(
 
     meta = {
         "d_in": d_in,
+        "d_out": d_out,
         "n_tokens": n_total,
         "dtype": str(dtype).removeprefix("torch."),
         "shards": shards,
@@ -121,6 +132,8 @@ def cache_activations(
 class CachedActivations:
     """
     Iterable of shuffled activation batches read from a cache directory.
+
+    Caches written from ``(input, target)`` pairs yield such pairs.
 
     Each epoch visits the shards in a random order and shuffles tokens within
     each shard. Leftovers carry over to the next shard, so every batch has
@@ -175,16 +188,22 @@ class CachedActivations:
         return self.n_tokens // self.batch_tokens
 
     def _load_shard(self, name: str, g: torch.Generator) -> Tensor:
-        data = load_file(str(self.cache_dir / name))["activations"]
+        tensors = load_file(str(self.cache_dir / name))
+        data = tensors["activations"]
+        if "targets" in tensors:  # rows stay aligned through shuffling and carry-over
+            data = torch.cat([data, tensors["targets"]], -1)
         if self.shuffle:
             data = data[torch.randperm(data.shape[0], generator=g)]
         if self.device.type == "cuda":
             data = data.pin_memory()
         return data
 
-    def _serve(self, batch: Tensor) -> Tensor:
+    def _serve(self, batch: Tensor) -> Tensor | tuple[Tensor, Tensor]:
         batch = batch.to(self.device, non_blocking=True)
-        return batch.to(self.dtype) if self.dtype is not None else batch
+        batch = batch.to(self.dtype) if self.dtype is not None else batch
+        if self.meta.get("d_out") is None:
+            return batch
+        return batch[:, : self.d_in], batch[:, self.d_in :]
 
     def __iter__(self) -> Iterator[Tensor]:
         g = torch.Generator().manual_seed(self.seed + self._epoch)

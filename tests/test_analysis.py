@@ -213,7 +213,7 @@ def test_interventions(setup):
             torch.testing.assert_close(vit(x), clean, atol=1e-5, rtol=1e-5)
         with splice_sae(sae, vit.block, keep_error=False, exclude_positions=(0,)):
             spliced = vit(x)
-        with replace_activation(vit.block, lambda a: patch_kept_tokens(a, sae.reconstruct, exclude_positions=(0,))):
+        with replace_activation(vit.block, lambda a: patch_kept_tokens(a, lambda x, y: sae.reconstruct(x), exclude_positions=(0,))):
             torch.testing.assert_close(spliced, vit(x), atol=1e-5, rtol=1e-5)
 
         lat = int(sae.encode(vit.block(vit.embed(x).flatten(2).transpose(1, 2))).abs().sum((0, 1)).argmax())

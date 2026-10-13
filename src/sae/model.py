@@ -9,6 +9,11 @@ Sparse autoencoders.
 * **loss terms** shared by all of them: normalised MSE, AuxK, Matryoshka and
   Multi-TopK.
 
+With ``transcoder=True`` the same model reconstructs a *different*
+activation than it reads, e.g. an MLP's output from its input (Dunefsky,
+Chlenski & Nanda, 2024), optionally with a linear skip connection (Paulo,
+Shabalin & Belrose, 2025).
+
 Optimization-side tricks (learning-rate schedule, optimizers, k annealing,
 sparsity warmup, KL fine-tuning, logging) live in :mod:`sae.trainer`.
 
@@ -34,6 +39,10 @@ References:
     Bussmann, B., Nabeshima, N., Karvonen, A. & Nanda, N. (2025). Learning
         Multi-Level Features with Matryoshka Sparse Autoencoders.
         arXiv:2503.17547.
+    Dunefsky, J., Chlenski, P. & Nanda, N. (2024). Transcoders Find
+        Interpretable LLM Feature Circuits. arXiv:2406.11944.
+    Paulo, G., Shabalin, S. & Belrose, N. (2025). Transcoders Beat Sparse
+        Autoencoders for Interpretability. arXiv:2501.18823.
 """
 
 from __future__ import annotations
@@ -130,6 +139,13 @@ class SAEConfig:
         loss_normalization: ``"batch"`` divides the MSE by the variance of each
             batch; ``"fixed"`` divides by a constant computed once from the
             initialization sample, as in Gao et al. (2024, App. A.6).
+        transcoder: Reconstruct a separate target activation (``forward(x,
+            target)``) instead of the input; the encoder then has no
+            pre-encoder bias and input and target get separate scales.
+        d_out: Width of the target; ``None`` means ``d_in``. Only for
+            transcoders.
+        skip_connection: Add a linear skip term ``x W_skip`` to a transcoder's
+            output (Paulo et al., 2025); ``W_skip`` starts at zero.
     """
 
     d_in: int
@@ -163,6 +179,10 @@ class SAEConfig:
 
     loss_normalization: str = "batch"
 
+    transcoder: bool = False
+    d_out: int | None = None
+    skip_connection: bool = False
+
     def __post_init__(self) -> None:
         if self.activation not in ACTIVATIONS:
             raise ValueError(f"unknown activation {self.activation!r}, expected one of {sorted(ACTIVATIONS)}")
@@ -174,6 +194,10 @@ class SAEConfig:
             raise ValueError(f"multi_topk needs a TopK-style activation, got {self.activation!r}")
         if self.loss_normalization not in ("batch", "fixed"):
             raise ValueError(f"loss_normalization must be 'batch' or 'fixed', got {self.loss_normalization!r}")
+        if self.d_out is None:
+            self.d_out = self.d_in
+        if not self.transcoder and (self.d_out != self.d_in or self.skip_connection):
+            raise ValueError("d_out != d_in and skip_connection need transcoder=True")
 
         if self.aux_coeff is None:
             self.aux_coeff = act_cls.default_aux_coeff
@@ -307,6 +331,11 @@ class SAE(nn.Module):
     public API returns is in input units, and :meth:`save` folds the scale into
     the weights (as done for Gemma Scope; Lieberum et al., 2024).
 
+    A transcoder (``cfg.transcoder``) encodes ``f(x) = sigma(W_enc^T x +
+    b_enc)`` and predicts a target ``y_hat = f(x) D + b_dec [+ x W_skip]``.
+    Its target has its own scale (``target_scale``); latent activations are
+    in target units.
+
     Args:
         cfg: Model configuration. If ``None``, ``kwargs`` are passed to
             :class:`SAEConfig`.
@@ -328,13 +357,18 @@ class SAE(nn.Module):
         self.sparsity_scale = 1.0
         d_in, d_sae = self.cfg.d_in, self.cfg.d_sae
 
+        d_out = self.cfg.d_out
         self.w_enc = nn.Parameter(torch.empty(d_in, d_sae))
         self.b_enc = nn.Parameter(torch.zeros(d_sae))
-        self.b_dec = nn.Parameter(torch.zeros(d_in))
+        self.b_dec = nn.Parameter(torch.zeros(d_out))
+        if self.cfg.skip_connection:
+            self.w_skip = nn.Parameter(torch.zeros(d_in, d_out))
         self.activation = ACTIVATIONS[self.cfg.activation](self.cfg)
         self.decoder = DECODERS[self.cfg.decoder](self.cfg)
 
         self.register_buffer("input_scale", torch.ones(()))
+        if self.cfg.transcoder:
+            self.register_buffer("target_scale", torch.ones(()))
         self.register_buffer("loss_norm", torch.full((), float("nan")))
         self.register_buffer("tokens_since_active", torch.zeros(d_sae, dtype=torch.long))
         if self.cfg.matryoshka_prefixes is not None:
@@ -350,17 +384,24 @@ class SAE(nn.Module):
         Data-free initialization.
 
         The encoder is the transpose of the decoder's initial unit-norm
-        directions (Conerly et al., 2024; Gao et al., 2024). Biases are zero.
+        directions (Conerly et al., 2024; Gao et al., 2024); a transcoder's
+        encoder gets independent random unit directions. Biases and the skip
+        connection are zero.
         """
         self.b_enc.zero_()
         self.b_dec.zero_()
         atoms = self.decoder.reset_parameters()
+        if self.cfg.transcoder:
+            atoms = F.normalize(torch.randn(self.cfg.d_sae, self.cfg.d_in), dim=-1)
         self.w_enc.copy_(rearrange(atoms, "d_sae d_in -> d_in d_sae"))
+        if self.cfg.skip_connection:
+            self.w_skip.zero_()
 
     @torch.no_grad()
     def initialize_from_data(
         self,
         sample: Tensor,
+        target: Tensor | None = None,
         normalize_input: bool = True,
         b_dec_init: str = "geometric_median",
         calibrate_encoder: bool = True,
@@ -376,44 +417,57 @@ class SAE(nn.Module):
         Args:
             sample: Activations, shape ``(..., d_in)``, with at least
                 ``decoder.min_init_tokens`` rows.
-            normalize_input: Whether to estimate ``input_scale``.
+            target: Matching targets ``(..., d_out)``; required for
+                transcoders, which initialize decoder-side state from them.
+            normalize_input: Whether to estimate ``input_scale`` (and
+                ``target_scale``).
             b_dec_init: ``"geometric_median"``, ``"mean"`` or ``"zeros"``.
             calibrate_encoder: Rescale the encoder so the initial
                 reconstruction matches the input magnitude (Gao et al., 2024,
                 App. A.1). See :meth:`calibrate_encoder_scale_`.
 
         Raises:
-            ValueError: If ``b_dec_init`` is unknown.
+            ValueError: If ``b_dec_init`` is unknown, or a transcoder gets no
+                ``target``.
         """
-        flat, _ = pack([sample.to(self.device, torch.float32)], "* d_in")
-        if normalize_input:
-            mean_norm = flat.norm(dim=-1).mean()
-            self.input_scale.fill_(math.sqrt(self.cfg.d_in) / mean_norm.clamp_min(1e-8).item())
-        else:
-            self.input_scale.fill_(1.0)
-        flat = flat * self.input_scale
+        if self.cfg.transcoder and target is None:
+            raise ValueError("a transcoder needs target activations to initialize")
+
+        def scale_of(flat: Tensor) -> float:
+            if not normalize_input:
+                return 1.0
+            return math.sqrt(flat.shape[-1]) / flat.norm(dim=-1).mean().clamp_min(1e-8).item()
+
+        x, _ = pack([sample.to(self.device, torch.float32)], "* d_in")
+        self.input_scale.fill_(scale_of(x))
+        x = x * self.input_scale
+        y = x
+        if self.cfg.transcoder:
+            y, _ = pack([target.to(self.device, torch.float32)], "* d_out")
+            self.target_scale.fill_(scale_of(y))
+            y = y * self.target_scale
 
         if b_dec_init == "geometric_median":
-            self.b_dec.copy_(geometric_median(flat))
+            self.b_dec.copy_(geometric_median(y))
         elif b_dec_init == "mean":
-            self.b_dec.copy_(reduce(flat, "n d -> d", "mean"))
+            self.b_dec.copy_(reduce(y, "n d -> d", "mean"))
         elif b_dec_init == "zeros":
             self.b_dec.zero_()
         else:
             raise ValueError(f"unknown b_dec_init {b_dec_init!r}")
 
-        centred = flat - reduce(flat, "n d -> 1 d", "mean")
+        centred = y - reduce(y, "n d -> 1 d", "mean")
         self.loss_norm.fill_(reduce(centred**2, "n d -> ", "mean").item())
 
-        atoms = self.decoder.initialize_from_data_(flat - self.b_dec)
-        if atoms is not None:
+        atoms = self.decoder.initialize_from_data_(y - self.b_dec)
+        if atoms is not None and not self.cfg.transcoder:
             self.w_enc.copy_(rearrange(atoms, "d_sae d_in -> d_in d_sae"))
 
         if calibrate_encoder:
-            self.calibrate_encoder_scale_(flat)
+            self.calibrate_encoder_scale_(x, y)
 
     @torch.no_grad()
-    def calibrate_encoder_scale_(self, x_s: Tensor) -> None:
+    def calibrate_encoder_scale_(self, x_s: Tensor, y_s: Tensor | None = None) -> None:
         """
         Rescales ``w_enc`` so the initial reconstruction matches the input.
 
@@ -426,12 +480,13 @@ class SAE(nn.Module):
 
         Args:
             x_s: Activations in scaled units, shape ``(n, d_in)``.
+            y_s: Scaled targets for a transcoder; ``None`` means ``x_s``.
         """
         if self.b_enc.abs().max() > 0:
             return
         was_training = self.training
         self.train()  # training-mode selection
-        target = x_s - self.b_dec
+        target = (x_s if y_s is None else y_s) - self.b_dec - self._skip(x_s)
         recon = self._decode(self.activation(self._pre_acts(x_s), self.k_current), self.decoder_weight())
         alpha = (recon * target).sum() / (recon * recon).sum().clamp_min(1e-8)
         if alpha > 0:
@@ -469,11 +524,22 @@ class SAE(nn.Module):
         """Boolean mask of latents dead for ``dead_tokens_threshold`` tokens."""
         return self.tokens_since_active >= self.cfg.dead_tokens_threshold
 
+    @property
+    def output_scale(self) -> Tensor:
+        """Scale of the reconstructed activation: ``target_scale`` for transcoders, else ``input_scale``."""
+        return self.target_scale if self.cfg.transcoder else self.input_scale
+
     def _scale_in(self, flat_x: Tensor) -> Tensor:
         return flat_x.to(self.w_enc.dtype) * self.input_scale
 
     def _pre_acts(self, x_s: Tensor) -> Tensor:
-        return einsum(x_s - self.b_dec, self.w_enc, "n d_in, d_in d_sae -> n d_sae") + self.b_enc
+        centred = x_s if self.cfg.transcoder else x_s - self.b_dec
+        return einsum(centred, self.w_enc, "n d_in, d_in d_sae -> n d_sae") + self.b_enc
+
+    def _skip(self, x_s: Tensor) -> Tensor | float:
+        if not self.cfg.skip_connection:
+            return 0.0
+        return einsum(x_s.to(self.w_skip.dtype), self.w_skip, "n d_in, d_in d_out -> n d_out")
 
     def _decode(self, code: SparseCode, weight: Tensor, latent_mask: Tensor | None = None) -> Tensor:
         """
@@ -531,14 +597,15 @@ class SAE(nn.Module):
         recon_aux = self._decode(code, weight)
         return torch.nan_to_num(normalized_mse(recon_aux.float(), residual), nan=0.0)
 
-    def _matryoshka_loss(self, code: SparseCode, x_s: Tensor, weight: Tensor) -> Tensor:
-        """Mean normalised MSE over nested prefixes (Bussmann et al., 2025)."""
-        partial = self.b_dec.float().expand_as(x_s)
+    def _matryoshka_loss(self, code: SparseCode, base: Tensor, y_s: Tensor, weight: Tensor) -> Tensor:
+        """Mean normalised MSE over nested prefixes (Bussmann et al., 2025);
+        ``base`` is the latent-free part of the prediction (bias, skip)."""
+        partial = base.float().expand_as(y_s)
         losses = []
         for g in range(len(self.cfg.matryoshka_prefixes)):
             mask = (self._latent_group == g).to(weight.dtype)
             partial = partial + self._decode(code, weight, mask).float()
-            losses.append(self._nmse(partial, x_s))
+            losses.append(self._nmse(partial, y_s))
         return torch.stack(losses).mean()
 
     def _encode_code(self, flat_x: Tensor) -> SparseCode:
@@ -552,12 +619,13 @@ class SAE(nn.Module):
             x: Activations, shape ``(..., d_in)``.
 
         Returns:
-            Sparse activations, shape ``(..., d_sae)``, in input units. In eval
-            mode a BatchTopK SAE uses its learned threshold, so the result
-            does not depend on the rest of the batch.
+            Sparse activations, shape ``(..., d_sae)``, in input units (target
+            units for a transcoder). In eval mode a BatchTopK SAE uses its
+            learned threshold, so the result does not depend on the rest of
+            the batch.
         """
         flat_x, ps = pack([x], "* d_in")
-        acts = self._to_dense(self._encode_code(flat_x)) / self.input_scale
+        acts = self._to_dense(self._encode_code(flat_x)) / self.output_scale
         [acts] = unpack(acts, ps, "* d_sae")
         return acts
 
@@ -572,7 +640,7 @@ class SAE(nn.Module):
             Pre-activations, shape ``(..., d_sae)``.
         """
         flat_x, ps = pack([x], "* d_in")
-        pre = self._pre_acts(self._scale_in(flat_x)) / self.input_scale
+        pre = self._pre_acts(self._scale_in(flat_x)) / self.output_scale
         [pre] = unpack(pre, ps, "* d_sae")
         return pre
 
@@ -580,18 +648,39 @@ class SAE(nn.Module):
         """
         Decodes latents back to activation space.
 
+        For a transcoder with a skip connection this omits the skip term,
+        which depends on the input; see :meth:`reconstruct`.
+
         Args:
             acts: Latent activations, shape ``(..., d_sae)``, in input units.
 
         Returns:
-            Reconstruction, shape ``(..., d_in)``.
+            Reconstruction, shape ``(..., d_out)``.
         """
         flat, ps = pack([acts], "* d_sae")
         weight = self.decoder_weight()
-        recon = einsum(flat.to(weight.dtype), weight, "n d_sae, d_sae d_in -> n d_in")
-        recon = recon + self.b_dec / self.input_scale
-        [recon] = unpack(recon, ps, "* d_in")
+        recon = einsum(flat.to(weight.dtype), weight, "n d_sae, d_sae d_out -> n d_out")
+        recon = recon + self.b_dec / self.output_scale
+        [recon] = unpack(recon, ps, "* d_out")
         return recon
+
+    def skip(self, x: Tensor) -> Tensor:
+        """
+        A transcoder's skip-connection term ``x W_skip``, in output units.
+
+        Args:
+            x: Activations, shape ``(..., d_in)``.
+
+        Returns:
+            Shape ``(..., d_out)``; zeros without a skip connection.
+        """
+        flat_x, ps = pack([x], "* d_in")
+        if not self.cfg.skip_connection:
+            out = flat_x.new_zeros(flat_x.shape[0], self.cfg.d_out)
+        else:
+            out = self._skip(self._scale_in(flat_x)) / self.output_scale
+        [out] = unpack(out.to(x.dtype), ps, "* d_out")
+        return out
 
     def reconstruct(self, x: Tensor) -> Tensor:
         """
@@ -601,14 +690,17 @@ class SAE(nn.Module):
             x: Activations, shape ``(..., d_in)``.
 
         Returns:
-            Reconstruction, shape ``(..., d_in)``, in input units and dtype.
+            Reconstruction (a transcoder's prediction), shape ``(..., d_out)``,
+            in the units and dtype of the input.
         """
         flat_x, ps = pack([x], "* d_in")
-        recon_s = self._decode(self._encode_code(flat_x), self.decoder_weight()) + self.b_dec
-        [recon] = unpack((recon_s / self.input_scale).to(x.dtype), ps, "* d_in")
+        x_s = self._scale_in(flat_x)
+        recon_s = self._decode(self.activation(self._pre_acts(x_s), self.k_current), self.decoder_weight())
+        recon_s = recon_s + self.b_dec + self._skip(x_s)
+        [recon] = unpack((recon_s / self.output_scale).to(x.dtype), ps, "* d_out")
         return recon
 
-    def forward(self, x: Tensor, return_acts: bool = True) -> SAEOutput:
+    def forward(self, x: Tensor, target: Tensor | None = None, return_acts: bool = True) -> SAEOutput:
         """
         Encodes, decodes and computes the training objective.
 
@@ -620,27 +712,34 @@ class SAE(nn.Module):
 
         Args:
             x: Activations, shape ``(..., d_in)``.
+            target: For transcoders, the activation to predict,
+                ``(..., d_out)`` with the same leading shape as ``x``.
             return_acts: Build the dense ``(..., d_sae)`` activation tensor.
 
         Returns:
             An :class:`SAEOutput`.
 
         Raises:
+            ValueError: If a transcoder gets no target or an SAE gets one.
             RuntimeError: If an Archetypal SAE is trained before
                 :meth:`initialize_from_data`.
         """
         cfg = self.cfg
+        if cfg.transcoder != (target is not None):
+            raise ValueError("transcoders need a target; SAEs reconstruct their input and take none")
         flat_x, ps = pack([x], "* d_in")
         x_s = self._scale_in(flat_x)
+        y_s = x_s if target is None else pack([target], "* d_out")[0].to(self.w_enc.dtype) * self.output_scale
         pre = self._pre_acts(x_s)
         weight = self.decoder_weight()
 
         code = self.activation(pre, self.k_current)
-        recon_s = self._decode(code, weight) + self.b_dec
+        base = self.b_dec + self._skip(x_s)
+        recon_s = self._decode(code, weight) + base
         latent_counts = self._update_stats(code)
 
-        x_f, recon_f = x_s.float(), recon_s.float()
-        nmse = self._nmse(recon_f, x_f)
+        y_f, recon_f = y_s.float(), recon_s.float()
+        nmse = self._nmse(recon_f, y_f)
         metrics: dict[str, Tensor] = {
             "nmse": nmse.detach(),
             "l0": (latent_counts.sum() / code.n).float(),
@@ -648,7 +747,7 @@ class SAE(nn.Module):
 
         loss = nmse
         if cfg.matryoshka_prefixes is not None:
-            loss = self._matryoshka_loss(code, x_f, weight)
+            loss = self._matryoshka_loss(code, base, y_f, weight)
             metrics["matryoshka_loss"] = loss.detach()
 
         if self.training:
@@ -657,21 +756,21 @@ class SAE(nn.Module):
                 loss = loss + self.sparsity_scale * penalty
                 metrics["sparsity_loss"] = penalty.detach()
             if cfg.aux_coeff > 0:
-                aux = self._aux_loss(pre, (x_f - recon_f).detach(), weight)
+                aux = self._aux_loss(pre, (y_f - recon_f).detach(), weight)
                 loss = loss + cfg.aux_coeff * aux
                 metrics["aux_loss"] = aux.detach()
             if cfg.multi_topk:
                 code_m = self.activation(pre, min(self.k_current * cfg.multi_topk_factor, cfg.d_sae))
-                multi = self._nmse((self._decode(code_m, weight) + self.b_dec).float(), x_f)
+                multi = self._nmse((self._decode(code_m, weight) + base).float(), y_f)
                 loss = loss + cfg.multi_topk_coeff * multi
                 metrics["multi_topk_nmse"] = multi.detach()
 
         metrics["loss"] = loss.detach()
 
-        [recon] = unpack((recon_s / self.input_scale).to(x.dtype), ps, "* d_in")
+        [recon] = unpack((recon_s / self.output_scale).to(x.dtype), ps, "* d_out")
         acts = None
         if return_acts:
-            [acts] = unpack(self._to_dense(code) / self.input_scale, ps, "* d_sae")
+            [acts] = unpack(self._to_dense(code) / self.output_scale, ps, "* d_sae")
         return SAEOutput(
             acts=acts,
             recon=recon,
@@ -683,25 +782,33 @@ class SAE(nn.Module):
     @torch.no_grad()
     def folded_state_dict(self) -> dict[str, Tensor]:
         """
-        Returns a state dict with ``input_scale`` folded into the weights.
+        Returns a state dict with the input (and target) scales folded into the weights.
 
-        With ``s = input_scale``, encoder pre-activations become ``pre / s``
-        (same selection, activations in input units) and the decoder is
-        unchanged, so unit-norm atoms stay unit norm. Biases, the fixed loss
-        normalizer and the activation's thresholds are rescaled accordingly.
+        With input scale ``s_in`` and output scale ``s_out`` (equal for an
+        SAE), encoder pre-activations become ``pre / s_out`` (same selection,
+        activations in output units), so ``W_enc`` is multiplied by
+        ``s_in / s_out`` (unchanged for an SAE) and ``b_enc``, ``b_dec``, the
+        fixed loss normalizer and the activation's thresholds are divided by
+        ``s_out``. The decoder is unchanged, so unit-norm atoms stay unit
+        norm; a skip connection is multiplied by ``s_in / s_out``.
 
         Returns:
             A state dict whose model works on raw activations.
         """
         self.decoder.refresh_()
-        s = self.input_scale.clone()
+        s_in, s_out = self.input_scale.clone(), self.output_scale.clone()
         sd = {k: v.detach().clone().contiguous() for k, v in self.state_dict().items()}
-        sd["b_enc"] = sd["b_enc"] / s
-        sd["b_dec"] = sd["b_dec"] / s
-        sd["loss_norm"] = sd["loss_norm"] / s**2
-        sd["input_scale"] = torch.ones_like(s)
-        self.activation.fold_(sd, "activation.", s)
-        self.decoder.fold_(sd, "decoder.", s)
+        if self.cfg.transcoder:
+            sd["w_enc"] = sd["w_enc"] * (s_in / s_out)
+            sd["target_scale"] = torch.ones_like(s_out)
+        if self.cfg.skip_connection:
+            sd["w_skip"] = sd["w_skip"] * (s_in / s_out)
+        sd["b_enc"] = sd["b_enc"] / s_out
+        sd["b_dec"] = sd["b_dec"] / s_out
+        sd["loss_norm"] = sd["loss_norm"] / s_out**2
+        sd["input_scale"] = torch.ones_like(s_in)
+        self.activation.fold_(sd, "activation.", s_out)
+        self.decoder.fold_(sd, "decoder.", s_out)
         return sd
 
     @torch.no_grad()
