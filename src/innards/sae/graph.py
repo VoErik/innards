@@ -43,12 +43,7 @@ from __future__ import annotations
 
 from collections.abc import (
     Callable,
-    Iterator,
     Sequence
-)
-from contextlib import (
-    ExitStack,
-    contextmanager
 )
 from dataclasses import (
     dataclass,
@@ -58,21 +53,28 @@ from typing import Any
 
 import torch
 from einops import einsum
+from nnsight.intervention.envoy import Envoy
 from torch import (
     Tensor,
     nn
 )
 
+from ..edits import (
+    Edit,
+    compose,
+    keep_mask,
+    run
+)
+from ..models import (
+    layer_name,
+    unwrap
+)
 from .analysis import _frozen
 from .clt import CrossLayerTranscoder
-from .data import (
-    default_input_fn,
-    from_tokens,
-    replace_activation,
-    to_tokens,
-    token_keep_mask
-)
+from .data import default_input_fn
 from .model import SAE
+
+Layer = str | nn.Module
 
 
 @dataclass
@@ -91,20 +93,20 @@ class _ErrorRecord:
 
 
 class _Recorder:
-    """Collects the leaves created by the site hooks, in forward order."""
+    """Collects the leaves created by the site edits, in forward order."""
 
-    def __init__(self, layout: str, exclude_positions: Sequence[int], token_mask_fn, batch):
-        self.layout, self.exclude, self.mask_fn, self.batch = layout, exclude_positions, token_mask_fn, batch
+    def __init__(self, exclude_positions: Sequence[int], mask: Tensor | None):
+        self.exclude, self.mask = exclude_positions, mask
         self.records: list[_LatentRecord | _ErrorRecord] = []
 
     def keep(self, tokens: Tensor) -> Tensor:
-        return token_keep_mask(tokens, self.exclude, self.mask_fn, self.batch)
+        return keep_mask(tokens, self.exclude, self.mask)
 
-    def patch(self, act: Tensor, keep: Tensor, new: Tensor) -> Tensor:
-        tokens = to_tokens(act, self.layout)
+    @staticmethod
+    def patch(tokens: Tensor, keep: Tensor, new: Tensor) -> Tensor:
         patched = tokens.clone()
         patched[keep] = new.to(tokens.dtype)
-        return from_tokens(patched, self.layout, act)
+        return patched
 
 
 @dataclass
@@ -112,15 +114,17 @@ class Site:
     """
     Where and how dictionaries are spliced in for :func:`attribution_graph`.
 
-    Build with :func:`sae_site` or :func:`clt_site`.
+    Build with :func:`sae_site` or :func:`clt_site`. ``edits`` returns
+    ``(layer, edit)`` pairs (edits on tokens, see :mod:`innards.edits`),
+    applied with nnsight in forward order.
     """
 
     name: str
-    install: Callable[[_Recorder], Any] = field(repr=False)
+    edits: Callable[[_Recorder], list[tuple[Layer, Edit]]] = field(repr=False)
     modules: list[nn.Module] = field(default_factory=list, repr=False)
 
 
-def sae_site(sae: SAE, hook_module: nn.Module, target_module: nn.Module | None = None,
+def sae_site(sae: SAE, hook_module: Layer, target_module: Layer | None = None,
              name: str | None = None) -> Site:
     """
     An SAE (``target_module=None``) or transcoder site.
@@ -132,41 +136,40 @@ def sae_site(sae: SAE, hook_module: nn.Module, target_module: nn.Module | None =
 
     Args:
         sae: The SAE or transcoder.
-        hook_module: Module whose output the dictionary reads.
-        target_module: For transcoders, the module whose output is replaced.
-        name: Site name used in node labels; defaults to the module's class.
+        hook_module: Module (or layer name) whose output the dictionary reads.
+        target_module: For transcoders, the module (or layer name) whose
+            output is replaced.
+        name: Site name used in node labels; defaults to the layer name or
+            the module's class.
     """
-    name = name or type(hook_module).__name__
+    name = name or (hook_module if isinstance(hook_module, str) else type(hook_module).__name__)
 
-    @contextmanager
-    def install(rec: _Recorder) -> Iterator[None]:
+    def edits(rec: _Recorder) -> list[tuple[Layer, Edit]]:
         state: dict[str, Tensor] = {}
 
-        def read(act: Tensor) -> Tensor:
-            tokens = to_tokens(act, rec.layout)
+        def read(tokens: Tensor) -> Tensor:
             keep = rec.keep(tokens)
             x = tokens[keep].to(sae.w_enc.dtype)
             pre = sae.pre_activations(x)
             acts = sae.encode(x).detach().requires_grad_(True)
             rec.records.append(_LatentRecord(name, keep, acts, pre))
             state.update(keep=keep, recon=sae.decode(acts) + sae.skip(x))
-            return act
+            return tokens
 
-        def write(act: Tensor) -> Tensor:
+        def write(tokens: Tensor) -> Tensor:
             keep, recon = state.pop("keep"), state.pop("recon")
-            y = to_tokens(act, rec.layout)[keep].to(recon.dtype)
+            y = tokens[keep].to(recon.dtype)
             error = (y - recon).detach().requires_grad_(True)
             rec.records.append(_ErrorRecord(name, keep, error))
-            return rec.patch(act, keep, recon + error)
+            return rec.patch(tokens, keep, recon + error)
 
         target = target_module if target_module is not None else hook_module
-        with replace_activation(hook_module, read), replace_activation(target, write):
-            yield
+        return [(hook_module, read), (target, write)]
 
-    return Site(name, install, [sae])
+    return Site(name, edits, [sae])
 
 
-def clt_site(clt: CrossLayerTranscoder, inputs: Sequence[nn.Module], outputs: Sequence[nn.Module],
+def clt_site(clt: CrossLayerTranscoder, inputs: Sequence[Layer], outputs: Sequence[Layer],
              name: str = "clt") -> Site:
     """
     A cross-layer transcoder replacing every MLP.
@@ -177,19 +180,18 @@ def clt_site(clt: CrossLayerTranscoder, inputs: Sequence[nn.Module], outputs: Se
 
     Args:
         clt: The cross-layer transcoder.
-        inputs: Modules whose outputs are the MLP inputs, in layer order.
+        inputs: Modules (or layer names) whose outputs are the MLP inputs, in
+            layer order.
         outputs: The MLPs, in layer order.
         name: Site name prefix.
     """
     n, d_out = clt.cfg.n_layers, clt.cfg.d_out
 
-    @contextmanager
-    def install(rec: _Recorder) -> Iterator[None]:
+    def edits(rec: _Recorder) -> list[tuple[Layer, Edit]]:
         state: dict[int, tuple[Tensor, Tensor | float]] = {}
 
         def read(layer: int):
-            def hook(act: Tensor) -> Tensor:
-                tokens = to_tokens(act, rec.layout)
+            def edit(tokens: Tensor) -> Tensor:
                 keep = rec.keep(tokens)
                 x_s = tokens[keep].to(clt.w_enc.dtype) * clt.input_scale[layer]
                 pre = einsum(x_s, clt.w_enc[layer], "b d, d s -> b s") + clt.b_enc[layer]
@@ -199,27 +201,22 @@ def clt_site(clt: CrossLayerTranscoder, inputs: Sequence[nn.Module], outputs: Se
                 contrib = (acts @ clt.decoder_weight(layer)).view(-1, n - layer, d_out)
                 skip = x_s @ clt.w_skip[layer] if clt.cfg.skip_connection else 0.0
                 state[layer] = (contrib, skip)
-                return act
-            return hook
+                return tokens
+            return edit
 
         def write(m: int):
-            def hook(act: Tensor) -> Tensor:
-                tokens = to_tokens(act, rec.layout)
+            def edit(tokens: Tensor) -> Tensor:
                 keep = rec.keep(tokens)
                 pred = clt.b_dec[m] + sum(state[layer][0][:, m - layer] for layer in range(m + 1)) + state[m][1]
                 recon = pred / clt.target_scale[m]
                 error = (tokens[keep].to(recon.dtype) - recon).detach().requires_grad_(True)
                 rec.records.append(_ErrorRecord(f"{name}.{m}", keep, error))
-                return rec.patch(act, keep, recon + error)
-            return hook
+                return rec.patch(tokens, keep, recon + error)
+            return edit
 
-        with ExitStack() as stack:
-            for layer in range(n):
-                stack.enter_context(replace_activation(inputs[layer], read(layer)))
-                stack.enter_context(replace_activation(outputs[layer], write(layer)))
-            yield
+        return [pair for layer in range(n) for pair in ((inputs[layer], read(layer)), (outputs[layer], write(layer)))]
 
-    return Site(name, install, [clt])
+    return Site(name, edits, [clt])
 
 
 @dataclass
@@ -331,7 +328,7 @@ class AttributionGraph:
 
 
 def attribution_graph(
-    model: nn.Module,
+    model: nn.Module | Envoy,
     sites: Sequence[Site],
     batch: Any,
     target_fn: Callable[[Any, Any], Tensor],
@@ -344,18 +341,19 @@ def attribution_graph(
     """
     Builds the attribution graph of a scalar metric over the spliced sites.
 
-    Runs one forward pass, one backward pass from the metric, and one
+    Runs one forward pass (with the dictionaries spliced in by nnsight, see
+    :func:`innards.edits.run`), one backward pass from the metric, and one
     backward pass per selected latent node (``max_nodes`` of them) for its
     incoming edges.
 
     Args:
-        model: The model (frozen during the computation).
+        model: The model (plain or nnsight; frozen during the computation).
         sites: Dictionaries to splice in, from :func:`sae_site` / :func:`clt_site`.
         batch: Model inputs, already on the right device (typically one prompt).
         target_fn: ``fn(model_output, batch) -> scalar or (batch,)``; summed.
         max_nodes: Latent nodes kept, by ``|attribution|``. Error nodes are
             always kept.
-        layout: Activation layout at the hooks.
+        layout: Activation layout at the sites.
         exclude_positions: Positions left unspliced (e.g. BOS / CLS).
         token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask.
         input_fn: Maps the batch to model ``(args, kwargs)``.
@@ -363,15 +361,18 @@ def attribution_graph(
     Returns:
         An :class:`AttributionGraph`.
     """
-    model.eval()
+    module = unwrap(model)
+    module.eval()
     dictionaries = [m.eval() for site in sites for m in site.modules]
-    rec = _Recorder(layout, exclude_positions, token_mask_fn, batch)
-    args, kwargs = input_fn(batch)
-    with ExitStack() as stack:
-        stack.enter_context(_frozen(model, *dictionaries))  # only the leaves need gradients
-        for site in sites:
-            stack.enter_context(site.install(rec))
-        metric = target_fn(model(*args, **kwargs), batch).sum()
+    rec = _Recorder(exclude_positions, token_mask_fn(batch) if token_mask_fn is not None else None)
+    edits: dict[str, Edit] = {}
+    for site in sites:
+        for layer, edit in site.edits(rec):  # several edits on one layer run in installation order
+            name = layer_name(module, layer)
+            edits[name] = compose(edits[name], edit) if name in edits else edit
+    with _frozen(module, *dictionaries), torch.enable_grad():  # only the leaves need gradients
+        out, _ = run(model, batch, edits, layouts=layout, input_fn=input_fn)
+        metric = target_fn(out, batch).sum()
 
         records = rec.records
         leaves = [r.acts if isinstance(r, _LatentRecord) else r.error for r in records]

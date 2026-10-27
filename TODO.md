@@ -29,7 +29,7 @@ matters, and where it would go.
 
 - **KL fine-tuning for CLTs (`sae/trainer.py`, `sae/clt.py`).**
   `SAETrainer.finetune_kl` supports single SAEs and transcoders only. For a
-  CLT, the patched pass must splice all layers at once (as `splice_clt` does)
+  CLT, the patched pass must splice all layers at once (as `clt_edits` does)
   while collecting every layer's inputs and outputs to compute the CLT loss
   next to the KL term.
 

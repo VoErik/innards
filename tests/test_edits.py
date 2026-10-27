@@ -29,7 +29,7 @@ from innards.models import (
     layer_name,
     wrap
 )
-from innards.sae.data import replace_activation
+from _hooks import replace_output
 
 LAYERS = {"test_vit": ("blocks.2", "btd"), "test_resnet": ("layer2", "bchw"), "test_mambaout": ("stages.1", "bhwc")}
 
@@ -61,7 +61,7 @@ def test_edit_matches_hook(case):
         out, _ = run(model, x, {layer: steer(v, 2.0)})
         # the same edit through a plain forward hook, in the layer's own layout
         shape = (1, -1, 1, 1) if layout == "bchw" else (-1,)
-        with replace_activation(model.get_submodule(layer), lambda a: a + 2.0 * v.reshape(shape)):
+        with replace_output(model.get_submodule(layer), lambda a: a + 2.0 * v.reshape(shape)):
             ref = model(x)
     torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
 

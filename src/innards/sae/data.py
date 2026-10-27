@@ -5,9 +5,7 @@ Activation harvesting for SAE training on vision and language models.
 output of one module with nnsight (:func:`innards.extract.capture`), drops
 excluded tokens and serves shuffled token batches from a large buffer, so a
 batch mixes tokens from many images or sequences. Interventions (splicing the
-SAE in, e.g. for KL fine-tuning) go through :mod:`innards.edits`; the
-low-level forward-hook utilities here are used by :mod:`innards.sae.clt` and
-:mod:`innards.sae.graph`.
+SAE in, e.g. for KL fine-tuning) go through :mod:`innards.edits`.
 
 The activation layouts (see :mod:`innards.layouts`) are:
 
@@ -47,7 +45,6 @@ from collections.abc import (
     Iterator,
     Sequence
 )
-from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -98,162 +95,6 @@ def token_keep_mask(
     if token_mask_fn is not None:
         keep &= token_mask_fn(batch).to(keep.device, torch.bool)
     return keep
-
-
-class _StopForward(Exception):
-    pass
-
-
-@contextmanager
-def capture_activation(module: nn.Module, stop: bool = False) -> Iterator[dict[str, Tensor]]:
-    """
-    Captures the output of ``module`` during a forward pass.
-
-    Tuple outputs are reduced to their first element.
-
-    Args:
-        module: The module to hook.
-        stop: Abort the forward pass right after the module, saving the cost
-            of the remaining layers.
-
-    Yields:
-        A dict whose ``"act"`` entry holds the captured tensor after the
-        forward pass.
-    """
-    store: dict[str, Tensor] = {}
-
-    def hook(_mod, _inp, out):
-        store["act"] = out[0] if isinstance(out, (tuple, list)) else out
-        if stop:
-            raise _StopForward
-
-    handle = module.register_forward_hook(hook)
-    try:
-        yield store
-    finally:
-        handle.remove()
-
-
-@contextmanager
-def replace_activation(module: nn.Module, fn: Callable[[Tensor], Tensor]) -> Iterator[None]:
-    """
-    Replaces the output of ``module`` with ``fn(output)`` during forward passes.
-
-    Args:
-        module: The module to hook.
-        fn: Function applied to the module output (first element for tuples).
-
-    Yields:
-        None.
-    """
-
-    def hook(_mod, _inp, out):
-        if isinstance(out, tuple):
-            return (fn(out[0]), *out[1:])
-        if isinstance(out, list):
-            return [fn(out[0]), *out[1:]]
-        return fn(out)
-
-    handle = module.register_forward_hook(hook)
-    try:
-        yield
-    finally:
-        handle.remove()
-
-
-def patch_kept_tokens(
-    act: Tensor,
-    fn: Callable[[Tensor, Tensor], Tensor],
-    layout: str = "btd",
-    exclude_positions: Sequence[int] = (),
-    token_mask_fn: Callable[[Any], Tensor] | None = None,
-    batch: Any = None,
-    source: Tensor | None = None,
-) -> Tensor:
-    """
-    Replaces the kept tokens of a captured activation by ``fn(x, y)``.
-
-    Excluded positions (CLS, BOS, ...) and tokens masked out by
-    ``token_mask_fn`` (e.g. padding) pass through unchanged.
-
-    Args:
-        act: Module output in ``layout``; ``y`` are its kept tokens.
-        fn: Maps kept tokens ``x, y`` (both ``(n, d)``) to replacements for ``y``.
-        layout: Activation layout.
-        exclude_positions: Positions left unchanged.
-        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
-            tokens to replace.
-        batch: The model input batch passed to ``token_mask_fn``.
-        source: Optional activation (same layout and token grid) whose kept
-            tokens are ``x``, e.g. a transcoder's input; ``None`` uses ``act``.
-
-    Returns:
-        The patched activation, in ``layout``.
-    """
-    tokens = to_tokens(act, layout)
-    keep = token_keep_mask(tokens, exclude_positions, token_mask_fn, batch)
-    y = tokens[keep]
-    x = y if source is None else to_tokens(source, layout)[keep]
-    patched = tokens.clone()
-    patched[keep] = fn(x, y).to(tokens.dtype)
-    return from_tokens(patched, layout, act)
-
-
-@contextmanager
-def splice(
-    hook_module: nn.Module,
-    fn: Callable[[Tensor, Tensor], Tensor],
-    target_module: nn.Module | None = None,
-    layout: str = "btd",
-    exclude_positions: Sequence[int] = (),
-    token_mask_fn: Callable[[Any], Tensor] | None = None,
-    batch: Any = None,
-) -> Iterator[None]:
-    """
-    Replaces kept tokens of ``target_module``'s output by ``fn(x, y)`` during forward passes.
-
-    ``x`` are the kept tokens of ``hook_module``'s output and ``y`` those of
-    ``target_module``'s output. For an SAE both are the same module, so
-    ``x is y``; for a transcoder ``hook_module`` is the input (e.g. the norm
-    before an MLP) and ``target_module`` the output it predicts (the MLP).
-    ``hook_module`` must run before ``target_module``.
-
-    Args:
-        hook_module: Module whose output is read.
-        fn: Maps kept tokens ``x, y`` to replacements for ``y``.
-        target_module: Module whose output is replaced; ``None`` means
-            ``hook_module``.
-        layout: Activation layout at both modules.
-        exclude_positions: Positions left unchanged.
-        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
-            tokens to replace.
-        batch: The model input batch passed to ``token_mask_fn``.
-
-    Yields:
-        None.
-
-    Raises:
-        RuntimeError: If ``target_module`` runs before ``hook_module``.
-    """
-    if target_module is None or target_module is hook_module:
-        with replace_activation(hook_module, lambda act: patch_kept_tokens(
-                act, fn, layout, exclude_positions, token_mask_fn, batch)):
-            yield
-        return
-
-    store: dict[str, Tensor] = {}
-
-    def read(act: Tensor) -> Tensor:
-        store["x"] = act
-        return act
-
-    def write(act: Tensor) -> Tensor:
-        if "x" not in store:
-            raise RuntimeError("target_module ran before hook_module")
-        return patch_kept_tokens(act, fn, layout, exclude_positions, token_mask_fn, batch, source=store.pop("x"))
-
-    with replace_activation(hook_module, read), replace_activation(target_module, write):
-        yield
 
 
 def split_fields(

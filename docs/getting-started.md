@@ -23,8 +23,8 @@ models; only the hook point and the tokens to exclude change.
 
 ### 1. Harvest activations
 
-{class}`~innards.sae.data.ActivationStore` runs the frozen model, captures the output
-of one module with a forward hook, drops excluded tokens and serves shuffled
+{class}`~innards.sae.data.ActivationStore` runs the frozen model, reads the output
+of one module with nnsight, drops excluded tokens and serves shuffled
 token batches from a large buffer:
 
 ```python

@@ -19,7 +19,6 @@ from innards.sae.activations import (
 from innards.sae.data import (
     ActivationStore,
     from_tokens,
-    patch_kept_tokens,
     to_tokens
 )
 from innards.sae.optim import (
@@ -307,12 +306,12 @@ def test_conv_layout_kl(tmp_path):
     assert tr.evaluate_downstream(cnn, cnn[1], img_loader, kl_cfg)["downstream/top1_agreement"] > 0.3
 
 
-def test_patch_kept_tokens_respects_masks():
+def test_rows_edit_respects_masks():
+    from innards.edits import rows
+
     act = torch.randn(2, 6, 4)
-    mask_fn = lambda batch: batch
-    batch = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.bool)  # padding in row 0
-    out = patch_kept_tokens(act, lambda x, y: torch.zeros_like(y), "btd", exclude_positions=(0,), token_mask_fn=mask_fn,
-                            batch=batch)
+    mask = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.bool)  # padding in row 0
+    out = rows(torch.zeros_like, exclude=(0,), mask=mask)(act)
     assert torch.equal(out[:, 0], act[:, 0]) and torch.equal(out[0, 4:], act[0, 4:])
     assert (out[0, 1:4] == 0).all() and (out[1, 1:] == 0).all()
 

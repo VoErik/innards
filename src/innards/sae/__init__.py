@@ -43,8 +43,8 @@ from .cache import (
 from .clt import (
     CLTConfig,
     CrossLayerTranscoder,
-    clt_hooks,
-    splice_clt
+    clt_edits,
+    clt_hooks
 )
 from .data import ActivationStore
 from .decoders import (
@@ -103,6 +103,6 @@ __all__ = [
     "output_effects",
     "register_activation",
     "sae_site",
-    "splice_clt",
+    "clt_edits",
 ]
 __version__ = "0.2.0"

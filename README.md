@@ -229,7 +229,8 @@ write to the MLP outputs of layers `l, l+1, ...` (Ameisen et al., 2025), so
 a feature computed once can explain the same output across layers.
 
 ```python
-from innards.sae import CrossLayerTranscoder, clt_hooks, splice_clt
+from innards.edits import run
+from innards.sae import CrossLayerTranscoder, clt_edits, clt_hooks
 
 layers = model.gpt_neox.layers
 ins, outs = [l.post_attention_layernorm for l in layers], [l.mlp for l in layers]
@@ -239,8 +240,7 @@ trainer = SAETrainer(clt, TrainerConfig(total_tokens=100_000_000))
 trainer.train(store)
 trainer.evaluate(val_store)                                         # eval/fve, eval/layer3/fve, ...
 trainer.evaluate_downstream(model, ins, loader, kl_cfg, target_module=outs, loss_fn=...)
-with splice_clt(clt, ins, outs):                                    # run the replacement model
-    logits = model(**inputs)
+logits, _ = run(model, inputs, clt_edits(clt, ins, outs, model=model))   # the replacement model
 ```
 
 ## Attribution graphs

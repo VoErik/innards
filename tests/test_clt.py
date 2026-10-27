@@ -5,7 +5,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from innards.sae.clt import CLTConfig, CrossLayerTranscoder, clt_hooks, splice_clt
+from innards.edits import run
+from innards.sae.clt import CLTConfig, CrossLayerTranscoder, clt_edits, clt_hooks
 from innards.sae.data import ActivationStore
 from innards.sae.model import SAE
 from innards.sae.trainer import KLFinetuneConfig, SAETrainer, TrainerConfig
@@ -111,16 +112,18 @@ def test_clt_on_model_store_splice_and_downstream(tmp_path):
     tr.train(store)
     assert tr.evaluate(store, max_batches=3)["eval/fve"] > 0.5
     clt.eval()
+    lns, mlps = list(net.lns), list(net.mlps)
     with torch.no_grad():
         clean = net(inputs[:8])
-        with splice_clt(clt, list(net.lns), list(net.mlps), keep_error=True):
-            torch.testing.assert_close(net(inputs[:8]), clean, atol=1e-5, rtol=1e-5)
-        with splice_clt(clt, list(net.lns), list(net.mlps)):
-            replaced = net(inputs[:8])
+        kept, _ = run(net, inputs[:8], clt_edits(clt, lns, mlps, keep_error=True, model=net))
+        torch.testing.assert_close(kept, clean, atol=1e-5, rtol=1e-5)
+        replaced, _ = run(net, inputs[:8], clt_edits(clt, lns, mlps, model=net))
         assert not torch.allclose(replaced, clean, atol=1e-6)
-        with splice_clt(clt, list(net.lns), list(net.mlps), keep_error=True,
-                        edit=lambda layer, a: torch.zeros_like(a) if layer == 0 else a):
-            assert not torch.allclose(net(inputs[:8]), clean, atol=1e-6)
+        names = [f"lns.{i}" for i in range(3)], [f"mlps.{i}" for i in range(3)]
+        torch.testing.assert_close(run(net, inputs[:8], clt_edits(clt, *names))[0], replaced)  # layer names work too
+        edited, _ = run(net, inputs[:8], clt_edits(clt, lns, mlps, keep_error=True, model=net,
+                                                   edit=lambda layer, a: torch.zeros_like(a) if layer == 0 else a))
+        assert not torch.allclose(edited, clean, atol=1e-6)
 
     ce = lambda out, batch: nn.functional.cross_entropy(out, out.detach().argmax(-1))
     metrics = tr.evaluate_downstream(net, list(net.lns), data, KLFinetuneConfig(), loss_fn=ce,

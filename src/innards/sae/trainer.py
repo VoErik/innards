@@ -48,7 +48,6 @@ from dataclasses import (
     asdict,
     dataclass
 )
-from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +70,6 @@ from ..models import (
 from .data import (
     _to_device,
     default_input_fn,
-    splice,
 )
 from .optim import (
     build_optimizers,
@@ -79,7 +77,7 @@ from .optim import (
 )
 from .clt import (
     CrossLayerTranscoder,
-    splice_clt
+    clt_edits
 )
 from .model import (
     MODEL_TYPES,
@@ -886,46 +884,33 @@ class SAETrainer:
         def ablate(x: Tensor, y: Tensor) -> Tensor:
             return y.mean(0, keepdim=True).expand_as(y) if ablation == "mean" else torch.zeros_like(y)
 
-        if not is_clt:
-            nn_model = wrap(model)
+        nn_model = wrap(model)
+        if is_clt:
+            targets = [layer_name(model, m) for m in target_module]
+        else:
             hook = layer_name(model, hook_module)
-            target = hook if target_module is None else layer_name(model, target_module)
+            targets = [hook if target_module is None else layer_name(model, target_module)]
+
+        def replaced(mask: Tensor | None) -> dict:
+            if is_clt:
+                return clt_edits(sae, hook_module, target_module, exclude_positions=kc.exclude_positions, mask=mask,
+                                 model=model)
+            return cross(hook, targets[0], lambda x, y: sae.reconstruct(x), kc.exclude_positions, mask)
 
         for i, batch in enumerate(input_loader):
             if max_batches is not None and i >= max_batches:
                 break
             batch = _to_device(batch, self.device)
             args, kwargs = kc.input_fn(batch)
-
-            def replaced():  # CLTs still splice with forward hooks
-                return splice_clt(sae, hook_module, target_module, layout=kc.layout,
-                                  exclude_positions=kc.exclude_positions, token_mask_fn=kc.token_mask_fn, batch=batch)
-
-            def ablated():
-                stack = ExitStack()
-                for m in target_module:
-                    stack.enter_context(splice(m, ablate, None, kc.layout, kc.exclude_positions, kc.token_mask_fn,
-                                               batch))
-                return stack
-
+            mask = kc.token_mask_fn(batch) if kc.token_mask_fn else None
             with self._autocast():
                 clean_out = model(*args, **kwargs)
-                if is_clt:
-                    with replaced():
-                        patched_out = model(*args, **kwargs)
-                    if loss_fn is not None:
-                        with ablated():
-                            ablated_out = model(*args, **kwargs)
-                else:
-                    mask = kc.token_mask_fn(batch) if kc.token_mask_fn else None
-                    patched_out, _ = run(nn_model, batch,
-                                         cross(hook, target, lambda x, y: sae.reconstruct(x), kc.exclude_positions,
-                                               mask),
+                patched_out, _ = run(nn_model, batch, replaced(mask), layouts=kc.layout, input_fn=kc.input_fn)
+                if loss_fn is not None:
+                    ablated_out, _ = run(nn_model, batch,
+                                         {t: rows(lambda y: ablate(None, y), kc.exclude_positions, mask)
+                                          for t in targets},
                                          layouts=kc.layout, input_fn=kc.input_fn)
-                    if loss_fn is not None:
-                        ablated_out, _ = run(nn_model, batch,
-                                             {target: rows(lambda y: ablate(None, y), kc.exclude_positions, mask)},
-                                             layouts=kc.layout, input_fn=kc.input_fn)
             clean, patched = kc.output_fn(clean_out).float(), kc.output_fn(patched_out).float()
             mask = kc.kl_mask_fn(batch) if kc.kl_mask_fn else None
             sums["kl"] += self._kl(clean, patched, mask).item()

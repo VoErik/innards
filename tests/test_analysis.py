@@ -121,9 +121,9 @@ def test_latent_attribution_matches_ablation(setup):
         tok[:, 1:] = sae.decode(acts) + err
         return tok
 
-    from innards.sae.data import replace_activation
+    from _hooks import replace_output
 
-    with torch.no_grad(), replace_activation(vit.block, ablate):
+    with torch.no_grad(), replace_output(vit.block, ablate):
         ablated = vit(x)[:, 3]
     assert (attr.target - ablated).item() == pytest.approx(vals[0].item(), rel=1e-3, abs=1e-5)
 
@@ -202,8 +202,8 @@ def test_cached_activations_order_and_prefetch(tmp_path, bs):
 
 
 def test_interventions(setup):
+    from _hooks import replace_output
     from innards.edits import rows, run, steer
-    from innards.sae.data import patch_kept_tokens, replace_activation
     from innards.sae.interventions import clamp, mean_ablate, sae_edits, scale, zero_ablate
 
     vit, images, *_, sae = setup
@@ -216,7 +216,7 @@ def test_interventions(setup):
         clean = vit(x)
         torch.testing.assert_close(spliced(), clean, atol=1e-5, rtol=1e-5)  # error kept, no edit: unchanged
         recon = spliced(keep_error=False)
-        with replace_activation(vit.block, lambda a: patch_kept_tokens(a, lambda x, y: sae.reconstruct(x), exclude_positions=(0,))):
+        with replace_output(vit.block, lambda a: torch.cat([a[:, :1], sae.reconstruct(a[:, 1:])], 1)):
             torch.testing.assert_close(recon, vit(x), atol=1e-5, rtol=1e-5)
         by_module, _ = run(vit, x, sae_edits(sae, vit.block, keep_error=False, exclude_positions=(0,), model=vit))
         torch.testing.assert_close(by_module, recon)

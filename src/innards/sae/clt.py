@@ -40,12 +40,7 @@ import json
 import math
 from collections.abc import (
     Callable,
-    Iterator,
     Sequence
-)
-from contextlib import (
-    ExitStack,
-    contextmanager
 )
 from dataclasses import (
     asdict,
@@ -69,20 +64,23 @@ from safetensors.torch import (
     load_file,
     save_file
 )
+from nnsight.intervention.envoy import Envoy
 from torch import (
     Tensor,
     nn
 )
 
+from ..edits import (
+    Edit,
+    compose,
+    rows
+)
+from ..models import layer_name
 from .activations import (
     ACTIVATIONS,
     SparseCode,
     decode_code,
     rowwise_topk
-)
-from .data import (
-    patch_kept_tokens,
-    replace_activation
 )
 from .model import (
     SAEConfig,
@@ -575,46 +573,48 @@ class CrossLayerTranscoder(nn.Module):
         return model.to(device).eval()
 
 
-@contextmanager
-def splice_clt(
+def clt_edits(
     clt: CrossLayerTranscoder,
-    inputs: Sequence[nn.Module],
-    outputs: Sequence[nn.Module],
+    inputs: Sequence[str | nn.Module],
+    outputs: Sequence[str | nn.Module],
     keep_error: bool = False,
     edit: Callable[[int, Tensor], Tensor] | None = None,
-    layout: str = "btd",
     exclude_positions: Sequence[int] = (),
-    token_mask_fn: Callable[[Any], Tensor] | None = None,
-    batch: Any = None,
-) -> Iterator[None]:
+    mask: Tensor | None = None,
+    model: nn.Module | Envoy | None = None,
+) -> dict[str, Edit]:
     """
-    Replaces every MLP output by the CLT's prediction during forward passes.
+    Edits replacing every MLP output by the CLT's prediction, for :func:`innards.edits.run`.
 
     Latents of layer ``l`` are computed from the (possibly already patched)
     MLP input of layer ``l``; MLP ``m``'s output is replaced at kept tokens by
     the sum of the contributions of layers ``<= m``. With ``keep_error`` the
     CLT error of each layer is added back, so only ``edit`` changes the model.
 
+    Typical usage::
+
+        logits, _ = run(model, batch, clt_edits(clt, ins, outs, model=model))
+
     Args:
         clt: The CLT (should be in eval mode).
-        inputs: Modules whose outputs are the MLP inputs, in layer order.
+        inputs: Layers whose outputs are the MLP inputs, in layer order, as
+            names (or modules, with ``model`` given).
         outputs: The MLPs, in layer order.
         keep_error: Add each layer's error ``y_m - y_hat_m`` back.
         edit: Optional ``fn(layer, acts) -> acts`` on a layer's
             ``(n, d_sae)`` activations (normalised units).
-        layout: Activation layout at the hooks.
         exclude_positions: Positions left unchanged.
-        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask.
-        batch: The model input batch passed to ``token_mask_fn``.
+        mask: Optional boolean ``(batch, tokens)`` mask of tokens to replace.
+        model: Needed only to resolve modules given as layers.
 
-    Yields:
-        None.
+    Returns:
+        Layer name -> edit.
     """
     n, d_out = clt.cfg.n_layers, clt.cfg.d_out
     state: dict[int, Any] = {}
 
     def read(layer: int):
-        def fn(x: Tensor, y: Tensor) -> Tensor:
+        def fn(x: Tensor) -> Tensor:
             x_s = x.to(clt.w_enc.dtype) * clt.input_scale[layer]
             pre = einsum(x_s, clt.w_enc[layer], "b d, d s -> b s") + clt.b_enc[layer]
             code = clt.activations[layer](pre, clt.k_current)
@@ -623,11 +623,11 @@ def splice_clt(
             edited = clean if edit is None else (edit(layer, acts) @ clt.decoder_weight(layer)).view(-1, n - layer, d_out)
             skip = x_s @ clt.w_skip[layer] if clt.cfg.skip_connection else 0.0
             state[layer] = (clean, edited, skip)
-            return y
+            return x
         return fn
 
     def write(m: int):
-        def fn(x: Tensor, y: Tensor) -> Tensor:
+        def fn(y: Tensor) -> Tensor:
             clean = clt.b_dec[m] + sum(state[layer][0][:, m - layer] for layer in range(m + 1)) + state[m][2]
             edited = clt.b_dec[m] + sum(state[layer][1][:, m - layer] for layer in range(m + 1)) + state[m][2]
             scale = clt.target_scale[m]
@@ -635,13 +635,10 @@ def splice_clt(
             return out + (y.to(out.dtype) - clean / scale) if keep_error else out
         return fn
 
-    hooks = []
+    edits: dict[str, Edit] = {}
     for layer in range(n):
-        hooks.append(replace_activation(inputs[layer], lambda a, f=read(layer): patch_kept_tokens(
-            a, f, layout, exclude_positions, token_mask_fn, batch)))
-        hooks.append(replace_activation(outputs[layer], lambda a, f=write(layer): patch_kept_tokens(
-            a, f, layout, exclude_positions, token_mask_fn, batch)))
-    with ExitStack() as stack:
-        for h in hooks:
-            stack.enter_context(h)
-        yield
+        for module, fn in ((inputs[layer], read(layer)), (outputs[layer], write(layer))):
+            name = layer_name(model, module)
+            e = rows(fn, exclude_positions, mask)
+            edits[name] = compose(edits[name], e) if name in edits else e
+    return edits
