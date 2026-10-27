@@ -86,6 +86,35 @@ I.logit_lens(model, tokens)                          # ViTs: what a block alread
 I.attention_rollout(I.attention_maps(model, images))[:, 0, 1:]
 ```
 
+`v` can also be a function of the tokens (`fn(tokens) -> scores`), e.g. an
+SAE latent (`innards.sae.latent_fn(sae, 42)`).
+
+## Units over a dataset
+
+{mod}`~innards.analysis.units` answers "what does each unit respond to?" over
+a whole dataset, streamed from the model. A unit is one output of an encode
+function on a layer's tokens: the neurons or channels themselves (the
+default), projections on directions, probe logits or SAE latents.
+
+```python
+from innards.analysis import units as U
+from innards.analysis.dashboard import image_renderer, save_dashboard
+
+stats, top = U.unit_stats(model, loader, "stages.2", threshold=0.5, per_example=True)  # channels of a CNN
+stats, top = U.unit_stats(model, loader, "blocks.6", lambda t: t @ V.T, exclude=(0,))   # directions
+U.entries(top, 3)                                    # [(value, example, position), ...], best first
+
+path = U.cache_units(model, loader, "blocks.6", "units/b6", lambda t: t @ V.T, threshold=1.0, exclude=(0,))
+U.quantile_examples(path, 3), U.cooccurrence(path, [0, 1, 2])   # no model needed any more
+save_dashboard("b6.html", path, image_renderer(images, n_prefix=1), directions=V, readout=head.weight)
+```
+
+`per_example=True` ranks examples by their peak token, so the top entries
+are distinct images (the top *tokens* of a unit often all come from one
+image). A unit is active where `|activation| > threshold`; dense units need a
+threshold for frequencies to mean something, and for the cache to stay
+sparse.
+
 ## Combining them
 
 - **Decodable vs. used.** A probe finds a concept; ablating its direction

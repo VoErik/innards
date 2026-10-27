@@ -6,31 +6,32 @@ modules.
 
 ## Latent statistics and examples
 
-For a single pass over a (deterministic) loader,
-{func}`~innards.sae.analysis.analyze_dataset` returns per-latent statistics and the
-top-activating tokens:
+Latents are units like any other, so statistics, top examples, the latent
+cache and the dashboards are the general tools of
+{mod}`innards.analysis.units` and {mod}`innards.analysis.dashboard` with
+{func}`~innards.sae.analysis.latent_fn` as the encode function. One pass over a
+(deterministic) loader:
 
 ```python
-from innards.sae import analysis as A
+from innards.analysis import units as U
+from innards.sae import latent_fn
 
-res = A.analyze_dataset(sae, model, "blocks.6", val_loader, n_top=20, exclude=(0,))
-res.stats.frequency, res.stats.dead, res.stats.dense(0.1)
-res.top.unique_examples(latent)          # [(value, example index, token position), ...]
+stats, top = U.unit_stats(model, val_loader, "blocks.6", latent_fn(sae), n_top=20, exclude=(0,))
+stats.frequency, (stats.frequency == 0).nonzero()      # firing frequency, dead latents
+U.entries(top, latent)                                 # [(value, example index, token position), ...]
+U.unit_stats(model, val_loader, "blocks.6", latent_fn(sae), per_example=True)   # top images, not top patches
 ```
 
 For repeated analysis, **cache the latents once** and query the cache without
-running the model again. {func}`~innards.sae.latent_cache.cache_latents` stores the
+running the model again. {func}`~innards.analysis.units.cache_units` stores the
 sparse codes and each token's (example, position):
 
 ```python
-from innards.sae import LatentCache, cache_latents
-
-cache = LatentCache(cache_latents(sae, model, model.blocks[6], val_loader, "latents/block6",
-                                  exclude=(0,)))
-stats = cache.stats()
-top = cache.top_examples(n_top=20)
-bins = cache.quantile_examples(latent=42, n_bins=5)   # examples across activation strengths
-co = cache.cooccurrence([42, 7, 1001])                # pairwise co-firing counts
+path = U.cache_units(model, val_loader, "blocks.6", "latents/block6", latent_fn(sae), exclude=(0,),
+                     metadata={"sae": "block6_16k"})
+stats, top = U.cache_stats(path), U.cache_top(path, n_top=20)
+bins = U.quantile_examples(path, 42, n_bins=5)      # examples across activation strengths
+co = U.cooccurrence(path, [42, 7, 1001])            # pairwise co-firing counts
 ```
 
 Top examples show a latent's most extreme behaviour; sampling each
@@ -101,26 +102,27 @@ Modules work in place of layer names when ``model=`` is given, e.g.
 
 ## Dashboards
 
-{mod}`innards.sae.dashboard` writes self-contained HTML pages (no server, no network,
-light and dark themes):
+{mod}`innards.analysis.dashboard` writes self-contained HTML pages for a
+cache (no server, no network, light and dark themes):
 
 ```python
-from innards.sae.dashboard import image_renderer, save_latent_dashboard, text_renderer
+from innards.analysis.dashboard import image_renderer, save_dashboard, text_renderer
 
-save_latent_dashboard("dashboard.html", cache, text_renderer(val_tokens),
-                      sae=sae, readout=unembed, output_labels=vocab)
-save_latent_dashboard("vit.html", cache, image_renderer(val_images, n_prefix=1,
-                      mean=IMAGENET_MEAN, std=IMAGENET_STD))
+save_dashboard("dashboard.html", path, text_renderer(val_tokens), noun="latent",
+               directions=sae.decoder_weight(), readout=unembed, output_labels=vocab)
+save_dashboard("vit.html", path, image_renderer(val_images, n_prefix=1, mean=IMAGENET_MEAN,
+               std=IMAGENET_STD), noun="latent", per_example=True)
 ```
 
 The index lists every latent (searchable and sortable, with a firing-frequency
 histogram). Each latent's page shows its statistics, activation histogram, top
 examples, examples per activation quantile, nearest latents by decoder
-direction and output effects. A renderer decides how an example looks:
-`text_renderer` shades a window of tokens, `image_renderer` overlays the
-patch activations on the image, and any `fn(example, position, token_acts,
-vmax) -> html` works. Every latent's examples are embedded, so files grow
-with `max_latents`.
+direction and output effects (both need `directions=`). A renderer decides
+how an example looks: `text_renderer` shades a window of tokens,
+`image_renderer` overlays the patch activations on the image, and any
+`fn(example, position, token_acts, vmax) -> html` works. Every latent's
+examples are embedded, so files grow with `max_units`.
+{mod}`innards.sae.dashboard` draws attribution graphs (see [Circuits](circuits.md)).
 
 ## Plots
 
@@ -129,5 +131,6 @@ else: ``plot.histogram`` for latent density (``log10=True``) and decoder
 redundancy, ``plot.embedding`` for dictionary maps, ``plot.similarity_matrix``
 (``signed=True``) for atom cosines, ``plot.bars`` for output effects and
 attributions, ``plot.images`` for top images with activation maps.
-{mod}`innards.sae.viz` keeps the HTML token views for language models
-(``text_examples_html``, ``token_activation_html``, ``show_html``).
+For language models, {mod}`innards.analysis.dashboard` also has inline token
+views for notebooks (``text_examples_html``, ``token_activation_html``,
+``show_html``).

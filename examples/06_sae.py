@@ -9,10 +9,12 @@ from common import NAME, figure_path, normalisation, parse, setup, stack
 
 from innards import RowLoader, extract_to_disk, unwrap
 from innards.analysis import causal, interp, metrics, plot
+from innards.analysis.dashboard import image_renderer, save_dashboard
+from innards.analysis.units import cache_units, entries, unit_stats
 from innards.edits import zero
 from innards.extract import layer_tokens
 from innards.reduce import drop
-from innards.sae import SAE, SAETrainer, TrainerConfig, analyze_dataset, encode_inputs, latent_fn
+from innards.sae import SAE, SAETrainer, TrainerConfig, latent_fn
 from innards.sae.interventions import sae_edits
 
 args = parse(__doc__, "vit_tiny_patch16_224.augreg_in21k_ft_in1k", n=500)
@@ -31,19 +33,14 @@ trainer.train(RowLoader(run / L, batch_rows=1024))
 print("held-in fve:", round(trainer.evaluate(RowLoader(run / L, batch_rows=1024))["eval/fve"], 3))
 sae = trainer.export_model().eval()
 
-# 2. Which latents fire, and on what? (one pass over the data through the live model)
-analysis = analyze_dataset(sae, model, L, loader, exclude=prefix)
-ax = plot.histogram(analysis.stats.frequency, log10=True, xlabel="log10 firing frequency", ylabel="latents",
+# 2. Which latents fire, and on what? One pass over the data through the live model; the latents are
+#    units like any other (neurons, directions), and per_example ranks images by their peak patch.
+stats, top = unit_stats(model, loader, L, latent_fn(sae), n_top=8, per_example=True, exclude=prefix)
+ax = plot.histogram(stats.frequency, log10=True, xlabel="log10 firing frequency", ylabel="latents",
                     title="latent density")
 plot.save(ax.figure, figure_path(args, "sae_latent_density"))
-freq = analysis.stats.frequency
-latent = int(torch.where(freq < 0.05, freq, torch.zeros_like(freq)).argmax())   # the most frequent non-dense latent
-# top images = highest maximum over each image's patches (top *tokens* can all come from one image)
-with torch.no_grad():
-    peak = torch.cat([encode_inputs(sae, model, L, x.to(args.device))[:, len(prefix):, latent].amax(1).cpu()
-                      for x, _ in loader])
-examples = peak.topk(8).indices.tolist()
-images, labels = stack(data, examples)
+latent = int(torch.where(stats.frequency < 0.05, stats.frequency, 0).argmax())   # most frequent non-dense latent
+images, labels = stack(data, [e for _, e, _ in entries(top, latent)])
 with torch.no_grad():   # the latent as a function of the layer's tokens: any direction tool takes it
     tokens = layer_tokens(model, images.to(args.device), L)
     maps = interp.spatial_map(tokens, latent_fn(sae, latent), tuple(vit.patch_embed.grid_size), exclude=prefix)
@@ -56,3 +53,12 @@ edits = sae_edits(sae, L, zero([latent]), exclude=prefix)
 change = causal.effect(model, loader, edits, metrics.change(metrics.logit("label")))
 mean, lo, hi = metrics.bootstrap_ci(change)
 print(f"ablating latent {latent}: label logit change {mean:+.4f} [{lo:+.4f}, {hi:+.4f}]")
+
+# 4. A browsable dashboard of the 100 most frequent latents (cache once, then no model needed).
+cache = cache_units(model, loader, L, f"{args.out}/latents_sae", latent_fn(sae), exclude=prefix)
+render = image_renderer(lambda e: data[e][0], tuple(vit.patch_embed.grid_size), n_prefix=len(prefix),
+                        **normalisation(model))
+page = save_dashboard(figure_path(args, "sae_dashboard").with_suffix(".html"), cache, render, per_example=True,
+                      directions=sae.decoder_weight(), readout=vit.head.weight, output_labels=lambda i: NAME.get(i, f"class {i}"),
+                      noun="latent", max_units=100, n_top=8, n_bins=2, title=f"SAE latents at {L}")
+print("dashboard:", page)

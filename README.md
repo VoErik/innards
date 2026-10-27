@@ -40,6 +40,7 @@ Other extras: `wandb`, `mlflow`, `tensorboard` (SAE training logs), `umap`,
 | `innards.analysis.causal`, `.metrics` | effects and sweeps with per-example values and bootstrap CIs, activation / attribution patching, relevant subspaces |
 | `innards.analysis.spline` | the spline view of ReLU networks: activation regions, local complexity, partitions on input slices, Jacobian spectra |
 | `innards.analysis.interp` | top examples, spatial maps, integrated gradients, logit lens, attention maps and rollout |
+| `innards.analysis.units`, `.dashboard` | what each unit (neuron, channel, direction, SAE latent) responds to over a dataset: statistics, top examples, a sparse cache, HTML dashboards |
 | `innards.analysis.plot`, `innards.style` | publication-style figures for all of the above, one matplotlib style |
 | `innards.sae` | sparse autoencoders, transcoders and cross-layer transcoders: training, analysis, interventions, attribution graphs, dashboards |
 
@@ -156,12 +157,15 @@ sae.save("sae.safetensors")
 Analysis and interventions use the same machinery as the rest of innards:
 
 ```python
-from innards.sae import LatentCache, cache_latents
+from innards.analysis import units
+from innards.analysis.dashboard import image_renderer, save_dashboard
+from innards.sae import latent_fn
 from innards.edits import zero
 from innards.sae.interventions import sae_edits
 
-cache = LatentCache(cache_latents(sae, model, "blocks.6", val_loader, "latents/b6", exclude=(0,)))
-cache.stats(), cache.top_examples(n_top=20), cache.quantile_examples(latent=42)
+path = units.cache_units(model, val_loader, "blocks.6", "latents/b6", latent_fn(sae), exclude=(0,))  # latents are units
+units.cache_stats(path), units.cache_top(path, n_top=20, per_example=True), units.quantile_examples(path, 42)
+save_dashboard("b6.html", path, image_renderer(images, n_prefix=1), directions=sae.decoder_weight(), noun="latent")
 logits, _ = run(model, images, sae_edits(sae, "blocks.6", zero([42]), exclude=(0,)))
 V = sae.decoder_weight()                    # the dictionary is a set of directions for innards.analysis
 ```
@@ -180,7 +184,8 @@ V = sae.decoder_weight()                    # the dictionary is a set of directi
 * **Attribution graphs** over spliced SAEs, transcoders or CLTs
   (`attribution_graph`, `sae_site`, `clt_site`), with influence-based
   pruning. ([guide](docs/guides/circuits.md))
-* **Dashboards**: self-contained HTML latent browsers and graph viewers
+* **Dashboards**: self-contained HTML latent browsers
+  (`innards.analysis.dashboard`, for any units) and attribution-graph viewers
   (`innards.sae.dashboard`). ([guide](docs/guides/analysis.md))
 * **SAELens interop**: `save_saelens` / `load_saelens`.
   ([guide](docs/guides/interop.md))
