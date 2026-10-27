@@ -19,7 +19,11 @@ Typical usage::
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import (
+    Callable,
+    Iterator
+)
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -52,6 +56,32 @@ def unwrap(model: nn.Module | Envoy) -> nn.Module:
         The PyTorch module.
     """
     return model._module if isinstance(model, Envoy) else model
+
+
+@contextmanager
+def frozen(*modules: nn.Module | Envoy) -> Iterator[None]:
+    """
+    Disables gradients of the modules' parameters inside the block, restoring them after.
+
+    For gradients that only need to reach activations or inputs (attribution,
+    Jacobians), so parameter gradients are neither computed nor accumulated.
+
+    Args:
+        *modules: Modules or nnsight models.
+
+    Yields:
+        None.
+    """
+    modules = [unwrap(m) for m in modules]
+    flags = [[p.requires_grad for p in m.parameters()] for m in modules]
+    for m in modules:
+        m.requires_grad_(False)
+    try:
+        yield
+    finally:
+        for m, fl in zip(modules, flags):
+            for p, f in zip(m.parameters(), fl):
+                p.requires_grad_(f)
 
 
 def layer_name(model: nn.Module | Envoy, layer: str | nn.Module | Envoy) -> str:

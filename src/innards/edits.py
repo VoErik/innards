@@ -8,8 +8,10 @@ the same for ViTs and CNNs; :func:`run` applies a dict of them in one nnsight
 trace, :func:`edit_output` applies one inside your own trace.
 
 Factories for the usual edits: :func:`steer`, :func:`ablate` (project out
-directions), :func:`zero`, :func:`mean_ablate`, :func:`patch` (activation
-patching). SAE edits live in :mod:`innards.sae.interventions`.
+directions), :func:`patch` (activation patching), and edits of single units
+(neurons, or SAE latents): :func:`zero`, :func:`scale`, :func:`clamp`,
+:func:`mean_ablate`. :func:`innards.sae.interventions.sae_edits` applies the
+unit edits in an SAE's latent space.
 
 Typical usage::
 
@@ -23,6 +25,9 @@ Typical usage::
         logits = model.output.save()
 
 References:
+    Templeton, A. et al. (2024). Scaling Monosemanticity: Extracting
+        Interpretable Features from Claude 3 Sonnet. Transformer Circuits
+        Thread. (Feature clamping.)
     Turner, A. et al. (2023). Steering Language Models With Activation
         Engineering. arXiv:2308.10248.
     Meng, K. et al. (2022). Locating and Editing Factual Associations in GPT.
@@ -185,28 +190,87 @@ def ablate(directions: Tensor) -> Edit:
     return edit
 
 
-def zero() -> Edit:
+Units = int | Sequence[int] | Tensor | None
+
+
+def _units(units: Units, device: torch.device) -> Tensor | slice:
+    if units is None:
+        return slice(None)
+    return torch.as_tensor([units] if isinstance(units, int) else units, device=device, dtype=torch.long)
+
+
+def _set_units(fn: Callable[[Tensor, Tensor | slice], Tensor], units: Units) -> Edit:
+    """An edit replacing the selected units (last dimension) by ``fn(values, index)``."""
+
+    def edit(x: Tensor) -> Tensor:
+        idx = _units(units, x.device)
+        out = x.clone()
+        out[..., idx] = fn(x[..., idx], idx).to(x.dtype)
+        return out
+
+    return edit
+
+
+def zero(units: Units = None) -> Edit:
     """
-    Sets the tokens to zero.
+    Sets units (or everything) to zero.
+
+    Units index the last dimension: neurons of a layer's tokens, or the
+    latents of an SAE (see :func:`innards.sae.interventions.sae_edits`).
+
+    Args:
+        units: Unit index or indices; ``None`` zeroes everything.
 
     Returns:
         The edit.
     """
-    return torch.zeros_like
+    return _set_units(lambda v, idx: torch.zeros_like(v), units)
 
 
-def mean_ablate(mean: Tensor) -> Edit:
+def scale(units: Units, factor: float) -> Edit:
     """
-    Replaces every token by ``mean``, e.g. the dataset mean of the layer.
+    Multiplies units by ``factor`` (0 ablates, above 1 amplifies).
 
     Args:
-        mean: Vector ``(d,)``.
+        units: Unit index or indices; ``None`` scales everything.
+        factor: Multiplier.
+
+    Returns:
+        The edit.
+    """
+    return _set_units(lambda v, idx: v * factor, units)
+
+
+def clamp(units: Units, value: float, only_active: bool = False) -> Edit:
+    """
+    Sets units to ``value``, e.g. to steer with an SAE latent (Templeton et al., 2024).
+
+    Args:
+        units: Unit index or indices.
+        value: The value, e.g. a multiple of the unit's maximum activation.
+        only_active: Only where the unit is non-zero (SAE latents that fire).
+
+    Returns:
+        The edit.
+    """
+    return _set_units(lambda v, idx: torch.where(v != 0, value, v) if only_active else torch.full_like(v, value), units)
+
+
+def mean_ablate(mean: Tensor, units: Units = None) -> Edit:
+    """
+    Replaces units (or the whole vector) by their mean, e.g. the dataset mean of the layer.
+
+    Args:
+        mean: Mean of every unit ``(d,)``. For SAE latents, the mean over all
+            tokens including those where a latent is off, e.g.
+            ``frequency * mean_activation``.
+        units: Unit index or indices; ``None`` replaces the whole vector.
 
     Returns:
         The edit.
     """
     mean = mean.detach()
-    return lambda tokens: mean.to(tokens).expand_as(tokens).clone()
+    return _set_units(lambda v, idx: mean.to(v.device, v.dtype)[idx].expand_as(v), units)
 
 
 def patch(source: Tensor, exclude: Sequence[int] = (), mask: Tensor | None = None) -> Edit:

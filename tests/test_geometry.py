@@ -194,3 +194,26 @@ def test_inlp_erases_the_concept():
     assert V.shape == (4, 16)
     assert accs[0] > 0.95 and accs[-1] < 0.65
     assert D.probe_layers({"erased": G.remove(X, V)}, y)["erased"] < 0.65
+
+
+def test_nearest_excludes_self_and_matches_dense():
+    V = torch.nn.functional.normalize(torch.randn(50, 8, generator=torch.Generator().manual_seed(0)), dim=-1)
+    cos, idx = G.nearest(V, k=3, chunk=7)
+    dense = (V @ V.T).double().fill_diagonal_(-2)
+    ref_v, ref_i = dense.topk(3, dim=-1)
+    torch.testing.assert_close(cos.double(), ref_v, atol=1e-5, rtol=0)
+    assert torch.equal(idx, ref_i)
+    one_v, one_i = G.nearest(V, 4, k=3)
+    assert one_v.shape == (3,) and torch.equal(one_i, ref_i[4])
+    many_v, many_i = G.nearest(V, [4, 7], k=3)
+    assert many_i.shape == (2, 3) and torch.equal(many_i[1], ref_i[7])
+
+
+def test_embed():
+    X = torch.randn(60, 5, generator=torch.Generator().manual_seed(0)) * torch.tensor([5.0, 1, 1, 1, 0.1])
+    P = G.embed(X, "pca")
+    assert P.shape == (60, 2)
+    assert P[:, 0].var() > P[:, 1].var()  # first coordinate is the top principal axis
+    assert G.embed(X, "tsne", n_components=2, metric="cosine").shape == (60, 2)
+    with pytest.raises(ValueError):
+        G.embed(X, "isomap")

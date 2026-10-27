@@ -10,7 +10,6 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from innards.sae import analysis as A
-from innards.sae import viz
 from innards.extract import RowStream
 from innards.store import RowLoader, write_rows
 from innards.sae.model import SAE
@@ -66,39 +65,27 @@ def test_cache_max_rows(tmp_path, setup):
     assert RowLoader(path).n_rows == 500
 
 
-def test_analyze_dataset(setup):
-    vit, images, loader, _, sae = setup
-    res = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude=(0,))
-    assert res.stats.n_tokens == 96 * 16
-    # mean L0 = sum of frequencies = k for TopK
-    assert abs(res.stats.frequency.sum().item() - 4) < 1e-3
-    lat = int(res.stats.frequency.argmax())
-    entries = res.top.for_latent(lat)
-    assert len(entries) == 5 and all(p != 0 for _, _, p in entries)  # CLS never selected
-    v, e, p = entries[0]
-    acts = A.encode_inputs(sae, vit, vit.block, images[e : e + 1])
-    torch.testing.assert_close(acts[0, p, lat], torch.tensor(v), atol=1e-5, rtol=1e-5)
-    assert abs(v) == pytest.approx(res.stats.max_activation[lat].item(), rel=1e-5)
-
-
 def test_dictionary_geometry(setup):
+    from innards.analysis.geometry import nearest
+
     *_, sae = setup
-    v, i = A.max_cosine_similarity(sae, chunk=16)
-    assert v.shape == (64,) and (i != torch.arange(64)).all() and (v <= 1 + 1e-5).all()
-    nv, ni = A.nearest_latents(sae, 3, n=4)
-    assert ni[0] == i[3] and nv[0] == pytest.approx(v[3].item(), abs=1e-5)
-    m = A.decoder_similarity_matrix(sae, [1, 2, 3])
-    torch.testing.assert_close(m.diagonal(), torch.ones(3), atol=1e-5, rtol=0)
+    atoms = torch.nn.functional.normalize(sae.decoder_weight().detach(), dim=-1)
+    v, i = nearest(atoms, k=1, chunk=16)
+    assert v.shape == (64, 1) and (i[:, 0] != torch.arange(64)).all() and (v <= 1 + 1e-5).all()
+    nv, ni = nearest(atoms, 3, k=4)
+    assert ni[0] == i[3, 0] and nv[0] == pytest.approx(v[3, 0].item(), abs=1e-5)
     assert A.encoder_decoder_cosine(sae).shape == (64,)
-    assert A.dictionary_embedding(sae).shape == (64, 2)
 
 
 def test_output_effects(setup):
+    from innards.analysis.interp import readout_effect, top_outputs
+
     vit, *_, sae = setup
-    eff = A.output_effects(sae, vit.head.weight, latents=[0, 5], n=3)
+    top_v, top_i, bot_v, bot_i = top_outputs(readout_effect(sae.decoder_weight()[[0, 5]], vit.head.weight), n=3)
     direct = sae.decoder_weight()[5] @ vit.head.weight.T
-    assert eff.top_values.shape == (2, 3)
-    assert eff.top_values[1, 0].item() == pytest.approx(direct.max().item(), rel=1e-5)
+    assert top_v.shape == bot_i.shape == (2, 3)
+    assert top_v[1, 0].item() == pytest.approx(direct.max().item(), rel=1e-5)
+    assert bot_v[1, 0].item() == pytest.approx(direct.min().item(), rel=1e-5)
 
 
 def test_latent_attribution_matches_ablation(setup):
@@ -128,34 +115,42 @@ def test_latent_attribution_matches_ablation(setup):
     assert (attr.target - ablated).item() == pytest.approx(vals[0].item(), rel=1e-3, abs=1e-5)
 
 
-def test_patch_maps_and_input_attribution(setup):
+def test_latent_fn_with_interp(setup):
+    from innards.analysis import interp
+    from innards.edits import run
+
     vit, images, *_, sae = setup
-    maps = A.latent_patch_maps(sae, vit, vit.block, images[:2], [0, 1], exclude=(0,))
+    tokens = run(vit, images[:2], read="block")[1]["block"]
+    torch.testing.assert_close(A.latent_fn(sae)(tokens), sae.encode(tokens))
+    torch.testing.assert_close(A.encode_inputs(sae, vit, "block", images[:2]), sae.encode(tokens))
+    maps = interp.spatial_map(tokens, A.latent_fn(sae, [0, 1]), (4, 4), exclude=(0,))
     assert maps.shape == (2, 2, 4, 4)
-    single = A.latent_patch_maps(sae, vit, vit.block, images[:2], 1, exclude=(0,))
+    single = interp.spatial_map(tokens, A.latent_fn(sae, 1), (4, 4), exclude=(0,))
     torch.testing.assert_close(single, maps[:, 1])
-    sal = A.input_attribution(sae, vit, vit.block, images[:2], latent=0, exclude=(0,))
+    values, examples, positions = interp.top_k(tokens, A.latent_fn(sae, 1), k=3)
+    assert values[0] == sae.encode(tokens)[..., 1].max()
+    sal = interp.input_attribution(vit, images[:2], "block", A.latent_fn(sae, 0, pre=True), exclude=(0,))
     assert sal.shape == images[:2].shape and sal.abs().sum() > 0
     assert all(p.requires_grad for p in vit.parameters())
 
 
 def test_viz_smoke(setup):
+    from innards.analysis import plot
+    from innards.analysis.dashboard import text_examples_html
+    from innards.analysis.units import unit_stats
+    from innards.analysis.geometry import nearest
+    from innards.analysis.interp import readout_effect, top_outputs
+
     vit, images, loader, _, sae = setup
-    res = A.analyze_dataset(sae, vit, vit.block, loader, n_top=4, exclude=(0,))
-    viz.plot_latent_density(res.stats.frequency)
-    viz.plot_max_cosine_similarity(A.max_cosine_similarity(sae)[0])
-    viz.plot_dictionary_map(A.dictionary_embedding(sae), color=res.stats.frequency, highlight=[1, 2])
-    viz.plot_similarity_matrix(A.decoder_similarity_matrix(sae, [0, 1, 2]), [0, 1, 2])
-    eff = A.output_effects(sae, vit.head.weight, latents=[0], n=3)
-    viz.plot_output_effects(eff.top_values[0], eff.top_ids[0], eff.bottom_values[0], eff.bottom_ids[0],
-                            labels=[f"class {i}" for i in range(10)])
-    attr = A.latent_attribution(sae, vit, vit.block, images[:1], lambda o, _: o[:, 0], exclude=(0,))
-    v, l = attr.top_latents(0, 5)
-    viz.plot_attribution_bars(v, l, error=attr.error_attribution[0].sum().item())
-    imgs = [viz.to_display_image(images[i]) for i in range(3)]
-    maps = A.latent_patch_maps(sae, vit, vit.block, images[:3], 0, exclude=(0,))
-    viz.plot_top_images(imgs, maps, values=[1.0, 2.0, 3.0], suptitle="latent 0")
-    html = viz.text_examples_html([(["a", "b<", "c"], [0.0, 1.0, -0.5], 1)], title="latent 0", context=1)
+    stats, _ = unit_stats(vit, loader, vit.block, A.latent_fn(sae), n_top=4, exclude=(0,))
+    atoms = torch.nn.functional.normalize(sae.decoder_weight().detach(), dim=-1)
+    plot.histogram(stats.frequency, log10=True, xlabel="log10 firing frequency", title="density")
+    plot.histogram(nearest(atoms, k=1)[0], xlabel="max cosine similarity")
+    plot.embedding(atoms, values=stats.frequency, annotate=[1, 2], metric="cosine")
+    plot.similarity_matrix(atoms[:3] @ atoms[:3].T, labels=["0", "1", "2"], signed=True)
+    tv, ti, bv, bi = top_outputs(readout_effect(atoms[[0]], vit.head.weight), n=3)
+    plot.bars(torch.cat([tv[0], bv[0].flip(0)]), [f"class {int(i)}" for i in torch.cat([ti[0], bi[0].flip(0)])])
+    html = text_examples_html([(["a", "b<", "c"], [0.0, 1.0, -0.5], 1)], title="latent 0", context=1)
     assert "b&lt;" in html and "rgba(208,59,59,1.000)" in html
 
 
@@ -169,18 +164,6 @@ def test_latent_attribution_token_mask(setup):
     assert not attr.keep[:, 0].any() and not attr.keep[:, 5].any() and attr.keep[:, 1].all()
     assert (attr.acts[:, 5] == 0).all() and (attr.error_attribution[:, 0] == 0).all()
     torch.testing.assert_close(attr.target, vit(x)[:, 3].detach(), atol=1e-5, rtol=1e-5)
-
-
-def test_analyze_dataset_chunking_is_exact(setup):
-    vit, _, loader, _, sae = setup
-    full = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude=(0,))
-    chunked = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude=(0,), chunk_tokens=7)
-    torch.testing.assert_close(chunked.stats.frequency, full.stats.frequency)
-    torch.testing.assert_close(chunked.stats.max_activation, full.stats.max_activation)
-    torch.testing.assert_close(chunked.top.values, full.top.values)
-    filled = full.top.values != 0
-    assert torch.equal(chunked.top.example[filled], full.top.example[filled])
-    assert (full.top.position[~filled] == -1).all()
 
 
 @pytest.mark.parametrize("bs", [64, 1000])  # 1000 > shard size: a batch spans several shards
@@ -204,7 +187,8 @@ def test_cached_activations_order_and_prefetch(tmp_path, bs):
 def test_interventions(setup):
     from _hooks import replace_output
     from innards.edits import rows, run, steer
-    from innards.sae.interventions import clamp, mean_ablate, sae_edits, scale, zero_ablate
+    from innards.edits import clamp, mean_ablate, scale, zero
+    from innards.sae.interventions import sae_edits
 
     vit, images, *_, sae = setup
     x = images[:4]
@@ -223,15 +207,15 @@ def test_interventions(setup):
 
         lat = int(sae.encode(vit.block(vit.embed(x).flatten(2).transpose(1, 2))).abs().sum((0, 1)).argmax())
         outs = {name: spliced(edit) for name, edit in [
-            ("zero", zero_ablate(lat)), ("clamp0", clamp([lat], 0.0)), ("scale0", scale(lat, 0.0)),
-            ("mean0", mean_ablate(lat, torch.zeros(sae.cfg.d_sae)))]}
+            ("zero", zero(lat)), ("clamp0", clamp([lat], 0.0)), ("scale0", scale(lat, 0.0)),
+            ("mean0", mean_ablate(torch.zeros(sae.cfg.d_sae), lat))]}
         assert not torch.allclose(outs["zero"], clean, atol=1e-4)
         for name in ("clamp0", "scale0", "mean0"):
             torch.testing.assert_close(outs[name], outs["zero"])
 
         # The block output moves by exactly -a * d at every patch token where the latent fired.
         ref = run(vit, x, read="block")[1]["block"]
-        got = run(vit, x, sae_edits(sae, "block", zero_ablate(lat), exclude=(0,)), read="block")[1]["block"]
+        got = run(vit, x, sae_edits(sae, "block", zero(lat), exclude=(0,)), read="block")[1]["block"]
         a = sae.encode(ref)[..., lat]
         expected = ref - a.unsqueeze(-1) * sae.decoder_weight()[lat]
         torch.testing.assert_close(got[:, 1:], expected[:, 1:], atol=1e-5, rtol=1e-5)
@@ -241,46 +225,3 @@ def test_interventions(setup):
         st = run(vit, x, {"block": rows(steer(direction, 3.0), exclude=(0,))}, read="block")[1]["block"]
         torch.testing.assert_close(st[:, 1:], ref[:, 1:] + 3.0 * direction)
         torch.testing.assert_close(st[:, 0], ref[:, 0])
-
-
-def test_latent_cache_matches_analysis(tmp_path, setup):
-    from innards.sae.latent_cache import LatentCache, cache_latents
-
-    vit, images, loader, _, sae = setup
-    # Small shards and chunks so merging across shards is exercised.
-    path = cache_latents(sae, vit, vit.block, loader, tmp_path / "lat", exclude=(0,), shard_tokens=200,
-                         chunk_tokens=50, metadata={"hook": "block"})
-    cache = LatentCache(path)
-    assert len(cache.meta["shards"]) > 3 and cache.meta["metadata"]["hook"] == "block"
-    ref = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude=(0,))
-    stats = cache.stats()
-    assert stats.n_tokens == ref.stats.n_tokens == 96 * 16
-    for f in ("frequency", "mean_activation", "max_activation"):
-        torch.testing.assert_close(getattr(stats, f), getattr(ref.stats, f))
-    top = cache.top_examples(5)
-    torch.testing.assert_close(top.values, ref.top.values)
-    filled = ref.top.values != 0
-    assert torch.equal(top.example[filled], ref.top.example[filled])
-    assert torch.equal(top.position[filled], ref.top.position[filled])
-
-    # Dense reference over the whole dataset: (examples, tokens, d_sae) with CLS zeroed.
-    dense = A.encode_inputs(sae, vit, vit.block, images)
-    dense[:, 0] = 0
-    lat = int(stats.frequency.argmax())
-    tokens, values = cache.latent_activations(lat)
-    example, position = cache.token_index(tokens)
-    torch.testing.assert_close(values, dense[example, position, lat])
-    assert values.numel() == int((dense[..., lat] != 0).sum())
-
-    bins = cache.quantile_examples(lat, n_bins=4, per_bin=3)
-    assert len(bins) == 4 and all(len(b) == 3 for b in bins)
-    mags = [[abs(v) for v, _, _ in b] for b in bins]
-    assert all(max(mags[i]) <= min(mags[i + 1]) + 1e-6 for i in range(3))  # bins ordered by magnitude
-    for v, e, p in bins[-1]:
-        assert dense[e, p, lat].item() == pytest.approx(v, rel=1e-5)
-
-    latents = [0, 3, lat, 10]
-    active = (dense.reshape(-1, sae.cfg.d_sae)[:, latents] != 0).float()
-    expected = active.T @ active
-    torch.testing.assert_close(cache.cooccurrence(latents), expected)
-    torch.testing.assert_close(cache.cooccurrence(latents, chunk_tokens=7), expected)

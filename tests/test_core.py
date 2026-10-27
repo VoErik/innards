@@ -523,7 +523,8 @@ def test_transcoder_config_and_target_checks():
 def test_transcoder_store_cache_kl_and_interventions(tmp_path):
     from innards.store import RowLoader, write_rows
     from innards.edits import run
-    from innards.sae.interventions import sae_edits, zero_ablate
+    from innards.edits import zero
+    from innards.sae.interventions import sae_edits
 
     torch.manual_seed(0)
     vit = ToyViT()
@@ -557,7 +558,7 @@ def test_transcoder_store_cache_kl_and_interventions(tmp_path):
         clean = vit(images[:4])
         out, _ = run(vit, images[:4], sae_edits(tc, ln, target=mlp, exclude=(0,), model=vit))
         torch.testing.assert_close(out, clean, atol=1e-5, rtol=1e-5)
-        out, _ = run(vit, images[:4], sae_edits(tc, ln, zero_ablate(list(range(128))), target=mlp,
+        out, _ = run(vit, images[:4], sae_edits(tc, ln, zero(list(range(128))), target=mlp,
                                                exclude=(0,), model=vit))
         assert not torch.allclose(out, clean, atol=1e-3)
 

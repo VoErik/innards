@@ -67,10 +67,10 @@ from ..edits import (
 )
 from ..extract import default_input_fn
 from ..models import (
+    frozen,
     layer_name,
     unwrap
 )
-from .analysis import _frozen
 from .clt import CrossLayerTranscoder
 from .model import SAE
 
@@ -367,7 +367,7 @@ def attribution_graph(
         for layer, edit in site.edits(rec):  # several edits on one layer run in installation order
             name = layer_name(module, layer)
             edits[name] = compose(edits[name], edit) if name in edits else edit
-    with _frozen(module, *dictionaries), torch.enable_grad():  # only the leaves need gradients
+    with frozen(module, *dictionaries), torch.enable_grad():  # only the leaves need gradients
         out, _ = run(model, batch, edits, input_fn=input_fn)
         metric = target_fn(out, batch).sum()
 

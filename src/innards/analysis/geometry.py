@@ -11,6 +11,7 @@ Typical usage::
     effective_rank(X), participation_ratio(X), twonn_dim(X)
     nc1, nc2_norm, nc2_angle, nc3, nc4 = neural_collapse(X, y, W=head.weight, b=head.bias)
     subspace_angles(V_probe, V)
+    cosines, neighbours = nearest(sae.decoder_weight(), k=1)     # redundancy of a dictionary
 
 References:
     Garrido, Q., Balestriero, R., Najman, L. & LeCun, Y. (2023). RankMe:
@@ -39,6 +40,8 @@ References:
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 import numpy as np
 import scipy.linalg
@@ -388,6 +391,77 @@ def cosine_matrix(V: Tensor, W: Tensor | None = None) -> Tensor:
     V = _2d(V)
     W = V if W is None else _2d(W)
     return (V / V.norm(dim=1, keepdim=True)) @ (W / W.norm(dim=1, keepdim=True)).T
+
+
+def nearest(V: Tensor, query: int | Sequence[int] | Tensor | None = None, k: int = 10,
+            chunk: int = 4096) -> tuple[Tensor, Tensor]:
+    """
+    Nearest directions by cosine similarity, excluding each query itself.
+
+    E.g. for an SAE dictionary (``V = sae.decoder_weight()``): ``k=1`` over
+    all rows gives each latent's most similar latent (values near 1 indicate
+    duplicated or split latents).
+
+    Args:
+        V: Directions ``(n, d)``.
+        query: Row index or indices; ``None`` queries every row.
+        k: Number of neighbours.
+        chunk: Query rows per chunk, bounding memory to ``chunk * n``.
+
+    Returns:
+        ``(cosines, indices)``, ``(k,)`` each for a single index, else ``(q, k)``.
+    """
+    U = _2d(V)
+    U = U / U.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    single = isinstance(query, int)
+    rows = torch.arange(len(U)) if query is None else torch.as_tensor([query] if single else query).reshape(-1)
+    k = min(k, len(U) - 1)
+    vals, idx = [], []
+    for part in rows.split(chunk):
+        sims = U[part] @ U.T
+        sims[torch.arange(len(part)), part] = -2.0  # not the query itself
+        v, i = sims.topk(k, dim=-1)
+        vals.append(v)
+        idx.append(i)
+    vals, idx = torch.cat(vals), torch.cat(idx)
+    return (vals[0], idx[0]) if single else (vals, idx)
+
+
+def embed(X: Tensor, method: str = "pca", n_components: int = 2, metric: str = "euclidean",
+          seed: int = 0) -> Tensor:
+    """
+    Low-dimensional coordinates of a representation (or a set of directions).
+
+    Args:
+        X: Representation ``(n, d)``, e.g. pooled activations or the
+            normalised atoms of an SAE dictionary.
+        method: ``"pca"``, ``"tsne"`` (scikit-learn) or ``"umap"`` (needs
+            ``umap-learn``, the ``umap`` extra).
+        n_components: Output dimensionality.
+        metric: Distance for t-SNE and UMAP, e.g. ``"cosine"`` for directions.
+        seed: Random seed for t-SNE and UMAP.
+
+    Returns:
+        Coordinates ``(n, n_components)``.
+
+    Raises:
+        ValueError: If the method is unknown.
+    """
+    Z = _rows(X)
+    if method == "pca":
+        V, _ = pca(Z, k=n_components)
+        return (Z - Z.mean(0)) @ V.T
+    if method == "tsne":
+        from sklearn.manifold import TSNE
+
+        coords = TSNE(n_components=n_components, metric=metric, init="pca", random_state=seed)
+        return torch.from_numpy(coords.fit_transform(Z.cpu().numpy()))
+    if method == "umap":
+        import umap
+
+        coords = umap.UMAP(n_components=n_components, metric=metric, random_state=seed)
+        return torch.from_numpy(coords.fit_transform(Z.cpu().numpy()))
+    raise ValueError(f"method must be 'pca', 'tsne' or 'umap', got {method!r}")
 
 
 def subspace_angles(U: Tensor, V: Tensor) -> Tensor:
