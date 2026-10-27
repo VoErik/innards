@@ -5,7 +5,7 @@
 The project is managed with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv sync                    # core: torch, einops, safetensors, numpy
+uv sync                    # core: torch, nnsight, einops, safetensors, numpy
 uv sync --extra viz        # + matplotlib plots
 uv sync --extra notebooks  # everything the example notebooks need
 uv sync --extra wandb      # or mlflow / tensorboard, for experiment logging

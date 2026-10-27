@@ -9,7 +9,7 @@ reference; build locally with `uv run --group docs sphinx-build docs docs/_build
 ## Install
 
 ```bash
-uv sync                       # core: torch, einops, safetensors, numpy
+uv sync                       # core: torch, nnsight, einops, safetensors, numpy
 uv sync --extra viz           # + matplotlib plots and HTML views
 uv sync --extra notebooks     # everything the example notebooks need
 uv sync --extra wandb         # or mlflow / tensorboard, for experiment logging
@@ -18,6 +18,22 @@ uv sync --extra wandb         # or mlflow / tensorboard, for experiment logging
 Extras: `wandb`, `mlflow`, `tensorboard`, `viz`, `umap`, `vision` (timm,
 torchvision), `language` (transformers, datasets), `notebooks`. The `dev`
 group adds pytest and notebook tooling (`uv sync --group dev`).
+
+## Extracting activations
+
+Any timm model, read through [nnsight](https://nnsight.net) (see the
+[extraction guide](docs/guides/extraction.md)):
+
+```python
+from innards import extract, extract_to_disk, load_acts, load_model
+from innards.reduce import token
+
+model, preprocess = load_model("vit_base_patch16_224")
+loader = ...  # any DataLoader over preprocess-ed images, e.g. (image, label) batches
+acts, labels = extract(model, loader, ["blocks.6", "blocks.11"], reduce=token(0))
+extract_to_disk(model, loader, ["blocks.6"], "acts/vit_b_val")   # each layer dir is an SAE cache
+acts, labels = load_acts("acts/vit_b_val")
+```
 
 ## Workflow
 

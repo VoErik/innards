@@ -9,6 +9,7 @@ dependencies = [
     "einops>=0.7",
     "safetensors>=0.4",
     "numpy>=1.24",
+    "nnsight>=0.8",
 ]
 
 [project.optional-dependencies]
@@ -33,7 +34,7 @@ notebooks = [
 [dependency-groups]
 dev = [
     "pytest>=8",
-    "innards[viz,tensorboard]",
+    "innards[viz,tensorboard,vision]",
     "jupytext>=1.16",
     "nbclient>=0.10",
     "ipykernel>=6",

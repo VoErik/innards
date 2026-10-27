@@ -7,12 +7,13 @@ shuffled token batches from a large buffer, so a batch mixes tokens from many
 images or sequences. The same hook utilities splice the SAE into the model for
 KL fine-tuning (see :meth:`innards.sae.trainer.SAETrainer.finetune_kl`).
 
-Three activation layouts are supported:
+The activation layouts (see :mod:`innards.layouts`) are:
 
 * ``"btd"``: tokens, ``(batch, tokens, d)``, e.g. ViT / CLIP residual streams
   or language-model hidden states.
 * ``"bchw"``: convolutional feature maps ``(batch, channels, h, w)``; every
   spatial position is a token.
+* ``"bhwc"``: channels-last feature maps ``(batch, h, w, channels)``, e.g. Swin.
 * ``"bd"``: one vector per example, e.g. pooled embeddings.
 
 Excluding tokens:
@@ -48,78 +49,21 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
-from einops import rearrange
 from torch import (
     Tensor,
     nn
 )
 
-LAYOUTS = ("btd", "bchw", "bd")
-
-
-def to_tokens(act: Tensor, layout: str) -> Tensor:
-    """
-    Converts a captured activation to ``(batch, tokens, d)``.
-
-    Args:
-        act: Activation in ``layout``.
-        layout: One of ``"btd"``, ``"bchw"``, ``"bd"``.
-
-    Returns:
-        Tensor of shape ``(batch, tokens, d)``.
-
-    Raises:
-        ValueError: If the layout is unknown.
-    """
-    if layout == "btd":
-        return act
-    if layout == "bchw":
-        return rearrange(act, "b c h w -> b (h w) c")
-    if layout == "bd":
-        return rearrange(act, "b d -> b 1 d")
-    raise ValueError(f"unknown layout {layout!r}, expected one of {LAYOUTS}")
-
-
-def from_tokens(tokens: Tensor, layout: str, like: Tensor) -> Tensor:
-    """
-    Inverse of :func:`to_tokens`.
-
-    Args:
-        tokens: Tensor of shape ``(batch, tokens, d)``.
-        layout: Target layout.
-        like: A tensor in the target layout, used for spatial sizes.
-
-    Returns:
-        Tensor in ``layout``.
-
-    Raises:
-        ValueError: If the layout is unknown.
-    """
-    if layout == "btd":
-        return tokens
-    if layout == "bchw":
-        return rearrange(tokens, "b (h w) c -> b c h w", h=like.shape[2], w=like.shape[3])
-    if layout == "bd":
-        return rearrange(tokens, "b 1 d -> b d")
-    raise ValueError(f"unknown layout {layout!r}, expected one of {LAYOUTS}")
-
-
-def keep_positions(n_tokens: int, exclude: Sequence[int], device: torch.device) -> Tensor:
-    """
-    Indices of token positions not in ``exclude`` (negative indices allowed).
-
-    Args:
-        n_tokens: Sequence length.
-        exclude: Positions to drop, e.g. ``(0,)`` for CLS / BOS.
-        device: Device of the result.
-
-    Returns:
-        Long tensor of kept positions.
-    """
-    mask = torch.ones(n_tokens, dtype=torch.bool, device=device)
-    if exclude:
-        mask[torch.tensor([p % n_tokens for p in exclude], device=device)] = False
-    return mask.nonzero().squeeze(-1)
+from ..extract import (  # noqa: F401  (re-exported)
+    default_input_fn,
+    to_device as _to_device
+)
+from ..layouts import (  # noqa: F401  (re-exported)
+    LAYOUTS,
+    from_tokens,
+    keep_positions,
+    to_tokens
+)
 
 
 def token_keep_mask(
@@ -147,37 +91,6 @@ def token_keep_mask(
     if token_mask_fn is not None:
         keep &= token_mask_fn(batch).to(keep.device, torch.bool)
     return keep
-
-
-def default_input_fn(batch: Any) -> tuple[tuple, dict]:
-    """
-    Turns a loader batch into model ``(args, kwargs)``.
-
-    Dicts (e.g. Hugging Face tokenizer output) become keyword arguments;
-    tuples or lists such as ``(images, labels)`` pass their first element;
-    tensors are passed as is.
-
-    Args:
-        batch: A batch from the input loader.
-
-    Returns:
-        ``(args, kwargs)`` for ``model(*args, **kwargs)``.
-    """
-    if isinstance(batch, dict):
-        return (), dict(batch)
-    if isinstance(batch, (tuple, list)):
-        return (batch[0],), {}
-    return (batch,), {}
-
-
-def _to_device(obj: Any, device: torch.device) -> Any:
-    if isinstance(obj, Tensor):
-        return obj.to(device, non_blocking=True)
-    if isinstance(obj, dict):
-        return {k: _to_device(v, device) for k, v in obj.items()}
-    if isinstance(obj, (tuple, list)):
-        return type(obj)(_to_device(v, device) for v in obj)
-    return obj
 
 
 class _StopForward(Exception):

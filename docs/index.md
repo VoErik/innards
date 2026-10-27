@@ -31,6 +31,7 @@ sae.save("sae.safetensors")
 ## Where to start
 
 - [Getting started](getting-started.md): install, then harvest, train, evaluate and save an SAE.
+- [Extracting activations](guides/extraction.md): any timm model through nnsight, in memory or to disk.
 - [Architectures](guides/architectures.md): activations, decoders, loss terms, and adding your own.
 - [Training](guides/training.md): defaults, schedules, checkpoints, several layers at once, KL fine-tuning.
 - [Transcoders](guides/transcoders.md): transcoders, skip connections and cross-layer transcoders.
@@ -44,6 +45,7 @@ sae.save("sae.safetensors")
 :hidden:
 
 getting-started
+guides/extraction
 guides/architectures
 guides/training
 guides/transcoders
