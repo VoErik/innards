@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from innards.edits import run
 from innards.sae.clt import CLTConfig, CrossLayerTranscoder, clt_edits, clt_hooks
-from innards.sae.data import ActivationStore
+from innards.extract import RowStream
 from innards.sae.model import SAE
 from innards.sae.trainer import KLFinetuneConfig, SAETrainer, TrainerConfig
 
@@ -98,8 +98,7 @@ def test_clt_on_model_store_splice_and_downstream(tmp_path):
     net = ToyResidualNet()
     inputs = torch.randn(256, 6, 8)
     data = DataLoader(TensorDataset(inputs), batch_size=32)
-    store = ActivationStore(net, clt_hooks(list(net.lns), list(net.mlps)), data, batch_tokens=256,
-                            buffer_tokens=1024)
+    store = RowStream(net, data, clt_hooks(list(net.lns), list(net.mlps)), batch_rows=256, buffer_rows=1024)
     batch = next(iter(store))
     clt = CrossLayerTranscoder(n_layers=3, d_in=16, d_sae=128, activation="topk", k=8)
     x, y = clt.batch_tensors(batch)
@@ -127,6 +126,6 @@ def test_clt_on_model_store_splice_and_downstream(tmp_path):
 
     ce = lambda out, batch: nn.functional.cross_entropy(out, out.detach().argmax(-1))
     metrics = tr.evaluate_downstream(net, list(net.lns), data, KLFinetuneConfig(), loss_fn=ce,
-                                     target_module=list(net.mlps))
+                                     target=list(net.mlps))
     assert metrics["downstream/loss_ablated"] > metrics["downstream/loss_sae"]
     assert metrics["downstream/kl"] >= 0 and 0.0 < metrics["downstream/loss_recovered"] < 1.5

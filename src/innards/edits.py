@@ -54,31 +54,12 @@ from .extract import (
 )
 from .layouts import (
     from_tokens,
-    keep_positions,
+    keep_mask,
     to_tokens
 )
 from .models import wrap
 
 Edit = Callable[[Tensor], Tensor]
-
-
-def keep_mask(tokens: Tensor, exclude: Sequence[int] = (), mask: Tensor | None = None) -> Tensor:
-    """
-    Boolean ``(batch, tokens)`` mask of the tokens an edit applies to.
-
-    Args:
-        tokens: Tokens ``(batch, tokens, d)``.
-        exclude: Positions left out, e.g. ``(0,)`` for CLS / BOS.
-        mask: Optional boolean ``(batch, tokens)`` mask, e.g. non-padding tokens.
-
-    Returns:
-        The mask.
-    """
-    keep = torch.zeros(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
-    keep[:, keep_positions(tokens.shape[1], list(exclude), tokens.device)] = True
-    if mask is not None:
-        keep &= mask.to(keep.device, torch.bool)
-    return keep
 
 
 def rows(fn: Callable[[Tensor], Tensor], exclude: Sequence[int] = (), mask: Tensor | None = None) -> Edit:

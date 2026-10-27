@@ -18,45 +18,47 @@ group adds the test tooling, the `docs` group this documentation.
 ## The workflow
 
 You need a trained PyTorch model and a loader of its inputs. Everything below
-works the same for vision transformers, CNNs (`layout="bchw"`) and language
-models; only the hook point and the tokens to exclude change.
+works the same for vision transformers, CNNs and language models (layouts are
+inferred); only the layer and the tokens to exclude change.
 
-### 1. Harvest activations
+### 1. Token rows to train on
 
-{class}`~innards.sae.data.ActivationStore` runs the frozen model, reads the output
-of one module with nnsight, drops excluded tokens and serves shuffled
-token batches from a large buffer:
+{class}`~innards.extract.RowStream` runs the frozen model, reads one layer
+with nnsight, drops excluded tokens and serves shuffled batches of token
+rows from a large buffer:
 
 ```python
 import torch
-from innards.sae import ActivationStore
+from innards import RowStream
 
-store = ActivationStore(
-    model=model,
-    hook_module=model.blocks[6],                  # the SAE reads this module's output
-    input_loader=loader,
-    exclude_positions=range(model.num_prefix_tokens),  # e.g. CLS / registers, or BOS
-    device="cuda",
-    storage_dtype=torch.bfloat16,
+stream = RowStream(
+    model,
+    loader,
+    "blocks.6",                                   # the SAE reads this layer's output
+    exclude=range(model.num_prefix_tokens),       # e.g. CLS / registers, or BOS
+    dtype=torch.bfloat16,
 )
 ```
 
-For language models, pass `token_mask_fn=lambda batch: batch["attention_mask"]`
+For language models, pass `mask_fn=lambda batch: batch["attention_mask"]`
 (or a mask from token ids) to skip padding and special tokens; the forward
-pass stops right after the hooked module.
+pass stops right after the layer.
 
-### 2. Optionally cache them
+### 2. Optionally store them
 
 Streaming re-runs the model every epoch. When the same activations are used
-more than once (several epochs, sweeps, several SAEs on one layer), cache
-them to disk:
+more than once (several epochs, sweeps, several SAEs on one layer), write
+them to a row cache and read it with {class}`~innards.store.RowLoader`:
 
 ```python
-from innards.sae import CachedActivations, cache_activations
+from innards import RowLoader, write_rows
 
-cache_activations(store, "activations/block6", metadata={"hook": "blocks.6"})
-acts = CachedActivations("activations/block6", batch_tokens=4096, device="cuda")
+write_rows(stream, "activations/block6", dtype=torch.bfloat16, metadata={"layer": "blocks.6"})
+acts = RowLoader("activations/block6", batch_rows=4096, device="cuda")
 ```
+
+A layer folder of {func}`~innards.extract.extract_to_disk` is a row cache
+too (in example order), so extracted activations train directly.
 
 ### 3. Train
 
@@ -65,7 +67,7 @@ from innards.sae import SAE, SAETrainer, TrainerConfig
 
 sae = SAE(d_in=768, d_sae=16 * 768, activation="batchtopk", k=32)
 trainer = SAETrainer(sae, TrainerConfig(num_epochs=5, loggers=("tensorboard",)))
-trainer.train(acts)        # or trainer.train(store) with TrainerConfig(total_tokens=...)
+trainer.train(acts)        # or trainer.train(stream) with TrainerConfig(total_tokens=...)
 print(trainer.evaluate(val_acts))   # {"eval/nmse": ..., "eval/fve": ..., "eval/l0": ...}
 ```
 
@@ -84,10 +86,10 @@ def next_token_loss(out, batch):        # e.g. for a Hugging Face causal LM
     logits, ids = out.logits[:, :-1], batch["input_ids"][:, 1:]
     return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), ids.reshape(-1))
 
-kl_cfg = KLFinetuneConfig(exclude_positions=(0,), output_fn=lambda out: out.logits)
-trainer.evaluate_downstream(model, model.blocks[6], val_loader, kl_cfg, loss_fn=next_token_loss)
+kl_cfg = KLFinetuneConfig(exclude=(0,), output_fn=lambda out: out.logits)
+trainer.evaluate_downstream(model, "blocks.6", val_loader, kl_cfg, loss_fn=next_token_loss)
 # {"downstream/kl", "downstream/top1_agreement", "downstream/loss_recovered", ...}
-trainer.finetune_kl(model, model.blocks[6], train_loader, kl_cfg)  # optional, a few % of the budget
+trainer.finetune_kl(model, "blocks.6", train_loader, kl_cfg)  # optional, a few % of the budget
 ```
 
 ### 5. Save, load, analyse

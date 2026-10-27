@@ -8,9 +8,8 @@ Extracting activations: find layers, extract them in memory or to disk, load the
 import torch
 from common import parse, setup
 
-from innards import describe, extract, extract_to_disk, load_acts, load_info, stage_names
+from innards import RowLoader, describe, extract, extract_to_disk, load_acts, load_info, stage_names
 from innards.reduce import mean_pool, token
-from innards.sae import CachedActivations
 
 args = parse(__doc__, "vit_tiny_patch16_224.augreg_in21k_ft_in1k", n=200)
 model, data, loader = setup(args)
@@ -33,8 +32,8 @@ run = extract_to_disk(model, loader, layers[-2], f"{args.out}/acts", dtype=torch
 info = load_info(run)
 print("stored:", info["n_examples"], "examples,", info["layers"][layers[-2]])
 
-# 4. Load back, as tensors (n, tokens, d) - or the layer folder is directly an SAE training cache.
+# 4. Load back, as tensors (n, tokens, d) - or as shuffled batches of token rows, e.g. to train an SAE.
 acts, targets = load_acts(run)
 print("loaded:", tuple(acts[layers[-2]].shape), "labels:", targets[:5].tolist())
-batch = next(iter(CachedActivations(run / layers[-2], batch_tokens=1024)))
-print("as an SAE cache:", tuple(batch.shape))
+batch = next(iter(RowLoader(run / layers[-2], batch_rows=1024)))
+print("shuffled token rows:", tuple(batch.shape))

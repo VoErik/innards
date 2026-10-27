@@ -4,8 +4,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from innards.sae.cache import CachedActivations, cache_activations
-from innards.sae.data import ActivationStore
+from innards.extract import RowStream
+from innards.store import RowLoader, write_rows
 from innards.sae.group import SAEGroup
 from innards.sae.model import SAE
 from innards.sae.trainer import SAETrainer, TrainerConfig
@@ -25,20 +25,19 @@ def mlp_net():
 def test_multi_hook_store_and_cache_keep_tokens_aligned(tmp_path):
     net = mlp_net()
     loader = [torch.randn(4, 10, 8) for _ in range(20)]  # (batch, tokens, d) inputs
-    store = ActivationStore(net, {"h1": net[1], "h2": net[3]}, loader, batch_tokens=64, buffer_tokens=256,
-                            exclude_positions=(0,))
+    store = RowStream(net, loader, {"h1": net[1], "h2": net[3]}, batch_rows=64, buffer_rows=256, exclude=(0,))
     batch = next(iter(store))
     assert set(batch) == {"h1", "h2"} and batch["h1"].shape == (64, 16) and batch["h2"].shape == (64, 12)
     with torch.no_grad():  # rows are the same tokens after the joint shuffle
         torch.testing.assert_close(net[3](net[2](batch["h1"])), batch["h2"])
 
-    path = cache_activations(store, tmp_path / "multi", shard_tokens=100, dtype=torch.float32)
-    cached = CachedActivations(path, batch_tokens=32)
+    path = write_rows(store, tmp_path / "multi", shard_rows=100, dtype=torch.float32)
+    cached = RowLoader(path, batch_rows=32)
     assert cached.meta["kind"] == "dict" and [f for f, _ in cached.meta["fields"]] == ["h1", "h2"]
     for b in cached:
         with torch.no_grad():
             torch.testing.assert_close(net[3](net[2](b["h1"])), b["h2"])
-    assert sum(b["h1"].shape[0] for b in cached) == cached.n_tokens // 32 * 32
+    assert sum(b["h1"].shape[0] for b in cached) == cached.n_rows // 32 * 32
 
 
 def _dict_loader(n=20_000, bs=512):
@@ -83,8 +82,8 @@ def test_group_from_vit_store(tmp_path):
     torch.manual_seed(0)
     vit = ToyViT()
     loader = DataLoader(TensorDataset(torch.randn(256, 3, 16, 16)), batch_size=32)
-    store = ActivationStore(vit, {"block1": vit.block1, "block2": vit.block2}, loader, batch_tokens=256,
-                            buffer_tokens=2048, exclude_positions=(0,))
+    store = RowStream(vit, loader, {"block1": vit.block1, "block2": vit.block2}, batch_rows=256,
+                      buffer_rows=2048, exclude=(0,))
     group = SAEGroup({name: SAE(d_in=32, d_sae=128, k=8) for name in ("block1", "block2")})
     tr = SAETrainer(group, tcfg(tmp_path, total_tokens=40_000))
     tr.train(store)

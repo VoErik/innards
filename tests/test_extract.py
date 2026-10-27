@@ -13,7 +13,10 @@ from torch.utils.data import (
 timm = pytest.importorskip("timm")
 
 from innards.extract import (
+    RowStream,
     capture,
+    capture_tokens,
+    layer_tokens,
     describe,
     extract,
     extract_to_disk
@@ -38,7 +41,10 @@ from innards.reduce import (
     mean_pool,
     token
 )
-from innards.sae.cache import CachedActivations
+from innards.store import (
+    RowLoader,
+    write_rows
+)
 from innards.store import (
     load_info,
     load_layer,
@@ -277,7 +283,7 @@ def test_layer_dir_is_sae_cache(tmp_path):
     run = extract_to_disk(model, [x], "blocks.2", tmp_path / "run", reduce=drop([0]), shard_rows=100)
     rows = load_layer(run, "blocks.2", flat=True)
     assert rows.shape == (4 * 80, 64)
-    cached = torch.cat(list(CachedActivations(run / "blocks.2", batch_tokens=40, shuffle=False)))
+    cached = torch.cat(list(RowLoader(run / "blocks.2", batch_rows=40, shuffle=False)))
     assert torch.equal(cached, rows)
 
 
@@ -293,3 +299,38 @@ def test_save_and_load_in_memory(tmp_path):
     assert load_info(tmp_path / "run")["layers"]["a"]["layout"] == "btd"
     with pytest.raises(ValueError):
         save(tmp_path / "bad", {"a": torch.randn(2, 3), "b": torch.randn(3, 3)})
+
+
+# ---------- token rows: streaming and row caches ----------
+
+
+def test_layer_tokens_and_row_stream_on_channels_last():
+    model = timm.create_model("test_mambaout", pretrained=False).eval()
+    x = images(4)
+    with torch.no_grad():
+        tokens = layer_tokens(model, x, "stages.1")
+        both = capture_tokens(model, x, ["stages.1", "stages.0"])
+    assert tokens.shape == (4, 20 * 16, 32) and torch.equal(both["stages.1"], tokens)   # bhwc -> tokens, inferred
+    mask = torch.ones(4, 20 * 16, dtype=torch.bool)
+    mask[1] = False                                                                   # drop example 1 entirely
+    stream = RowStream(model, [(x, torch.zeros(4))], "stages.1", batch_rows=64, buffer_rows=128, exclude=(0,),
+                       mask_fn=lambda b: mask, seed=0)
+    rows = torch.cat(list(stream))
+    expected = torch.cat([tokens[i, 1:] for i in (0, 2, 3)])
+    assert rows.shape[1] == 32 and len(rows) == len(expected) // 64 * 64
+    # every served row is one of the kept tokens (shuffled)
+    assert torch.isin(rows[:, 0], expected[:, 0]).all() and not torch.isin(rows[:, 0], tokens[1, :, 0]).any()
+
+
+def test_write_rows_pairs_and_row_loader(tmp_path):
+    x = torch.arange(30.0).reshape(10, 3)
+    pairs = [(x[i : i + 4], -x[i : i + 4, :2]) for i in range(0, 10, 4)]
+    path = write_rows(pairs, tmp_path / "pairs", shard_rows=3, max_rows=9)
+    loader = RowLoader(path, batch_rows=3, shuffle=False)
+    assert loader.n_rows == 9 and loader.d_in == 3 and loader.meta["d_out"] == 2 and len(loader) == 3
+    a, b = map(torch.cat, zip(*loader))
+    torch.testing.assert_close(a, x[:9])
+    torch.testing.assert_close(b, -x[:9, :2])                                         # fields stay aligned
+    shuffled = list(RowLoader(path, batch_rows=3, seed=1))
+    sa, sb = map(torch.cat, zip(*shuffled))
+    torch.testing.assert_close(sb, -sa[:, :2])

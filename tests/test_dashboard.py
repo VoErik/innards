@@ -39,7 +39,7 @@ def test_latent_dashboard_payload(tmp_path):
     sae = SAE(d_in=16, d_sae=32, k=3)
     sae.initialize_from_data(acts)
     sae.eval()
-    cache = LatentCache(cache_latents(sae, net, net.block, loader, tmp_path / "lat", exclude_positions=(0,)))
+    cache = LatentCache(cache_latents(sae, net, net.block, loader, tmp_path / "lat", exclude=(0,)))
     words = [[f"w{i}</script>" for i in row.tolist()] for row in ids]  # hostile token text must stay escaped
     page = latent_dashboard_html(cache, text_renderer(words, context=3, sep=" "), n_top=5, sae=sae,
                                  readout=torch.randn(7, 16), output_labels=[f"class{i}" for i in range(7)],

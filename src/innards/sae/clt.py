@@ -18,9 +18,9 @@ activation's sparsity penalty (summed over layers) and AuxK.
 Training data are aligned MLP inputs and outputs of every layer, harvested
 in one pass::
 
-    store = ActivationStore(model, clt_hooks(mlp_inputs, mlp_outputs), loader)
+    stream = RowStream(model, loader, clt_hooks(mlp_inputs, mlp_outputs))
     clt = CrossLayerTranscoder(n_layers=6, d_in=512, d_sae=4096, activation="topk", k=32)
-    SAETrainer(clt, TrainerConfig(total_tokens=...)).train(store)
+    SAETrainer(clt, TrainerConfig(total_tokens=...)).train(stream)
 
 The model keeps its input and target scales as buffers (activations are in
 these normalised units) rather than folding them into the weights, since a
@@ -96,7 +96,7 @@ FORMAT_NAME = "sae-clt"
 
 def clt_hooks(inputs: Sequence[nn.Module], outputs: Sequence[nn.Module]) -> dict[str, nn.Module]:
     """
-    Hook dict for a multi-hook :class:`~innards.sae.data.ActivationStore` feeding a CLT.
+    Layer dict for a :class:`~innards.extract.RowStream` feeding a CLT.
 
     Args:
         inputs: Module whose output is each layer's MLP input (e.g. the norm
@@ -579,7 +579,7 @@ def clt_edits(
     outputs: Sequence[str | nn.Module],
     keep_error: bool = False,
     edit: Callable[[int, Tensor], Tensor] | None = None,
-    exclude_positions: Sequence[int] = (),
+    exclude: Sequence[int] = (),
     mask: Tensor | None = None,
     model: nn.Module | Envoy | None = None,
 ) -> dict[str, Edit]:
@@ -603,7 +603,7 @@ def clt_edits(
         keep_error: Add each layer's error ``y_m - y_hat_m`` back.
         edit: Optional ``fn(layer, acts) -> acts`` on a layer's
             ``(n, d_sae)`` activations (normalised units).
-        exclude_positions: Positions left unchanged.
+        exclude: Positions left unchanged.
         mask: Optional boolean ``(batch, tokens)`` mask of tokens to replace.
         model: Needed only to resolve modules given as layers.
 
@@ -639,6 +639,6 @@ def clt_edits(
     for layer in range(n):
         for module, fn in ((inputs[layer], read(layer)), (outputs[layer], write(layer))):
             name = layer_name(model, module)
-            e = rows(fn, exclude_positions, mask)
+            e = rows(fn, exclude, mask)
             edits[name] = compose(edits[name], e) if name in edits else e
     return edits

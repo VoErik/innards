@@ -16,8 +16,8 @@ from innards.sae.activations import (
     register_activation,
     dense_code
 )
-from innards.sae.data import (
-    ActivationStore,
+from innards.extract import RowStream
+from innards.layouts import (
     from_tokens,
     to_tokens
 )
@@ -264,8 +264,7 @@ def test_vision_store_train_and_kl_finetune(tmp_path):
     images = torch.randn(512, 3, 16, 16)
     img_loader = DataLoader(TensorDataset(images, torch.zeros(512)), batch_size=32)
 
-    store = ActivationStore(vit, vit.block1, img_loader, batch_tokens=256, buffer_tokens=2048,
-                            exclude_positions=(0,))
+    store = RowStream(vit, img_loader, vit.block1, batch_rows=256, buffer_rows=2048, exclude=(0,))
     batches = list(store)
     assert all(b.shape == (256, 32) for b in batches)
     assert sum(b.shape[0] for b in batches) > 0.9 * 512 * 16  # 16 patches per image, CLS dropped
@@ -275,7 +274,7 @@ def test_vision_store_train_and_kl_finetune(tmp_path):
     tr.train(store)
     assert tr.evaluate(store, max_batches=5)["eval/fve"] > 0.5
 
-    kl_cfg = KLFinetuneConfig(steps=40, exclude_positions=(0,), log_every=10)
+    kl_cfg = KLFinetuneConfig(steps=40, exclude=(0,), log_every=10)
     before = tr.evaluate_downstream(vit, vit.block1, img_loader, kl_cfg)
     tr.finetune_kl(vit, vit.block1, img_loader, kl_cfg)
     after = tr.evaluate_downstream(vit, vit.block1, img_loader, kl_cfg)
@@ -297,11 +296,11 @@ def test_conv_layout_kl(tmp_path):
                         nn.ReLU(), nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(16, 5))
     images = torch.randn(128, 3, 8, 8)
     img_loader = DataLoader(TensorDataset(images), batch_size=16)
-    store = ActivationStore(cnn, cnn[1], img_loader, batch_tokens=256, buffer_tokens=1024, layout="bchw")
+    store = RowStream(cnn, img_loader, cnn[1], batch_rows=256, buffer_rows=1024)
     sae = SAE(d_in=16, d_sae=64, k=4)
     tr = SAETrainer(sae, tcfg(tmp_path, total_tokens=20_000))
     tr.train(store)
-    kl_cfg = KLFinetuneConfig(steps=10, layout="bchw", log_every=5)
+    kl_cfg = KLFinetuneConfig(steps=10, log_every=5)
     tr.finetune_kl(cnn, cnn[1], img_loader, kl_cfg)
     assert tr.evaluate_downstream(cnn, cnn[1], img_loader, kl_cfg)["downstream/top1_agreement"] > 0.3
 
@@ -318,8 +317,7 @@ def test_rows_edit_respects_masks():
 
 def test_streaming_without_total_tokens_raises(tmp_path):
     net = nn.Sequential(nn.Linear(8, 16), nn.ReLU())
-    store = ActivationStore(net, net[1], [torch.randn(4, 10, 8) for _ in range(8)], batch_tokens=32,
-                            buffer_tokens=128)
+    store = RowStream(net, [torch.randn(4, 10, 8) for _ in range(8)], net[1], batch_rows=32, buffer_rows=128)
     tr = SAETrainer(SAE(d_in=16, d_sae=64, k=4), tcfg(tmp_path))
     with pytest.raises(ValueError, match="total_tokens"):
         tr.train(store)
@@ -401,7 +399,7 @@ class _Batches:
 
     def __init__(self, x, bs=256, fail_after=None):
         self.batches, self.fail_after, self.served = list(x.split(bs)), fail_after, 0
-        self.batch_tokens = bs
+        self.batch_rows = bs
 
     def __iter__(self):
         for b in self.batches:
@@ -523,7 +521,7 @@ def test_transcoder_config_and_target_checks():
 
 
 def test_transcoder_store_cache_kl_and_interventions(tmp_path):
-    from innards.sae.cache import CachedActivations, cache_activations
+    from innards.store import RowLoader, write_rows
     from innards.edits import run
     from innards.sae.interventions import sae_edits, zero_ablate
 
@@ -532,40 +530,39 @@ def test_transcoder_store_cache_kl_and_interventions(tmp_path):
     images = torch.randn(256, 3, 16, 16)
     img_loader = DataLoader(TensorDataset(images, torch.zeros(256)), batch_size=32)
     ln, mlp = vit.block1[0], vit.block1  # transcoder: LayerNorm output -> block output
-    store = ActivationStore(vit, ln, img_loader, batch_tokens=256, buffer_tokens=2048, exclude_positions=(0,),
-                            target_module=mlp)
+    store = RowStream(vit, img_loader, ln, target=mlp, batch_rows=256, buffer_rows=2048, exclude=(0,))
     x, y = next(iter(store))
     assert x.shape == y.shape == (256, 32)
     with torch.no_grad():  # pairs stay aligned through the shuffle
         torch.testing.assert_close(mlp[2](mlp[1](x)), y, atol=1e-5, rtol=1e-5)
 
-    path = cache_activations(store, tmp_path / "pairs", shard_tokens=1000, dtype=torch.float32)
-    cx, cy = next(iter(CachedActivations(path, batch_tokens=128)))
+    path = write_rows(store, tmp_path / "pairs", shard_rows=1000, dtype=torch.float32)
+    cx, cy = next(iter(RowLoader(path, batch_rows=128)))
     with torch.no_grad():
         torch.testing.assert_close(mlp[2](mlp[1](cx)), cy, atol=1e-5, rtol=1e-5)
 
     tc = SAE(d_in=32, d_sae=128, k=8, transcoder=True)
     tr = SAETrainer(tc, tcfg(tmp_path, total_tokens=60_000))
-    tr.train(CachedActivations(path, batch_tokens=256))
-    assert tr.evaluate(CachedActivations(path, batch_tokens=256))["eval/fve"] > 0.5
+    tr.train(RowLoader(path, batch_rows=256))
+    assert tr.evaluate(RowLoader(path, batch_rows=256))["eval/fve"] > 0.5
 
-    kl_cfg = KLFinetuneConfig(steps=30, exclude_positions=(0,), log_every=10)
-    before = tr.evaluate_downstream(vit, ln, img_loader, kl_cfg, target_module=mlp)
-    tr.finetune_kl(vit, ln, img_loader, kl_cfg, target_module=mlp)
-    after = tr.evaluate_downstream(vit, ln, img_loader, kl_cfg, target_module=mlp)
+    kl_cfg = KLFinetuneConfig(steps=30, exclude=(0,), log_every=10)
+    before = tr.evaluate_downstream(vit, ln, img_loader, kl_cfg, target=mlp)
+    tr.finetune_kl(vit, ln, img_loader, kl_cfg, target=mlp)
+    after = tr.evaluate_downstream(vit, ln, img_loader, kl_cfg, target=mlp)
     assert after["downstream/kl"] < before["downstream/kl"], (before, after)
 
     tc = tr.model.eval()
     with torch.no_grad():
         clean = vit(images[:4])
-        out, _ = run(vit, images[:4], sae_edits(tc, ln, target=mlp, exclude_positions=(0,), model=vit))
+        out, _ = run(vit, images[:4], sae_edits(tc, ln, target=mlp, exclude=(0,), model=vit))
         torch.testing.assert_close(out, clean, atol=1e-5, rtol=1e-5)
         out, _ = run(vit, images[:4], sae_edits(tc, ln, zero_ablate(list(range(128))), target=mlp,
-                                               exclude_positions=(0,), model=vit))
+                                               exclude=(0,), model=vit))
         assert not torch.allclose(out, clean, atol=1e-3)
 
     from innards.sae.analysis import latent_attribution
-    attr = latent_attribution(tc, vit, ln, images[:1], lambda o, _: o[:, 2], exclude_positions=(0,),
-                              target_module=mlp)
+    attr = latent_attribution(tc, vit, ln, images[:1], lambda o, _: o[:, 2], exclude=(0,),
+                              target=mlp)
     torch.testing.assert_close(attr.target, clean[:1, 2], atol=1e-5, rtol=1e-5)
     assert attr.acts.shape == (1, 17, 128) and not attr.keep[0, 0]

@@ -65,13 +65,13 @@ from ..edits import (
     keep_mask,
     run
 )
+from ..extract import default_input_fn
 from ..models import (
     layer_name,
     unwrap
 )
 from .analysis import _frozen
 from .clt import CrossLayerTranscoder
-from .data import default_input_fn
 from .model import SAE
 
 Layer = str | nn.Module
@@ -95,8 +95,8 @@ class _ErrorRecord:
 class _Recorder:
     """Collects the leaves created by the site edits, in forward order."""
 
-    def __init__(self, exclude_positions: Sequence[int], mask: Tensor | None):
-        self.exclude, self.mask = exclude_positions, mask
+    def __init__(self, exclude: Sequence[int], mask: Tensor | None):
+        self.exclude, self.mask = exclude, mask
         self.records: list[_LatentRecord | _ErrorRecord] = []
 
     def keep(self, tokens: Tensor) -> Tensor:
@@ -124,25 +124,25 @@ class Site:
     modules: list[nn.Module] = field(default_factory=list, repr=False)
 
 
-def sae_site(sae: SAE, hook_module: Layer, target_module: Layer | None = None,
+def sae_site(sae: SAE, layer: Layer, target: Layer | None = None,
              name: str | None = None) -> Site:
     """
-    An SAE (``target_module=None``) or transcoder site.
+    An SAE (``target=None``) or transcoder site.
 
-    An SAE replaces ``hook_module``'s output by ``decode(a) + e``; a
-    transcoder reads ``hook_module`` and replaces ``target_module``'s output
+    An SAE replaces ``layer``'s output by ``decode(a) + e``; a
+    transcoder reads ``layer`` and replaces ``target``'s output
     by ``decode(a) + skip(x) + e``. In both cases the latents ``a`` are
     computed from the (spliced) upstream model and become leaves.
 
     Args:
         sae: The SAE or transcoder.
-        hook_module: Module (or layer name) whose output the dictionary reads.
-        target_module: For transcoders, the module (or layer name) whose
+        layer: Module (or layer name) whose output the dictionary reads.
+        target: For transcoders, the module (or layer name) whose
             output is replaced.
         name: Site name used in node labels; defaults to the layer name or
             the module's class.
     """
-    name = name or (hook_module if isinstance(hook_module, str) else type(hook_module).__name__)
+    name = name or (layer if isinstance(layer, str) else type(layer).__name__)
 
     def edits(rec: _Recorder) -> list[tuple[Layer, Edit]]:
         state: dict[str, Tensor] = {}
@@ -163,8 +163,7 @@ def sae_site(sae: SAE, hook_module: Layer, target_module: Layer | None = None,
             rec.records.append(_ErrorRecord(name, keep, error))
             return rec.patch(tokens, keep, recon + error)
 
-        target = target_module if target_module is not None else hook_module
-        return [(hook_module, read), (target, write)]
+        return [(layer, read), (target if target is not None else layer, write)]
 
     return Site(name, edits, [sae])
 
@@ -333,9 +332,8 @@ def attribution_graph(
     batch: Any,
     target_fn: Callable[[Any, Any], Tensor],
     max_nodes: int = 200,
-    layout: str = "btd",
-    exclude_positions: Sequence[int] = (),
-    token_mask_fn: Callable[[Any], Tensor] | None = None,
+    exclude: Sequence[int] = (),
+    mask_fn: Callable[[Any], Tensor] | None = None,
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
 ) -> AttributionGraph:
     """
@@ -353,9 +351,8 @@ def attribution_graph(
         target_fn: ``fn(model_output, batch) -> scalar or (batch,)``; summed.
         max_nodes: Latent nodes kept, by ``|attribution|``. Error nodes are
             always kept.
-        layout: Activation layout at the sites.
-        exclude_positions: Positions left unspliced (e.g. BOS / CLS).
-        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask.
+        exclude: Positions left unspliced (e.g. BOS / CLS).
+        mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask.
         input_fn: Maps the batch to model ``(args, kwargs)``.
 
     Returns:
@@ -364,14 +361,14 @@ def attribution_graph(
     module = unwrap(model)
     module.eval()
     dictionaries = [m.eval() for site in sites for m in site.modules]
-    rec = _Recorder(exclude_positions, token_mask_fn(batch) if token_mask_fn is not None else None)
+    rec = _Recorder(exclude, mask_fn(batch) if mask_fn is not None else None)
     edits: dict[str, Edit] = {}
     for site in sites:
         for layer, edit in site.edits(rec):  # several edits on one layer run in installation order
             name = layer_name(module, layer)
             edits[name] = compose(edits[name], edit) if name in edits else edit
     with _frozen(module, *dictionaries), torch.enable_grad():  # only the leaves need gradients
-        out, _ = run(model, batch, edits, layouts=layout, input_fn=input_fn)
+        out, _ = run(model, batch, edits, input_fn=input_fn)
         metric = target_fn(out, batch).sum()
 
         records = rec.records

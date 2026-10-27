@@ -574,7 +574,7 @@ class SAE(nn.Module):
         if not self.cfg.transcoder:
             return (x,)
         if y is None:
-            raise ValueError("a transcoder needs (input, target) batches, e.g. ActivationStore(target_module=...)")
+            raise ValueError("a transcoder needs (input, target) batches, e.g. RowStream(..., target=...)")
         return x, pack([y], "* d_out")[0]
 
     @property

@@ -3,7 +3,7 @@ Training one SAE per hook point from a single pass over the model.
 
 Harvesting is usually the expensive part of SAE training, so it pays to
 capture many layers at once (as EleutherAI's ``sparsify`` does): a
-multi-hook :class:`~innards.sae.data.ActivationStore` yields dict batches, and an
+multi-layer :class:`~innards.extract.RowStream` yields dict batches, and an
 :class:`SAEGroup` holding one SAE per key trains them all in one loop with
 :class:`~innards.sae.trainer.SAETrainer`. Members never share parameters, so they
 train independently; only gradient clipping and the learning-rate schedule
@@ -12,9 +12,9 @@ are shared.
 Typical usage::
 
     hooks = {f"layer{i}": model.blocks[i] for i in range(12)}
-    store = ActivationStore(model, hooks, loader, exclude_positions=(0,))
+    stream = RowStream(model, loader, hooks, exclude=(0,))
     group = SAEGroup({name: SAE(d_in=768, d_sae=16384, k=32) for name in hooks})
-    SAETrainer(group, TrainerConfig(total_tokens=100_000_000)).train(store)
+    SAETrainer(group, TrainerConfig(total_tokens=100_000_000)).train(stream)
     group["layer3"].save("layer3.safetensors")
 """
 
