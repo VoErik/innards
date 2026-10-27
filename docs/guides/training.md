@@ -29,8 +29,9 @@ Optimizers `"muon"` and `"signum"` are available (as in EleutherAI's
 ## Common settings
 
 `total_tokens` / `num_epochs`
-: Stream for a token budget (needed for an {class}`~innards.sae.data.ActivationStore`,
-  which has no length) or run whole epochs over a cache or `DataLoader`.
+: Stream for a token budget (needed for a {class}`~innards.extract.RowStream`,
+  which has no length) or run whole epochs over a {class}`~innards.store.RowLoader`
+  or a `DataLoader`.
 
 `k_decay_steps`, `k_initial`
 : Anneal `k` linearly from a large value (TopK-style activations).
@@ -57,27 +58,28 @@ full training checkpoint (weights, optimizer and EMA state, counters, RNG):
 trainer = SAETrainer(sae, TrainerConfig(total_tokens=..., checkpoint_every=5000))
 ...  # interrupted
 trainer = SAETrainer.from_checkpoint("checkpoints/checkpoint.pt")
-trainer.train(store)   # continues at the saved step; the LR schedule picks up where it was
+trainer.train(stream)   # continues at the saved step; the LR schedule picks up where it was
 ```
 
 The data stream starts again from its beginning on resume.
 
 ## Several layers from one pass
 
-Harvesting is usually the expensive part. Pass a dict of modules to the store
-to capture several hook points in one forward pass (tokens are shuffled
-jointly, so every batch holds the same tokens at every hook) and train one
-SAE per hook in the same loop:
+Harvesting is usually the expensive part. Pass a dict of layers to a
+`RowStream` to read several layers in one forward pass (tokens are shuffled
+jointly, so every batch holds the same tokens at every layer) and train one
+SAE per layer in the same loop:
 
 ```python
+from innards import RowStream
 from innards.sae import SAEGroup
 
-hooks = {f"block{i}": model.blocks[i] for i in range(12)}
-store = ActivationStore(model, hooks, loader, exclude_positions=(0,))
-group = SAEGroup({name: SAE(d_in=768, d_sae=16384, k=32) for name in hooks})
+layers = {f"block{i}": f"blocks.{i}" for i in range(12)}
+stream = RowStream(model, loader, layers, exclude=(0,))
+group = SAEGroup({name: SAE(d_in=768, d_sae=16384, k=32) for name in layers})
 trainer = SAETrainer(group, TrainerConfig(total_tokens=200_000_000))
-trainer.train(store)
-trainer.evaluate(val_store)              # eval/block0/fve, eval/block1/fve, ...
+trainer.train(stream)
+trainer.evaluate(val_stream)             # eval/block0/fve, eval/block1/fve, ...
 group["block3"].save("block3.safetensors")
 ```
 
@@ -90,7 +92,7 @@ default follows the largest member.
 : Normalized MSE, FVE and L0 over a dataset, computed from global sums (per
   member / per layer for groups and cross-layer transcoders).
 
-`trainer.evaluate_downstream(model, hook_module, loader, kl_cfg, loss_fn=...)`
+`trainer.evaluate_downstream(model, layer, loader, kl_cfg, loss_fn=...)`
 : Splices the SAE into the model and reports the KL to the clean model,
   top-1 agreement and, with a `loss_fn`, the loss clean / spliced / ablated
   and the fraction of loss recovered,
@@ -103,4 +105,4 @@ model on $\tfrac12(L_{SAE} + \alpha\,KL)$ with $\alpha$ balancing the two terms,
 which shrinks the downstream loss gap at a few percent of the training budget
 (Karvonen, 2025). Configure it with
 {class}`~innards.sae.trainer.KLFinetuneConfig` (`output_fn` maps the model output to
-logits; `exclude_positions` and `token_mask_fn` should match training).
+logits; `exclude` and `mask_fn` should match training).

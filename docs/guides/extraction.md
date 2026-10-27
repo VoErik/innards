@@ -59,13 +59,22 @@ load_info("acts/convnext_val")["layers"]["stages.3"]   # layout, grid, shapes
 ```
 
 Rows are stored in dataset order, so do not shuffle the loader. Each layer
-directory is also an activation cache for SAE training:
+directory is a row cache: {class}`~innards.store.RowLoader` serves it as
+shuffled batches of token rows, e.g. to train an SAE:
 
 ```python
-from innards.sae import CachedActivations, SAETrainer
+from innards import RowLoader
+from innards.sae import SAETrainer
 
-SAETrainer(sae, cfg).train(CachedActivations("acts/convnext_val/stages.3", batch_tokens=4096))
+SAETrainer(sae, cfg).train(RowLoader("acts/convnext_val/stages.3", batch_rows=4096))
 ```
+
+To train on more tokens than fit on disk, stream them instead:
+{class}`~innards.extract.RowStream` runs the model and serves shuffled token
+rows from a buffer (`RowStream(model, loader, "stages.3")`); it takes a dict of
+layers (rows of several layers, aligned) or a `target` layer (input / target
+pairs, e.g. for transcoders). {func}`~innards.store.write_rows` stores any
+such stream as a row cache.
 
 Loaded activations are tensors, so `TensorDataset(acts["stages.3"], labels)`
 turns them into a `DataLoader` again, e.g. for probes.

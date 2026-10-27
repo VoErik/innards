@@ -11,8 +11,6 @@ Core modules:
 * :mod:`innards.sae.clt`: cross-layer transcoders replacing all MLPs at once.
 * :mod:`innards.sae.graph`: attribution graphs over spliced SAEs, transcoders and CLTs.
 * :mod:`innards.sae.dashboard`: self-contained HTML latent dashboards and graph viewers.
-* :mod:`innards.sae.data`: activation harvesting from vision and language models.
-* :mod:`innards.sae.cache`: caching harvested activations to disk.
 * :mod:`innards.sae.optim`: Adam, Muon and Signum (I only use Adam, but sparsify use Muon / Signum as well)
 * :mod:`innards.sae.analysis`: latent statistics, top examples, dictionary
   geometry, output effects and attributions.
@@ -22,6 +20,11 @@ Core modules:
 * :mod:`innards.sae.interop`: reading and writing the SAELens format.
 
 Optional: :mod:`innards.sae.viz` (plots and HTML views; ``viz`` extra).
+
+Training data come from the general machinery of innards: rows streamed from
+the model (:class:`innards.extract.RowStream`) or read from a row cache
+(:class:`innards.store.RowLoader`, e.g. a layer of
+:func:`innards.extract.extract_to_disk`).
 """
 
 from .activations import (
@@ -36,17 +39,12 @@ from .analysis import (
     max_cosine_similarity,
     output_effects,
 )
-from .cache import (
-    CachedActivations,
-    cache_activations
-)
 from .clt import (
     CLTConfig,
     CrossLayerTranscoder,
     clt_edits,
     clt_hooks
 )
-from .data import ActivationStore
 from .decoders import (
     DECODERS,
     Decoder
@@ -77,11 +75,9 @@ __all__ = [
     "ACTIVATIONS",
     "DECODERS",
     "Activation",
-    "ActivationStore",
     "AttributionGraph",
     "CLTConfig",
     "CrossLayerTranscoder",
-    "CachedActivations",
     "Decoder",
     "KLFinetuneConfig",
     "LatentCache",
@@ -93,7 +89,6 @@ __all__ = [
     "TrainerConfig",
     "analyze_dataset",
     "attribution_graph",
-    "cache_activations",
     "cache_latents",
     "clt_hooks",
     "clt_site",

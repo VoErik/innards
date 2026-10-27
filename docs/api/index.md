@@ -38,8 +38,6 @@ activations
 decoders
 trainer
 optim
-data
-cache
 group
 clt
 analysis

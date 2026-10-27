@@ -32,8 +32,8 @@ Other extras: `wandb`, `mlflow`, `tensorboard` (SAE training logs), `umap`,
 | Module | What it does |
 |---|---|
 | `innards.models` | load timm models wrapped for nnsight (`load_model`), find layers (`stage_names`, `module_names`) |
-| `innards.extract`, `innards.reduce` | extract activations of any layers over any `DataLoader`, in memory or to disk; CLS token, pooling, token selection |
-| `innards.store` | run directories of activations; each layer folder is also an SAE training cache |
+| `innards.extract`, `innards.reduce` | extract activations of any layers over any `DataLoader`, in memory, to disk, or as a shuffled stream of token rows (`RowStream`); CLS token, pooling, token selection |
+| `innards.store` | run directories of activations; row caches and `RowLoader` (shuffled token rows, e.g. for SAE training) |
 | `innards.edits` | interventions (`steer`, `ablate`, `patch`, `zero`, ...) applied in one nnsight trace (`run`) |
 | `innards.analysis.geometry`, `.similarity` | dimensionality, spectra, intrinsic dimension, neural collapse; CKA, RSA, Procrustes, SVCCA, mutual kNN |
 | `innards.analysis.directions` | class means, probes, LDA, INLP |
@@ -134,18 +134,19 @@ uv run python examples/03_causal.py
 ## Sparse autoencoders
 
 `innards.sae` trains and analyses SAEs, transcoders and cross-layer
-transcoders. Activations come from `extract_to_disk` (each layer folder is a
-training cache) or are streamed from the model by an `ActivationStore`:
+transcoders. Training rows come from the general machinery: a layer of
+`extract_to_disk` read by a `RowLoader`, or a `RowStream` from the live model:
 
 ```python
 from innards.reduce import drop
-from innards.sae import SAE, ActivationStore, CachedActivations, SAETrainer, TrainerConfig
+from innards import RowLoader, RowStream
+from innards.sae import SAE, SAETrainer, TrainerConfig
 
 extract_to_disk(model, loader, "blocks.6", "acts/run", reduce=drop([0]))    # patch tokens (no CLS)
 sae = SAE(d_in=384, d_sae=16 * 384, activation="batchtopk", k=32)
 trainer = SAETrainer(sae, TrainerConfig(num_epochs=5, loggers=("tensorboard",)))
-trainer.train(CachedActivations("acts/run/blocks.6", batch_tokens=4096))
-# or stream from the model: ActivationStore(model, "blocks.6", loader, exclude_positions=(0,))
+trainer.train(RowLoader("acts/run/blocks.6", batch_rows=4096))
+# or stream from the model: trainer.train(RowStream(model, loader, "blocks.6", exclude=(0,)))  (+ total_tokens)
 
 trainer.finetune_kl(model, "blocks.6", loader)                          # optional KL fine-tuning
 trainer.evaluate_downstream(model, "blocks.6", val_loader, loss_fn=...) # KL, top-1 agreement, loss recovered
@@ -158,9 +159,9 @@ Analysis and interventions use the same machinery as the rest of innards:
 from innards.sae import LatentCache, cache_latents
 from innards.sae.interventions import sae_edits, zero_ablate
 
-cache = LatentCache(cache_latents(sae, model, "blocks.6", val_loader, "latents/b6", exclude_positions=(0,)))
+cache = LatentCache(cache_latents(sae, model, "blocks.6", val_loader, "latents/b6", exclude=(0,)))
 cache.stats(), cache.top_examples(n_top=20), cache.quantile_examples(latent=42)
-logits, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([42]), exclude_positions=(0,)))
+logits, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([42]), exclude=(0,)))
 V = sae.decoder_weight()                    # the dictionary is a set of directions for innards.analysis
 ```
 
@@ -168,11 +169,11 @@ V = sae.decoder_weight()                    # the dictionary is a set of directi
   JumpReLU, ReLU + L1; Matryoshka, Multi-TopK, Archetypal decoders; your own
   activations via `register_activation`.
   ([guide](docs/guides/architectures.md))
-* **Many layers at once**: a dict of hooks in one `ActivationStore` and an
+* **Many layers at once**: a dict of layers in one `RowStream` and an
   `SAEGroup` train one SAE per layer from a single pass.
   ([guide](docs/guides/training.md))
 * **Transcoders and cross-layer transcoders**: `SAE(..., transcoder=True)`
-  with a `target_module`; `CrossLayerTranscoder` with `clt_hooks`, and
+  with a `target` layer; `CrossLayerTranscoder` with `clt_hooks`, and
   `clt_edits` to run the replacement model.
   ([guide](docs/guides/transcoders.md))
 * **Attribution graphs** over spliced SAEs, transcoders or CLTs

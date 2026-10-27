@@ -13,7 +13,7 @@ Typical usage::
 
     from innards.edits import run, rows, steer
 
-    logits, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([123]), exclude_positions=(0,)))
+    logits, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([123]), exclude=(0,)))
     logits, _ = run(model, images, {"blocks.6": rows(steer(sae.decoder_weight()[42], 8.0), exclude=(0,))})
 
 References:
@@ -175,7 +175,7 @@ def sae_edits(
     layer: str | nn.Module | Envoy,
     edit: LatentEdit | None = None,
     keep_error: bool = True,
-    exclude_positions: Sequence[int] = (),
+    exclude: Sequence[int] = (),
     mask: Tensor | None = None,
     target: str | nn.Module | Envoy | None = None,
     model: nn.Module | Envoy | None = None,
@@ -193,7 +193,7 @@ def sae_edits(
             ``model`` given).
         edit: Function on the ``(n, d_sae)`` activations.
         keep_error: Add the SAE error term back.
-        exclude_positions: Positions left unchanged (e.g. CLS / BOS).
+        exclude: Positions left unchanged (e.g. CLS / BOS).
         mask: Optional boolean ``(batch, tokens)`` mask of tokens to change,
             e.g. non-padding tokens.
         target: For transcoders: the layer whose output is replaced.
@@ -204,4 +204,4 @@ def sae_edits(
     """
     name = layer if isinstance(layer, str) else layer_name(model, layer)
     target = name if target is None else target if isinstance(target, str) else layer_name(model, target)
-    return cross(name, target, splice_fn(sae, edit, keep_error), exclude_positions, mask)
+    return cross(name, target, splice_fn(sae, edit, keep_error), exclude, mask)

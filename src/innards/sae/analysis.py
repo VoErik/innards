@@ -7,9 +7,9 @@ Analysis of trained SAEs:
 * output effects,
 * and attributions.
 
-Everything here is modality-agnostic. Activations are captured with the hook
-utilities of :mod:`innards.sae.data`, so the same functions work for ViTs, CNNs
-(``layout="bchw"``) and language models.
+Everything here is modality-agnostic. Activations are read with nnsight
+(:func:`innards.extract.capture_tokens`, layouts inferred), so the same
+functions work for ViTs, CNNs and language models.
 
 References:
     nostalgebraist (2020). interpreting GPT: the logit lens. LessWrong.
@@ -52,18 +52,19 @@ from torch import (
 
 from ..edits import (
     cross,
-    keep_mask,
     run
 )
-from ..models import layer_name
-from .data import (
-    _to_device,
+from ..extract import (
     default_input_fn,
-    keep_positions,
-    run_capture,
-    to_tokens,
-    token_keep_mask,
+    describe,
+    layer_tokens,
+    to_device
 )
+from ..layouts import (
+    keep_mask,
+    keep_positions
+)
+from ..models import layer_name
 from .model import SAE
 
 
@@ -274,9 +275,8 @@ def tokens_to_grid(values: Tensor, grid: tuple[int, int] | None = None) -> Tenso
 def encode_inputs(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module | str,
+    layer: str | nn.Module,
     batch: Any,
-    layout: str = "btd",
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
 ) -> Tensor:
     """
@@ -285,9 +285,8 @@ def encode_inputs(
     Args:
         sae: The SAE (put in eval mode).
         model: The model the SAE was trained on.
-        hook_module: Module (or layer name) whose output the SAE reads.
+        layer: Module (or layer name) whose output the SAE reads.
         batch: Model inputs, already on the right device.
-        layout: Activation layout at the hook.
         input_fn: Maps the batch to model ``(args, kwargs)``.
 
     Returns:
@@ -296,20 +295,18 @@ def encode_inputs(
     """
     sae.eval()
     model.eval()
-    act = run_capture(model, hook_module, batch, input_fn)
-    return sae.encode(to_tokens(act, layout).to(sae.w_enc.dtype))
+    return sae.encode(layer_tokens(model, batch, layer, input_fn).to(sae.w_enc.dtype))
 
 
 @torch.no_grad()
 def analyze_dataset(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module | str,
-    input_loader: Iterable,
+    layer: str | nn.Module,
+    batches: Iterable,
     n_top: int = 16,
-    layout: str = "btd",
-    exclude_positions: Sequence[int] = (),
-    token_mask_fn: Callable[[Any], Tensor] | None = None,
+    exclude: Sequence[int] = (),
+    mask_fn: Callable[[Any], Tensor] | None = None,
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
     device: str | torch.device | None = None,
     max_batches: int | None = None,
@@ -326,12 +323,11 @@ def analyze_dataset(
     Args:
         sae: The SAE.
         model: The model the SAE was trained on.
-        hook_module: Module (or layer name) whose output the SAE reads.
-        input_loader: Iterable of model inputs.
+        layer: Module (or layer name) whose output the SAE reads.
+        batches: Iterable of model inputs.
         n_top: Number of top tokens kept per latent.
-        layout: Activation layout at the hook.
-        exclude_positions: Positions to ignore, as in training.
-        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask,
+        exclude: Positions to ignore, as in training.
+        mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask,
             e.g. from the attention mask.
         input_fn: Maps a batch to model ``(args, kwargs)``.
         device: Device to run on; defaults to the SAE's device.
@@ -354,13 +350,13 @@ def analyze_dataset(
 
     sae.eval()
     model.eval()
-    for i, batch in enumerate(input_loader):
+    for i, batch in enumerate(batches):
         if max_batches is not None and i >= max_batches:
             break
-        batch = _to_device(batch, device)
-        tokens = to_tokens(run_capture(model, hook_module, batch, input_fn), layout)
+        batch = to_device(batch, device)
+        tokens = layer_tokens(model, batch, layer, input_fn)
         b, t, _ = tokens.shape
-        keep = token_keep_mask(tokens, exclude_positions, token_mask_fn, batch)
+        keep = keep_mask(tokens, exclude, mask_fn(batch) if mask_fn else None)
         flat_idx = rearrange(keep, "b t -> (b t)").nonzero().squeeze(-1)  # into the (b t) grid
         kept = tokens[keep].to(sae.w_enc.dtype)
         n_tokens += kept.shape[0]
@@ -562,14 +558,13 @@ def output_effects(
 def latent_attribution(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module | str,
+    layer: str | nn.Module,
     batch: Any,
     target_fn: Callable[[Any, Any], Tensor],
-    layout: str = "btd",
-    exclude_positions: Sequence[int] = (),
-    token_mask_fn: Callable[[Any], Tensor] | None = None,
+    exclude: Sequence[int] = (),
+    mask_fn: Callable[[Any], Tensor] | None = None,
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
-    target_module: nn.Module | str | None = None,
+    target: str | nn.Module | None = None,
 ) -> Attribution:
     """
     Attributes a scalar model output to SAE latents at every position.
@@ -583,18 +578,17 @@ def latent_attribution(
     Args:
         sae: The SAE.
         model: The model the SAE was trained on.
-        hook_module: Module (or layer name) whose output the SAE reads.
+        layer: Module (or layer name) whose output the SAE reads.
         batch: Model inputs, already on the right device.
         target_fn: ``fn(model_output, batch) -> (batch,)`` scalar per
             example, e.g. the logit of the predicted class, or of the correct
             next token at the last position.
-        layout: Activation layout at the hook.
-        exclude_positions: Positions left unpatched (e.g. CLS / BOS).
-        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
+        exclude: Positions left unpatched (e.g. CLS / BOS).
+        mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
             tokens to patch, e.g. non-padding tokens.
         input_fn: Maps the batch to model ``(args, kwargs)``.
-        target_module: For transcoders: the module whose output the
-            transcoder replaces (``hook_module`` is its input). A skip
+        target: For transcoders: the module whose output the
+            transcoder replaces (``layer`` is its input). A skip
             connection's contribution is kept out of both the latent and the
             error attributions.
 
@@ -603,9 +597,9 @@ def latent_attribution(
     """
     sae.eval()
     model.eval()
-    name = layer_name(model, hook_module)
-    target = name if target_module is None else layer_name(model, target_module)
-    mask = token_mask_fn(batch) if token_mask_fn is not None else None
+    name = layer_name(model, layer)
+    target = name if target is None else layer_name(model, target)
+    mask = mask_fn(batch) if mask_fn is not None else None
     store: dict[str, Tensor] = {}
 
     def splice_fn(x: Tensor, y: Tensor) -> Tensor:
@@ -619,16 +613,16 @@ def latent_attribution(
         store.update(acts=acts, error=error)
         return recon + skip + error
 
-    edits = cross(name, target, splice_fn, exclude_positions, mask)
+    edits = cross(name, target, splice_fn, exclude, mask)
     write = edits[target]
 
     def record_keep(tokens: Tensor) -> Tensor:
-        store["keep"] = keep_mask(tokens, exclude_positions, mask)
+        store["keep"] = keep_mask(tokens, exclude, mask)
         return write(tokens)
 
     edits[target] = record_keep
     with _frozen(model, sae):
-        out, _ = run(model, batch, edits, layouts=layout, input_fn=input_fn)
+        out, _ = run(model, batch, edits, input_fn=input_fn)
         target_value = target_fn(out, batch)
         target_value.sum().backward()
     acts, error, keep = store["acts"], store["error"], store["keep"]
@@ -650,11 +644,10 @@ def latent_attribution(
 def input_attribution(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module | str,
+    layer: str | nn.Module,
     inputs: Tensor,
     latent: int,
-    layout: str = "btd",
-    exclude_positions: Sequence[int] = (),
+    exclude: Sequence[int] = (),
     use_preactivation: bool = True,
 ) -> Tensor:
     """
@@ -666,11 +659,10 @@ def input_attribution(
     Args:
         sae: The SAE.
         model: The model, called as ``model(inputs)``.
-        hook_module: Module (or layer name) whose output the SAE reads.
+        layer: Module (or layer name) whose output the SAE reads.
         inputs: Float input tensor, e.g. images ``(batch, 3, H, W)``.
         latent: Latent index.
-        layout: Activation layout at the hook.
-        exclude_positions: Positions to ignore.
+        exclude: Positions to ignore.
         use_preactivation: Differentiate the encoder pre-activation instead of
             the post-activation value, so the map is informative even where
             the latent is not selected.
@@ -682,8 +674,8 @@ def input_attribution(
     model.eval()
     x = inputs.detach().clone().requires_grad_(True)
     with _frozen(model, sae):
-        tokens = to_tokens(run_capture(model, hook_module, x), layout)
-        pos = keep_positions(tokens.shape[1], exclude_positions, tokens.device)
+        tokens = layer_tokens(model, x, layer)
+        pos = keep_positions(tokens.shape[1], exclude, tokens.device)
         kept = tokens[:, pos].to(sae.w_enc.dtype)
         values = sae.pre_activations(kept) if use_preactivation else sae.encode(kept)
         values[..., latent].sum().backward()
@@ -694,38 +686,35 @@ def input_attribution(
 def latent_patch_maps(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module | str,
+    layer: str | nn.Module,
     images: Tensor,
     latents: int | Sequence[int],
-    exclude_positions: Sequence[int] = (0,),
+    exclude: Sequence[int] = (0,),
     grid: tuple[int, int] | None = None,
-    layout: str = "btd",
 ) -> Tensor:
     """
     Activation maps of latents over the patch grid of each image.
 
     Args:
         sae: The SAE.
-        model: A ViT (``layout="btd"``) or CNN (``layout="bchw"``).
-        hook_module: Module (or layer name) whose output the SAE reads.
+        model: A ViT or a CNN.
+        layer: Layer name (or module) whose output the SAE reads.
         images: Images ``(batch, 3, H, W)`` on the model's device.
         latents: One latent or a list of latents.
-        exclude_positions: Non-patch tokens to drop (CLS, registers). Ignored
-            for ``layout="bchw"``.
-        grid: Patch grid ``(h, w)``; ``None`` infers a square grid (ViTs) or
-            uses the feature map size (CNNs).
-        layout: Activation layout at the hook.
+        exclude: Non-patch tokens to drop (CLS, registers). Ignored for
+            feature maps.
+        grid: Patch grid ``(h, w)``; ``None`` uses the feature map size
+            (CNNs) or infers a square grid (ViTs).
 
     Returns:
         Maps of shape ``(batch, h, w)`` for one latent, or
         ``(batch, n_latents, h, w)`` for a list.
     """
-    act = run_capture(model, hook_module, images)
-    if layout == "bchw":
-        grid = grid or (act.shape[2], act.shape[3])
-        exclude_positions = ()
-    acts = sae.eval().encode(to_tokens(act, layout).to(sae.w_enc.dtype))
-    pos = keep_positions(acts.shape[1], exclude_positions, acts.device)
+    spatial = describe(model, images[:1], layer_name(model, layer))[layer_name(model, layer)]["grid"]
+    if spatial is not None:  # a feature map: every token is a position of the grid
+        grid, exclude = grid or spatial, ()
+    acts = sae.eval().encode(layer_tokens(model, images, layer).to(sae.w_enc.dtype))
+    pos = keep_positions(acts.shape[1], exclude, acts.device)
     single = isinstance(latents, int)
     sel = acts[:, pos][..., [latents] if single else list(latents)]
     maps = tokens_to_grid(rearrange(sel, "b t l -> b l t"), grid)

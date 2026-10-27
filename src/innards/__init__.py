@@ -6,8 +6,9 @@ Model access:
 * :mod:`innards.models`: loading timm models (wrapped for nnsight) and finding layers.
 * :mod:`innards.layouts`: activation layouts and conversion to tokens.
 * :mod:`innards.reduce`: what to keep of each example (CLS token, mean, ...).
-* :mod:`innards.extract`: extracting activations over a dataset, in memory or to disk.
-* :mod:`innards.store`: saving and loading extracted activations.
+* :mod:`innards.extract`: extracting activations over a dataset, in memory, to disk, or
+  as a shuffled stream of token rows.
+* :mod:`innards.store`: saving and loading activations; row caches and their loader.
 * :mod:`innards.edits`: interventions (steering, ablation, patching) applied with nnsight.
 
 Subpackages:
@@ -22,11 +23,14 @@ from .edits import (
     run
 )
 from .extract import (
+    RowStream,
     capture,
+    capture_tokens,
     describe,
     extract,
     extract_to_disk,
-    iter_extract
+    iter_extract,
+    layer_tokens
 )
 from .models import (
     load as load_model,
@@ -36,8 +40,10 @@ from .models import (
     wrap
 )
 from .store import (
+    RowLoader,
     load as load_acts,
     load_info,
     load_layer,
-    save as save_acts
+    save as save_acts,
+    write_rows
 )

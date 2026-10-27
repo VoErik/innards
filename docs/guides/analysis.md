@@ -1,7 +1,8 @@
 # Analysis
 
 Everything here is modality-agnostic: the same functions work for ViTs, CNNs
-(`layout="bchw"`) and language models.
+and language models (layouts are inferred). Layers are given by name or as
+modules.
 
 ## Latent statistics and examples
 
@@ -12,7 +13,7 @@ top-activating tokens:
 ```python
 from innards.sae import analysis as A
 
-res = A.analyze_dataset(sae, model, model.blocks[6], val_loader, n_top=20, exclude_positions=(0,))
+res = A.analyze_dataset(sae, model, "blocks.6", val_loader, n_top=20, exclude=(0,))
 res.stats.frequency, res.stats.dead, res.stats.dense(0.1)
 res.top.unique_examples(latent)          # [(value, example index, token position), ...]
 ```
@@ -25,7 +26,7 @@ sparse codes and each token's (example, position):
 from innards.sae import LatentCache, cache_latents
 
 cache = LatentCache(cache_latents(sae, model, model.blocks[6], val_loader, "latents/block6",
-                                  exclude_positions=(0,)))
+                                  exclude=(0,)))
 stats = cache.stats()
 top = cache.top_examples(n_top=20)
 bins = cache.quantile_examples(latent=42, n_bins=5)   # examples across activation strengths
@@ -70,7 +71,7 @@ in one nnsight trace:
 from innards.edits import rows, run, steer
 from innards.sae.interventions import clamp, mean_ablate, sae_edits, scale, zero_ablate
 
-ablated, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([42]), exclude_positions=(0,)))
+ablated, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([42]), exclude=(0,)))
 clamped, _ = run(model, images, sae_edits(sae, "blocks.6", clamp(42, value=5 * stats.max_activation[42])))
 steered, _ = run(model, images, {"blocks.6": rows(steer(sae.decoder_weight()[42], 8.0), exclude=(0,))})
 ```

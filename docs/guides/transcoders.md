@@ -9,17 +9,18 @@ a model whose MLPs are sparse and linear given the active latents, which is
 what makes [attribution graphs](circuits.md) clean.
 
 ```python
-from innards.sae import SAE, ActivationStore, SAETrainer, TrainerConfig
+from innards import RowStream
+from innards.sae import SAE, SAETrainer, TrainerConfig
 
 layer = model.gpt_neox.layers[3]
-store = ActivationStore(model, layer.post_attention_layernorm, loader,
-                        target_module=layer.mlp)            # yields aligned (input, target) pairs
+stream = RowStream(model, loader, layer.post_attention_layernorm,
+                   target=layer.mlp)                         # yields aligned (input, target) pairs
 tc = SAE(d_in=512, d_sae=8192, activation="topk", k=32, transcoder=True,
          skip_connection=True)                              # optional linear skip x W_skip
 trainer = SAETrainer(tc, TrainerConfig(total_tokens=50_000_000))
-trainer.train(store)
+trainer.train(stream)
 trainer.evaluate_downstream(model, layer.post_attention_layernorm, loader, kl_cfg,
-                            target_module=layer.mlp)
+                            target=layer.mlp)
 ```
 
 Differences from an SAE:
@@ -31,8 +32,8 @@ Differences from an SAE:
   which takes over the linear part of the MLP so the latents can focus on the
   rest (Paulo, Shabalin & Belrose, 2025).
 - Everything that splices a dictionary into the model (KL fine-tuning,
-  downstream evaluation, attribution, interventions) takes a `target_module`:
-  latents are read from `hook_module`, `target_module`'s output is replaced.
+  downstream evaluation, attribution, interventions) takes a `target`:
+  latents are read from `layer`, `target`'s output is replaced.
 
 ## Cross-layer transcoders
 
@@ -52,13 +53,13 @@ from innards.sae import CrossLayerTranscoder, clt_edits, clt_hooks
 layers = model.gpt_neox.layers
 ins = [l.post_attention_layernorm for l in layers]
 outs = [l.mlp for l in layers]
-store = ActivationStore(model, clt_hooks(ins, outs), loader)   # aligned inputs/outputs of every MLP
+stream = RowStream(model, loader, clt_hooks(ins, outs))   # aligned inputs/outputs of every MLP
 
 clt = CrossLayerTranscoder(n_layers=len(layers), d_in=512, d_sae=4096, activation="topk", k=32)
 trainer = SAETrainer(clt, TrainerConfig(total_tokens=100_000_000))
-trainer.train(store)
-trainer.evaluate(val_store)        # eval/fve and eval/layer<i>/fve, eval/layer<i>/l0
-trainer.evaluate_downstream(model, ins, val_loader, kl_cfg, target_module=outs, loss_fn=...)
+trainer.train(stream)
+trainer.evaluate(val_stream)       # eval/fve and eval/layer<i>/fve, eval/layer<i>/l0
+trainer.evaluate_downstream(model, ins, val_loader, kl_cfg, target=outs, loss_fn=...)
 
 logits, _ = run(model, inputs, clt_edits(clt, ins, outs, model=model))   # the replacement model
 ```

@@ -5,7 +5,7 @@ Two phases:
 
 1. :meth:`SAETrainer.train` trains on reconstruction (normalised MSE plus the
    auxiliary terms configured on the model) from an iterable of activation
-   batches, e.g. a :class:`innards.sae.data.ActivationStore` or a ``DataLoader`` over
+   batches, e.g. a :class:`innards.extract.RowStream`, a :class:`innards.store.RowLoader` or a ``DataLoader`` over
    cached activations.
 2. :meth:`SAETrainer.finetune_kl` optionally fine-tunes the SAE spliced into
    the model on KL + MSE (Karvonen, 2025), which shrinks the downstream loss
@@ -63,13 +63,13 @@ from ..edits import (
     rows,
     run
 )
+from ..extract import (
+    default_input_fn,
+    to_device
+)
 from ..models import (
     layer_name,
     wrap
-)
-from .data import (
-    _to_device,
-    default_input_fn,
 )
 from .optim import (
     build_optimizers,
@@ -201,10 +201,9 @@ class KLFinetuneConfig:
             learning rate (our default; the paper uses 5e-5 for its setup).
         lr_scale: Multiplier of the training learning rate when ``lr`` is
             ``None``.
-        layout: Activation layout at the hook (see ``innards.sae.data.LAYOUTS``).
-        exclude_positions: Token positions left unpatched (e.g. CLS / BOS),
+        exclude: Token positions left unpatched (e.g. CLS / BOS),
             consistent with the positions excluded during training.
-        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
+        mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
             tokens to patch, e.g. non-padding tokens; others pass through
             unchanged and do not enter the SAE loss.
         input_fn: Maps a loader batch to model ``(args, kwargs)``.
@@ -218,9 +217,8 @@ class KLFinetuneConfig:
     steps: int = 1000
     lr: float | None = None
     lr_scale: float = 0.25
-    layout: str = "btd"
-    exclude_positions: Sequence[int] = ()
-    token_mask_fn: Callable[[Any], Tensor] | None = None
+    exclude: Sequence[int] = ()
+    mask_fn: Callable[[Any], Tensor] | None = None
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn
     output_fn: Callable[[Any], Tensor] = lambda out: out
     kl_mask_fn: Callable[[Any], Tensor] | None = None
@@ -573,14 +571,14 @@ class SAETrainer:
 
     def _total_steps(self, dataloader: Iterable) -> int:
         if self.cfg.total_tokens is not None:
-            batch_tokens = getattr(dataloader, "batch_tokens", None)
-            if batch_tokens is None:
-                batch_tokens = self.model.batch_tensors(next(iter(dataloader)))[0].shape[0]
-            return math.ceil(self.cfg.total_tokens / batch_tokens)
+            batch_rows = getattr(dataloader, "batch_rows", None)
+            if batch_rows is None:
+                batch_rows = self.model.batch_tensors(next(iter(dataloader)))[0].shape[0]
+            return math.ceil(self.cfg.total_tokens / batch_rows)
         if not hasattr(dataloader, "__len__"):
             raise ValueError(
                 f"{type(dataloader).__name__} has no len(), so the number of steps per epoch is unknown; "
-                "set TrainerConfig.total_tokens when streaming (e.g. from an ActivationStore)"
+                "set TrainerConfig.total_tokens when streaming (e.g. from a RowStream)"
             )
         return len(dataloader) * self.cfg.num_epochs
 
@@ -590,7 +588,7 @@ class SAETrainer:
 
         Args:
             dataloader: Iterable of activation batches: a
-                :class:`~innards.sae.data.ActivationStore`, cached activations, or a
+                :class:`~innards.extract.RowStream`, a :class:`~innards.store.RowLoader`, or a
                 ``DataLoader``, yielding whatever the model's ``batch_tensors``
                 accepts (tensors, ``(input, target)`` pairs, dicts). Needs
                 ``len()`` unless ``total_tokens`` is set.
@@ -662,16 +660,16 @@ class SAETrainer:
     def finetune_kl(
         self,
         model: nn.Module,
-        hook_module: nn.Module | str,
-        input_loader: Iterable,
+        layer: str | nn.Module,
+        batches: Iterable,
         kl_cfg: KLFinetuneConfig | None = None,
-        target_module: nn.Module | str | None = None,
+        target: str | nn.Module | None = None,
     ) -> SAE:
         """
         Fine-tunes the SAE spliced into ``model`` on KL + reconstruction.
 
         Each step runs the frozen model twice: a clean pass recording the
-        activation at ``hook_module`` and the clean logits, and a patched pass
+        activation at ``layer`` and the clean logits, and a patched pass
         in which the activation is replaced by the SAE reconstruction. The
         loss is ``0.5 * (L_sae + alpha * KL(clean || patched))`` with
         ``alpha = L_sae / KL`` (Karvonen, 2025; end-to-end SAEs: Braun et al.,
@@ -681,13 +679,13 @@ class SAETrainer:
         Args:
             model: The model the activations come from (frozen here); the SAE
                 is spliced in with nnsight (:func:`innards.edits.run`).
-            hook_module: The module (or layer name) whose output the SAE
+            layer: The module (or layer name) whose output the SAE
                 reconstructs.
-            input_loader: Iterable of model inputs (images, token dicts, ...);
+            batches: Iterable of model inputs (images, token dicts, ...);
                 cycled until ``kl_cfg.steps`` steps are done.
             kl_cfg: Fine-tuning configuration.
-            target_module: For transcoders: the module (or layer name) whose
-                output the transcoder replaces (``hook_module`` is its input).
+            target: For transcoders: the module (or layer name) whose
+                output the transcoder replaces (``layer`` is its input).
 
         Returns:
             The fine-tuned model (EMA weights if enabled). A checkpoint is
@@ -707,18 +705,18 @@ class SAETrainer:
 
         model.eval()
         nn_model = wrap(model)
-        hook = layer_name(model, hook_module)
-        target = hook if target_module is None else layer_name(model, target_module)
+        hook = layer_name(model, layer)
+        target = hook if target is None else layer_name(model, target)
         grad_flags = [p.requires_grad for p in model.parameters()]
         model.requires_grad_(False)
         sae.train()
         sums: dict[str, float] = {}
         step = 0
         try:
-            for batch in itertools.chain.from_iterable(itertools.repeat(input_loader)):
+            for batch in itertools.chain.from_iterable(itertools.repeat(batches)):
                 if step >= kc.steps:
                     break
-                batch = _to_device(batch, self.device)
+                batch = to_device(batch, self.device)
                 args, kwargs = kc.input_fn(batch)
                 captured: dict[str, Any] = {}
 
@@ -726,12 +724,12 @@ class SAETrainer:
                     captured["out"] = sae(x, target=y if sae.cfg.transcoder else None, return_acts=False)
                     return captured["out"].recon
 
-                mask = kc.token_mask_fn(batch) if kc.token_mask_fn else None
-                edits = cross(hook, target, reconstruct, kc.exclude_positions, mask)
+                mask = kc.mask_fn(batch) if kc.mask_fn else None
+                edits = cross(hook, target, reconstruct, kc.exclude, mask)
                 with self._autocast():
                     with torch.no_grad():
                         clean = kc.output_fn(model(*args, **kwargs)).float()
-                    patched_out, _ = run(nn_model, batch, edits, layouts=kc.layout, input_fn=kc.input_fn)
+                    patched_out, _ = run(nn_model, batch, edits, input_fn=kc.input_fn)
                     patched_logits = kc.output_fn(patched_out).float()
 
                 out = captured["out"]
@@ -821,13 +819,13 @@ class SAETrainer:
     def evaluate_downstream(
         self,
         model: nn.Module,
-        hook_module: nn.Module | str | Sequence[nn.Module],
-        input_loader: Iterable,
+        layer: str | nn.Module | Sequence[str | nn.Module],
+        batches: Iterable,
         kl_cfg: KLFinetuneConfig | None = None,
         max_batches: int | None = None,
         loss_fn: Callable[[Any, Any], Tensor] | None = None,
         ablation: str = "zero",
-        target_module: nn.Module | str | Sequence[nn.Module] | None = None,
+        target: str | nn.Module | Sequence[str | nn.Module] | None = None,
     ) -> dict[str, float]:
         """
         Downstream fidelity of the model with the SAE spliced in.
@@ -842,21 +840,21 @@ class SAETrainer:
 
         Args:
             model: The model the activations come from.
-            hook_module: The module (or layer name) whose output the SAE
+            layer: The module (or layer name) whose output the SAE
                 reconstructs; the SAE is spliced in with nnsight.
-            input_loader: Iterable of model inputs.
-            kl_cfg: Supplies ``layout``, ``exclude_positions``,
-                ``token_mask_fn``, ``input_fn``, ``output_fn`` and ``kl_mask_fn``.
+            batches: Iterable of model inputs.
+            kl_cfg: Supplies ``exclude``,
+                ``mask_fn``, ``input_fn``, ``output_fn`` and ``kl_mask_fn``.
             max_batches: Optional cap on the number of batches.
             loss_fn: Optional ``fn(model_output, batch) -> scalar`` mean loss,
                 e.g. next-token cross-entropy for a language model or
                 classification cross-entropy for a vision model.
             ablation: Baseline replacing the kept tokens for ``L_ablated``:
                 ``"zero"``, or ``"mean"`` (mean of the batch's kept tokens).
-            target_module: For transcoders: the module whose output the
-                transcoder replaces (``hook_module`` is its input). For a
-                :class:`~innards.sae.clt.CrossLayerTranscoder`, ``hook_module`` and
-                ``target_module`` are the per-layer lists of MLP inputs and
+            target: For transcoders: the module whose output the
+                transcoder replaces (``layer`` is its input). For a
+                :class:`~innards.sae.clt.CrossLayerTranscoder`, ``layer`` and
+                ``target`` are the per-layer lists of MLP inputs and
                 MLPs, which are all replaced (or ablated) together.
 
         Returns:
@@ -886,31 +884,31 @@ class SAETrainer:
 
         nn_model = wrap(model)
         if is_clt:
-            targets = [layer_name(model, m) for m in target_module]
+            targets = [layer_name(model, m) for m in target]
         else:
-            hook = layer_name(model, hook_module)
-            targets = [hook if target_module is None else layer_name(model, target_module)]
+            hook = layer_name(model, layer)
+            targets = [hook if target is None else layer_name(model, target)]
 
         def replaced(mask: Tensor | None) -> dict:
             if is_clt:
-                return clt_edits(sae, hook_module, target_module, exclude_positions=kc.exclude_positions, mask=mask,
+                return clt_edits(sae, layer, target, exclude=kc.exclude, mask=mask,
                                  model=model)
-            return cross(hook, targets[0], lambda x, y: sae.reconstruct(x), kc.exclude_positions, mask)
+            return cross(hook, targets[0], lambda x, y: sae.reconstruct(x), kc.exclude, mask)
 
-        for i, batch in enumerate(input_loader):
+        for i, batch in enumerate(batches):
             if max_batches is not None and i >= max_batches:
                 break
-            batch = _to_device(batch, self.device)
+            batch = to_device(batch, self.device)
             args, kwargs = kc.input_fn(batch)
-            mask = kc.token_mask_fn(batch) if kc.token_mask_fn else None
+            mask = kc.mask_fn(batch) if kc.mask_fn else None
             with self._autocast():
                 clean_out = model(*args, **kwargs)
-                patched_out, _ = run(nn_model, batch, replaced(mask), layouts=kc.layout, input_fn=kc.input_fn)
+                patched_out, _ = run(nn_model, batch, replaced(mask), input_fn=kc.input_fn)
                 if loss_fn is not None:
                     ablated_out, _ = run(nn_model, batch,
-                                         {t: rows(lambda y: ablate(None, y), kc.exclude_positions, mask)
+                                         {t: rows(lambda y: ablate(None, y), kc.exclude, mask)
                                           for t in targets},
-                                         layouts=kc.layout, input_fn=kc.input_fn)
+                                         input_fn=kc.input_fn)
             clean, patched = kc.output_fn(clean_out).float(), kc.output_fn(patched_out).float()
             mask = kc.kl_mask_fn(batch) if kc.kl_mask_fn else None
             sums["kl"] += self._kl(clean, patched, mask).item()

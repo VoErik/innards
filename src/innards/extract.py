@@ -49,15 +49,19 @@ from torch import (
 from .layouts import (
     grid,
     infer_layout,
+    keep_mask,
     to_tokens
 )
 from .models import (
+    layer_name,
     unwrap,
     wrap
 )
 from .reduce import Reduce
 from .store import (
+    Rows,
     open_writer,
+    split_fields,
     write_run
 )
 
@@ -268,6 +272,181 @@ def capture(
             out[name] = _first(model.get(name).output).save()
         tracer.stop()
     return out
+
+
+def capture_tokens(
+    model: nn.Module | Envoy,
+    batch: Any,
+    layers: Layers,
+    input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
+    layouts: str | dict[str, str] | None = None,
+) -> dict[str, Tensor]:
+    """
+    Like :func:`capture`, with every output converted to tokens ``(batch, tokens, d)``.
+
+    Layouts are inferred (and cached per model, see :func:`plan`) unless given.
+
+    Args:
+        model: An nnsight model or a plain module.
+        batch: An input batch (on the model's device).
+        layers: Layer names or modules, in any order.
+        input_fn: Maps the batch to ``(args, kwargs)``.
+        layouts: Layouts, see :func:`describe`.
+
+    Returns:
+        Layer name -> tokens.
+    """
+    names = [layer_name(model, l) for l in _as_list(layers)]
+    site_layouts = plan(model, batch, names, layouts, input_fn)[1]
+    raw = capture(model, batch, names, input_fn)
+    return {n: to_tokens(raw[n], site_layouts[n]) for n in names}
+
+
+def layer_tokens(
+    model: nn.Module | Envoy,
+    batch: Any,
+    layer: str | nn.Module,
+    input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
+) -> Tensor:
+    """
+    Tokens ``(batch, tokens, d)`` of one layer; :func:`capture_tokens` for one layer.
+
+    Args:
+        model: An nnsight model or a plain module.
+        batch: An input batch (on the model's device).
+        layer: Layer name or module.
+        input_fn: Maps the batch to ``(args, kwargs)``.
+
+    Returns:
+        The tokens.
+    """
+    name = layer_name(model, layer)
+    return capture_tokens(model, batch, name, input_fn)[name]
+
+
+class RowStream:
+    """
+    Shuffled batches of token rows streamed from a model, re-iterable like a ``DataLoader``.
+
+    Runs the (frozen) model over ``batches``, keeps the tokens selected by
+    ``exclude`` and ``mask_fn`` as rows ``(n, d)``, and serves them from a
+    shuffle buffer: it fills ``buffer_rows`` rows, shuffles, serves half,
+    refills, so consecutive batches mix tokens from many inputs. One pass over
+    ``batches`` is one pass of the stream; iterate again for more. Use it to
+    train on more tokens than fit on disk; :func:`innards.store.write_rows`
+    stores it as a row cache otherwise.
+
+    Rows are a tensor for one layer, ``(input, target)`` pairs with
+    ``target`` (e.g. a transcoder's MLP input and output), or dicts for a
+    dict of layers (several hook points with the same token grid). All layers
+    are read in one forward pass and shuffled jointly, so row ``i`` of every
+    field is the same token.
+
+    Args:
+        model: Frozen model (plain or nnsight).
+        batches: Iterable of model inputs, e.g. a ``DataLoader``.
+        layers: Layer name or module, or a dict of name -> layer.
+        target: Optional second layer read as the target of ``layers``.
+        batch_rows: Rows per served batch.
+        buffer_rows: Shuffle-buffer size in rows.
+        exclude: Token positions to drop, e.g. ``(0,)`` for CLS or BOS, or
+            ``range(5)`` for CLS plus four ViT registers.
+        mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of tokens
+            to keep (e.g. from an attention mask), combined with ``exclude``.
+        layouts: Layouts, see :func:`describe`; inferred by default.
+        input_fn: Maps a batch to model ``(args, kwargs)``.
+        device: Device of the inputs and the buffer; defaults to the model's.
+        dtype: Dtype of the buffer, e.g. ``torch.bfloat16``; ``None`` keeps the model's.
+        autocast_dtype: Optional autocast dtype for the forward pass.
+        seed: Shuffle seed.
+
+    Attributes:
+        batch_rows: Rows per batch (read by the SAE trainer).
+    """
+
+    def __init__(
+        self,
+        model: nn.Module | Envoy,
+        batches: Iterable[Any],
+        layers: str | nn.Module | dict[str, str | nn.Module],
+        target: str | nn.Module | None = None,
+        batch_rows: int = 4096,
+        buffer_rows: int = 2**19,
+        exclude: Sequence[int] = (),
+        mask_fn: Callable[[Any], Tensor] | None = None,
+        layouts: str | dict[str, str] | None = None,
+        input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+        autocast_dtype: torch.dtype | None = None,
+        seed: int = 0,
+    ):
+        if isinstance(layers, dict) and target is not None:
+            raise ValueError("pass either a dict of layers or a target, not both")
+        self.model = wrap(model)
+        self.batches = batches
+        self.batch_rows = batch_rows
+        self.buffer_rows = max(buffer_rows, 2 * batch_rows)
+        self.exclude, self.mask_fn = tuple(exclude), mask_fn
+        self.layouts, self.input_fn = layouts, input_fn
+        self.device = torch.device(device if device is not None else next(unwrap(model).parameters()).device)
+        self.dtype, self.autocast_dtype = dtype, autocast_dtype
+        self.generator = torch.Generator().manual_seed(seed)
+        if isinstance(layers, dict):
+            self.kind, self.names = "dict", list(layers)
+            self.layers = [layer_name(model, l) for l in layers.values()]
+        elif target is not None:
+            self.kind, self.names = "pair", ["activations", "targets"]
+            self.layers = [layer_name(model, layers), layer_name(model, target)]
+        else:
+            self.kind, self.names = "tensor", ["activations"]
+            self.layers = [layer_name(model, layers)]
+        self._widths: list[int] = []
+
+    @torch.no_grad()
+    def rows(self, batch: Any) -> Tensor:
+        """
+        The kept token rows of one input batch, fields side by side.
+
+        Args:
+            batch: A batch from ``batches``.
+
+        Returns:
+            ``(n, sum of field widths)``.
+        """
+        unwrap(self.model).eval()
+        batch = to_device(batch, self.device)
+        with torch.autocast(self.device.type, dtype=self.autocast_dtype or torch.float32,
+                            enabled=self.autocast_dtype is not None):
+            acts = capture_tokens(self.model, batch, self.layers, self.input_fn, self.layouts)
+        tokens = [acts[n] for n in self.layers]
+        keep = keep_mask(tokens[0], self.exclude, self.mask_fn(batch) if self.mask_fn else None)
+        self._widths = [t.shape[-1] for t in tokens]
+        flat = torch.cat([t[keep].to(tokens[0].dtype) for t in tokens], -1)
+        return flat.to(self.dtype) if self.dtype else flat
+
+    def _serve(self, data: Tensor) -> Rows:
+        return split_fields(data, self.kind, self.names, self._widths)
+
+    def __iter__(self) -> Iterator[Rows]:
+        buffer: list[Tensor] = []
+        size = 0
+        for batch in self.batches:
+            flat = self.rows(batch)
+            buffer.append(flat)
+            size += flat.shape[0]
+            if size >= self.buffer_rows:
+                data = torch.cat(buffer)
+                data = data[torch.randperm(data.shape[0], generator=self.generator).to(data.device)]
+                n_serve = (data.shape[0] // 2) // self.batch_rows * self.batch_rows
+                for i in range(0, n_serve, self.batch_rows):
+                    yield self._serve(data[i : i + self.batch_rows])
+                buffer, size = [data[n_serve:]], data.shape[0] - n_serve
+        if size:
+            data = torch.cat(buffer)
+            data = data[torch.randperm(data.shape[0], generator=self.generator).to(data.device)]
+            for i in range(0, data.shape[0] - self.batch_rows + 1, self.batch_rows):
+                yield self._serve(data[i : i + self.batch_rows])
 
 
 def _reduce(act: Tensor, layout: str, reduce: Reduce | None) -> Tensor:

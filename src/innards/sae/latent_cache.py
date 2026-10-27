@@ -47,16 +47,15 @@ from torch import (
     nn
 )
 
+from ..extract import (
+    default_input_fn,
+    layer_tokens,
+    to_device
+)
+from ..layouts import keep_mask
 from .analysis import (
     LatentStats,
     TopExamples
-)
-from .data import (
-    _to_device,
-    default_input_fn,
-    run_capture,
-    to_tokens,
-    token_keep_mask
 )
 from .model import SAE
 
@@ -67,12 +66,11 @@ META_NAME = "meta.json"
 def cache_latents(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module | str,
-    input_loader: Iterable,
+    layer: str | nn.Module,
+    batches: Iterable,
     out_dir: str | Path,
-    layout: str = "btd",
-    exclude_positions: Sequence[int] = (),
-    token_mask_fn: Callable[[Any], Tensor] | None = None,
+    exclude: Sequence[int] = (),
+    mask_fn: Callable[[Any], Tensor] | None = None,
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
     device: str | torch.device | None = None,
     max_batches: int | None = None,
@@ -89,12 +87,11 @@ def cache_latents(
     Args:
         sae: The SAE.
         model: The model the SAE was trained on.
-        hook_module: Module (or layer name) whose output the SAE reads.
-        input_loader: Iterable of model inputs.
+        layer: Module (or layer name) whose output the SAE reads.
+        batches: Iterable of model inputs.
         out_dir: Output directory; created if needed.
-        layout: Activation layout at the hook.
-        exclude_positions: Positions not cached, as in training.
-        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
+        exclude: Positions not cached, as in training.
+        mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
             tokens to cache, e.g. non-padding tokens.
         input_fn: Maps a batch to model ``(args, kwargs)``.
         device: Device to run on; defaults to the SAE's device.
@@ -130,13 +127,13 @@ def cache_latents(
         pending = {k: [] for k in pending}
         n_pending = 0
 
-    for i, batch in enumerate(input_loader):
+    for i, batch in enumerate(batches):
         if max_batches is not None and i >= max_batches:
             break
-        batch = _to_device(batch, device)
-        tokens = to_tokens(run_capture(model, hook_module, batch, input_fn), layout)
+        batch = to_device(batch, device)
+        tokens = layer_tokens(model, batch, layer, input_fn)
         b, t, _ = tokens.shape
-        keep = token_keep_mask(tokens, exclude_positions, token_mask_fn, batch)
+        keep = keep_mask(tokens, exclude, mask_fn(batch) if mask_fn else None)
         flat_idx = rearrange(keep, "b t -> (b t)").nonzero().squeeze(-1)
         kept = tokens[keep].to(sae.w_enc.dtype)
         pending["example"].append((n_examples + flat_idx // t).cpu())
