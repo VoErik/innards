@@ -10,18 +10,14 @@ Core modules:
 * :mod:`innards.sae.group`: one SAE per hook point, trained from a single pass.
 * :mod:`innards.sae.clt`: cross-layer transcoders replacing all MLPs at once.
 * :mod:`innards.sae.graph`: attribution graphs over spliced SAEs, transcoders and CLTs.
-* :mod:`innards.sae.dashboard`: self-contained HTML latent dashboards and graph viewers.
+* :mod:`innards.sae.dashboard`: a self-contained HTML viewer for attribution graphs.
 * :mod:`innards.sae.optim`: Adam, Muon and Signum (I only use Adam, but sparsify use Muon / Signum as well)
-* :mod:`innards.sae.analysis`: latent statistics, top examples, attributions,
-  and :func:`latent_fn` to use latents wherever :mod:`innards.analysis` scores
-  directions.
+* :mod:`innards.sae.analysis`: :func:`latent_fn` to use latents wherever
+  :mod:`innards.analysis` takes units or scores directions (statistics, top
+  examples, dashboards, spatial maps), and latent attribution.
 * :mod:`innards.sae.interventions`: splicing the SAE in, with latents edited
   by the unit edits of :mod:`innards.edits`.
-* :mod:`innards.sae.latent_cache`: encoding a dataset once and analysing the cached
-  latents (statistics, top / quantile examples, co-occurrence).
 * :mod:`innards.sae.interop`: reading and writing the SAELens format.
-
-Optional: :mod:`innards.sae.viz` (plots and HTML views; ``viz`` extra).
 
 Training data come from the general machinery of innards: rows streamed from
 the model (:class:`innards.extract.RowStream`) or read from a row cache
@@ -35,7 +31,6 @@ from .activations import (
     register_activation
 )
 from .analysis import (
-    analyze_dataset,
     encode_inputs,
     latent_attribution,
     latent_fn,
@@ -57,10 +52,6 @@ from .graph import (
     sae_site
 )
 from .group import SAEGroup
-from .latent_cache import (
-    LatentCache,
-    cache_latents
-)
 from .model import (
     SAE,
     SAEConfig,
@@ -81,16 +72,13 @@ __all__ = [
     "CrossLayerTranscoder",
     "Decoder",
     "KLFinetuneConfig",
-    "LatentCache",
     "SAE",
     "SAEConfig",
     "SAEGroup",
     "SAEOutput",
     "SAETrainer",
     "TrainerConfig",
-    "analyze_dataset",
     "attribution_graph",
-    "cache_latents",
     "clt_hooks",
     "clt_site",
     "encode_inputs",

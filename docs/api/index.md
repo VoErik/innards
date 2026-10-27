@@ -25,6 +25,8 @@ analysis_spline
 analysis_causal
 analysis_metrics
 analysis_interp
+analysis_units
+analysis_dashboard
 analysis_plot
 style
 ```
@@ -41,10 +43,8 @@ optim
 group
 clt
 analysis
-latent_cache
 interventions
 graph
 dashboard
-viz
 interop
 ```

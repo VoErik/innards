@@ -10,7 +10,6 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from innards.sae import analysis as A
-from innards.sae import viz
 from innards.extract import RowStream
 from innards.store import RowLoader, write_rows
 from innards.sae.model import SAE
@@ -64,21 +63,6 @@ def test_cache_max_rows(tmp_path, setup):
     *_, store, _ = setup
     path = write_rows(store, tmp_path / "c2", shard_rows=256, max_rows=500)
     assert RowLoader(path).n_rows == 500
-
-
-def test_analyze_dataset(setup):
-    vit, images, loader, _, sae = setup
-    res = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude=(0,))
-    assert res.stats.n_tokens == 96 * 16
-    # mean L0 = sum of frequencies = k for TopK
-    assert abs(res.stats.frequency.sum().item() - 4) < 1e-3
-    lat = int(res.stats.frequency.argmax())
-    entries = res.top.for_latent(lat)
-    assert len(entries) == 5 and all(p != 0 for _, _, p in entries)  # CLS never selected
-    v, e, p = entries[0]
-    acts = A.encode_inputs(sae, vit, vit.block, images[e : e + 1])
-    torch.testing.assert_close(acts[0, p, lat], torch.tensor(v), atol=1e-5, rtol=1e-5)
-    assert abs(v) == pytest.approx(res.stats.max_activation[lat].item(), rel=1e-5)
 
 
 def test_dictionary_geometry(setup):
@@ -152,19 +136,21 @@ def test_latent_fn_with_interp(setup):
 
 def test_viz_smoke(setup):
     from innards.analysis import plot
+    from innards.analysis.dashboard import text_examples_html
+    from innards.analysis.units import unit_stats
     from innards.analysis.geometry import nearest
     from innards.analysis.interp import readout_effect, top_outputs
 
     vit, images, loader, _, sae = setup
-    res = A.analyze_dataset(sae, vit, vit.block, loader, n_top=4, exclude=(0,))
+    stats, _ = unit_stats(vit, loader, vit.block, A.latent_fn(sae), n_top=4, exclude=(0,))
     atoms = torch.nn.functional.normalize(sae.decoder_weight().detach(), dim=-1)
-    plot.histogram(res.stats.frequency, log10=True, xlabel="log10 firing frequency", title="density")
+    plot.histogram(stats.frequency, log10=True, xlabel="log10 firing frequency", title="density")
     plot.histogram(nearest(atoms, k=1)[0], xlabel="max cosine similarity")
-    plot.embedding(atoms, values=res.stats.frequency, annotate=[1, 2], metric="cosine")
+    plot.embedding(atoms, values=stats.frequency, annotate=[1, 2], metric="cosine")
     plot.similarity_matrix(atoms[:3] @ atoms[:3].T, labels=["0", "1", "2"], signed=True)
     tv, ti, bv, bi = top_outputs(readout_effect(atoms[[0]], vit.head.weight), n=3)
     plot.bars(torch.cat([tv[0], bv[0].flip(0)]), [f"class {int(i)}" for i in torch.cat([ti[0], bi[0].flip(0)])])
-    html = viz.text_examples_html([(["a", "b<", "c"], [0.0, 1.0, -0.5], 1)], title="latent 0", context=1)
+    html = text_examples_html([(["a", "b<", "c"], [0.0, 1.0, -0.5], 1)], title="latent 0", context=1)
     assert "b&lt;" in html and "rgba(208,59,59,1.000)" in html
 
 
@@ -178,18 +164,6 @@ def test_latent_attribution_token_mask(setup):
     assert not attr.keep[:, 0].any() and not attr.keep[:, 5].any() and attr.keep[:, 1].all()
     assert (attr.acts[:, 5] == 0).all() and (attr.error_attribution[:, 0] == 0).all()
     torch.testing.assert_close(attr.target, vit(x)[:, 3].detach(), atol=1e-5, rtol=1e-5)
-
-
-def test_analyze_dataset_chunking_is_exact(setup):
-    vit, _, loader, _, sae = setup
-    full = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude=(0,))
-    chunked = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude=(0,), chunk_tokens=7)
-    torch.testing.assert_close(chunked.stats.frequency, full.stats.frequency)
-    torch.testing.assert_close(chunked.stats.max_activation, full.stats.max_activation)
-    torch.testing.assert_close(chunked.top.values, full.top.values)
-    filled = full.top.values != 0
-    assert torch.equal(chunked.top.example[filled], full.top.example[filled])
-    assert (full.top.position[~filled] == -1).all()
 
 
 @pytest.mark.parametrize("bs", [64, 1000])  # 1000 > shard size: a batch spans several shards
@@ -251,46 +225,3 @@ def test_interventions(setup):
         st = run(vit, x, {"block": rows(steer(direction, 3.0), exclude=(0,))}, read="block")[1]["block"]
         torch.testing.assert_close(st[:, 1:], ref[:, 1:] + 3.0 * direction)
         torch.testing.assert_close(st[:, 0], ref[:, 0])
-
-
-def test_latent_cache_matches_analysis(tmp_path, setup):
-    from innards.sae.latent_cache import LatentCache, cache_latents
-
-    vit, images, loader, _, sae = setup
-    # Small shards and chunks so merging across shards is exercised.
-    path = cache_latents(sae, vit, vit.block, loader, tmp_path / "lat", exclude=(0,), shard_tokens=200,
-                         chunk_tokens=50, metadata={"hook": "block"})
-    cache = LatentCache(path)
-    assert len(cache.meta["shards"]) > 3 and cache.meta["metadata"]["hook"] == "block"
-    ref = A.analyze_dataset(sae, vit, vit.block, loader, n_top=5, exclude=(0,))
-    stats = cache.stats()
-    assert stats.n_tokens == ref.stats.n_tokens == 96 * 16
-    for f in ("frequency", "mean_activation", "max_activation"):
-        torch.testing.assert_close(getattr(stats, f), getattr(ref.stats, f))
-    top = cache.top_examples(5)
-    torch.testing.assert_close(top.values, ref.top.values)
-    filled = ref.top.values != 0
-    assert torch.equal(top.example[filled], ref.top.example[filled])
-    assert torch.equal(top.position[filled], ref.top.position[filled])
-
-    # Dense reference over the whole dataset: (examples, tokens, d_sae) with CLS zeroed.
-    dense = A.encode_inputs(sae, vit, vit.block, images)
-    dense[:, 0] = 0
-    lat = int(stats.frequency.argmax())
-    tokens, values = cache.latent_activations(lat)
-    example, position = cache.token_index(tokens)
-    torch.testing.assert_close(values, dense[example, position, lat])
-    assert values.numel() == int((dense[..., lat] != 0).sum())
-
-    bins = cache.quantile_examples(lat, n_bins=4, per_bin=3)
-    assert len(bins) == 4 and all(len(b) == 3 for b in bins)
-    mags = [[abs(v) for v, _, _ in b] for b in bins]
-    assert all(max(mags[i]) <= min(mags[i + 1]) + 1e-6 for i in range(3))  # bins ordered by magnitude
-    for v, e, p in bins[-1]:
-        assert dense[e, p, lat].item() == pytest.approx(v, rel=1e-5)
-
-    latents = [0, 3, lat, 10]
-    active = (dense.reshape(-1, sae.cfg.d_sae)[:, latents] != 0).float()
-    expected = active.T @ active
-    torch.testing.assert_close(cache.cooccurrence(latents), expected)
-    torch.testing.assert_close(cache.cooccurrence(latents, chunk_tokens=7), expected)

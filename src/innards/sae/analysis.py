@@ -1,10 +1,13 @@
 """
-Analysis of trained SAEs: latent statistics, top-activating examples and attributions.
+Analysis of trained SAEs: latents as units, and attributions to latents.
 
 Everything that is not specific to SAEs lives in :mod:`innards.analysis` and
 takes the dictionary as directions (``sae.decoder_weight()``) or the latents
-as a scoring function (:func:`latent_fn`):
+as an encode function (:func:`latent_fn`):
 
+* statistics and top examples over a dataset: ``units.unit_stats``,
+  ``units.cache_units`` (+ ``cache_top``, ``quantile_examples``,
+  ``cooccurrence``) and ``dashboard.save_dashboard``;
 * dictionary geometry: ``geometry.nearest`` (redundant latents, neighbours),
   ``geometry.cosine_matrix``, ``geometry.embed``;
 * output effects: ``interp.readout_effect`` and ``interp.top_outputs``;
@@ -36,17 +39,14 @@ from __future__ import annotations
 
 from collections.abc import (
     Callable,
-    Iterable, Sequence
+    Sequence
 )
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn.functional as F
-from einops import (
-    einsum,
-    rearrange
-)
+from einops import einsum
 from torch import (
     Tensor,
     nn
@@ -58,8 +58,7 @@ from ..edits import (
 )
 from ..extract import (
     default_input_fn,
-    layer_tokens,
-    to_device
+    layer_tokens
 )
 from ..layouts import keep_mask
 from ..models import (
@@ -67,113 +66,6 @@ from ..models import (
     layer_name
 )
 from .model import SAE
-
-
-@dataclass
-class LatentStats:
-    """
-    Per-latent activation statistics over a dataset.
-
-    Attributes:
-        frequency: Fraction of kept tokens on which each latent is active,
-            Shape: ``(d_sae,)``.
-        mean_activation: Mean absolute activation when active, Shape: ``(d_sae,)``.
-        max_activation: Maximum absolute activation, Shape: ``(d_sae,)``.
-        n_tokens: Number of kept tokens seen.
-    """
-
-    frequency: Tensor
-    mean_activation: Tensor
-    max_activation: Tensor
-    n_tokens: int
-
-    @property
-    def dead(self) -> Tensor:
-        """Indices of latents that never fired."""
-        return (self.frequency == 0).nonzero().squeeze(-1)
-
-    def dense(self, threshold: float = 0.1) -> Tensor:
-        """
-        Indices of latents firing on more than ``threshold`` of tokens.
-
-        Args:
-            threshold: Frequency threshold.
-
-        Returns:
-            Long tensor of latent indices.
-        """
-        return (self.frequency > threshold).nonzero().squeeze(-1)
-
-
-@dataclass
-class TopExamples:
-    """
-    Top-activating tokens per latent, by absolute activation.
-
-    Attributes:
-        values: Activations, shape ``(d_sae, n_top)``, sorted by descending
-            magnitude.
-        example: Index of the input in loader order, ``(d_sae, n_top)``; -1 for
-            empty slots.
-        position: Token position within that input (in the ``(batch, tokens,
-            d)`` layout, counting excluded positions), ``(d_sae, n_top)``;
-            -1 for empty slots.
-    """
-
-    values: Tensor
-    example: Tensor
-    position: Tensor
-
-    def for_latent(self, latent: int) -> list[tuple[float, int, int]]:
-        """
-        ``(value, example, position)`` triples of one latent, best first.
-
-        Args:
-            latent: Latent index.
-
-        Returns:
-            The non-empty entries.
-        """
-        out = []
-        for v, e, p in zip(
-                self.values[latent].tolist(),
-                self.example[latent].tolist(),
-                self.position[latent].tolist()
-        ):
-            if e >= 0 and v != 0:
-                out.append((v, e, p))
-        return out
-
-    def unique_examples(self, latent: int) -> list[tuple[float, int, int]]:
-        """
-        Like :meth:`for_latent` but keeps only the best token per input.
-
-        Args:
-            latent: Latent index.
-
-        Returns:
-            One ``(value, example, position)`` triple per input.
-        """
-        seen, out = set(), []
-        for v, e, p in self.for_latent(latent):
-            if e not in seen:
-                seen.add(e)
-                out.append((v, e, p))
-        return out
-
-
-@dataclass
-class DatasetAnalysis:
-    """
-    Result of :func:`analyze_dataset`.
-
-    Attributes:
-        stats: Per-latent statistics.
-        top: Top-activating tokens per latent.
-    """
-
-    stats: LatentStats
-    top: TopExamples
 
 
 @dataclass
@@ -269,101 +161,6 @@ def encode_inputs(
     """
     model.eval()
     return latent_fn(sae)(layer_tokens(model, batch, layer, input_fn))
-
-
-@torch.no_grad()
-def analyze_dataset(
-    sae: SAE,
-    model: nn.Module,
-    layer: str | nn.Module,
-    batches: Iterable,
-    n_top: int = 16,
-    exclude: Sequence[int] = (),
-    mask_fn: Callable[[Any], Tensor] | None = None,
-    input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
-    device: str | torch.device | None = None,
-    max_batches: int | None = None,
-    chunk_tokens: int = 4096,
-) -> DatasetAnalysis:
-    """
-    One pass over a dataset collecting latent statistics and top examples.
-
-    The loader must be deterministic (``shuffle=False``) so that
-    ``TopExamples.example`` indices can be mapped back to inputs. Only kept
-    tokens are encoded, ``chunk_tokens`` at a time, so memory is bounded by
-    ``chunk_tokens * d_sae`` whatever the batch size and sequence length.
-
-    Args:
-        sae: The SAE.
-        model: The model the SAE was trained on.
-        layer: Module (or layer name) whose output the SAE reads.
-        batches: Iterable of model inputs.
-        n_top: Number of top tokens kept per latent.
-        exclude: Positions to ignore, as in training.
-        mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask,
-            e.g. from the attention mask.
-        input_fn: Maps a batch to model ``(args, kwargs)``.
-        device: Device to run on; defaults to the SAE's device.
-        max_batches: Optional cap on the number of batches.
-        chunk_tokens: Tokens encoded at once.
-
-    Returns:
-        A :class:`DatasetAnalysis`.
-    """
-    device = torch.device(device) if device is not None else sae.device
-    d_sae = sae.cfg.d_sae
-    count = torch.zeros(d_sae, device=device)
-    total = torch.zeros(d_sae, device=device)
-    peak = torch.zeros(d_sae, device=device)
-    top_v = torch.zeros(0, d_sae, device=device)
-    top_e = torch.zeros(0, d_sae, dtype=torch.long, device=device)
-    top_p = torch.zeros(0, d_sae, dtype=torch.long, device=device)
-    n_tokens = 0
-    offset = 0
-
-    sae.eval()
-    model.eval()
-    for i, batch in enumerate(batches):
-        if max_batches is not None and i >= max_batches:
-            break
-        batch = to_device(batch, device)
-        tokens = layer_tokens(model, batch, layer, input_fn)
-        b, t, _ = tokens.shape
-        keep = keep_mask(tokens, exclude, mask_fn(batch) if mask_fn else None)
-        flat_idx = rearrange(keep, "b t -> (b t)").nonzero().squeeze(-1)  # into the (b t) grid
-        kept = tokens[keep].to(sae.w_enc.dtype)
-        n_tokens += kept.shape[0]
-
-        for start in range(0, kept.shape[0], chunk_tokens):
-            acts = sae.encode(kept[start : start + chunk_tokens]).float()
-            mags = acts.abs()
-            count += (mags > 0).sum(0)
-            total += mags.sum(0)
-            peak = torch.maximum(peak, mags.max(0).values)
-
-            _, idx = mags.topk(min(n_top, mags.shape[0]), dim=0)
-            where = flat_idx[start + idx]
-            cand_v = torch.cat([top_v, acts.gather(0, idx)])
-            cand_e = torch.cat([top_e, offset + where // t])
-            cand_p = torch.cat([top_p, where % t])
-            sel = cand_v.abs().topk(min(n_top, cand_v.shape[0]), dim=0).indices
-            top_v, top_e, top_p = cand_v.gather(0, sel), cand_e.gather(0, sel), cand_p.gather(0, sel)
-        offset += b
-
-    empty = top_v == 0
-    top_e, top_p = top_e.masked_fill(empty, -1), top_p.masked_fill(empty, -1)
-    stats = LatentStats(
-        frequency=(count / max(n_tokens, 1)).cpu(),
-        mean_activation=(total / count.clamp_min(1)).cpu(),
-        max_activation=peak.cpu(),
-        n_tokens=n_tokens,
-    )
-    top = TopExamples(
-        values=top_v.T.contiguous().cpu(),
-        example=top_e.T.contiguous().cpu(),
-        position=top_p.T.contiguous().cpu()
-    )
-    return DatasetAnalysis(stats, top)
 
 
 @torch.no_grad()
