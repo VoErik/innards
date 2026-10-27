@@ -1,5 +1,5 @@
-# SAELens interop: `sae.interop`
+# SAELens interop: `innards.sae.interop`
 
 ```{eval-rst}
-.. automodule:: sae.interop
+.. automodule:: innards.sae.interop
 ```

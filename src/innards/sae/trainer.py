@@ -1,11 +1,11 @@
 """
-Trainer for :class:`sae.model.SAE`.
+Trainer for :class:`innards.sae.model.SAE`.
 
 Two phases:
 
 1. :meth:`SAETrainer.train` trains on reconstruction (normalised MSE plus the
    auxiliary terms configured on the model) from an iterable of activation
-   batches, e.g. a :class:`sae.data.ActivationStore` or a ``DataLoader`` over
+   batches, e.g. a :class:`innards.sae.data.ActivationStore` or a ``DataLoader`` over
    cached activations.
 2. :meth:`SAETrainer.finetune_kl` optionally fine-tunes the SAE spliced into
    the model on KL + MSE (Karvonen, 2025), which shrinks the downstream loss
@@ -91,7 +91,7 @@ class TrainerConfig:
         num_epochs: Passes over the data when ``total_tokens`` is ``None``.
         optimizer: ``"adam"`` (default), ``"muon"`` or ``"signum"``.
         lr: Learning rate; ``None`` uses the optimizer's default from
-            :func:`~sae.optim.default_lr`.
+            :func:`~innards.sae.optim.default_lr`.
         adam_betas: Adam betas (Gao et al., 2024).
         adam_eps: Adam epsilon (Gao et al., 2024).
         warmup_steps: Linear warmup steps, capped at 5% of training.
@@ -194,7 +194,7 @@ class KLFinetuneConfig:
             learning rate (our default; the paper uses 5e-5 for its setup).
         lr_scale: Multiplier of the training learning rate when ``lr`` is
             ``None``.
-        layout: Activation layout at the hook (see ``sae.data.LAYOUTS``).
+        layout: Activation layout at the hook (see ``innards.sae.data.LAYOUTS``).
         exclude_positions: Token positions left unpatched (e.g. CLS / BOS),
             consistent with the positions excluded during training.
         token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
@@ -334,7 +334,7 @@ def _linear_schedule(total_steps: int, warmup: int, decay_frac: float) -> Callab
 
 class SAETrainer:
     """
-    Trains a :class:`sae.model.SAE`.
+    Trains a :class:`innards.sae.model.SAE`.
 
     Args:
         model: The SAE.
@@ -583,7 +583,7 @@ class SAETrainer:
 
         Args:
             dataloader: Iterable of activation batches: a
-                :class:`~sae.data.ActivationStore`, cached activations, or a
+                :class:`~innards.sae.data.ActivationStore`, cached activations, or a
                 ``DataLoader``, yielding whatever the model's ``batch_tensors``
                 accepts (tensors, ``(input, target)`` pairs, dicts). Needs
                 ``len()`` unless ``total_tokens`` is set.
@@ -841,7 +841,7 @@ class SAETrainer:
                 ``"zero"``, or ``"mean"`` (mean of the batch's kept tokens).
             target_module: For transcoders: the module whose output the
                 transcoder replaces (``hook_module`` is its input). For a
-                :class:`~sae.clt.CrossLayerTranscoder`, ``hook_module`` and
+                :class:`~innards.sae.clt.CrossLayerTranscoder`, ``hook_module`` and
                 ``target_module`` are the per-layer lists of MLP inputs and
                 MLPs, which are all replaced (or ablated) together.
 

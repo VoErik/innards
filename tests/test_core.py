@@ -10,28 +10,28 @@ from torch.utils.data import (
     TensorDataset
 )
 
-from sae.activations import (
+from innards.sae.activations import (
     ACTIVATIONS,
     Activation,
     register_activation,
     dense_code
 )
-from sae.data import (
+from innards.sae.data import (
     ActivationStore,
     from_tokens,
     patch_kept_tokens,
     to_tokens
 )
-from sae.optim import (
+from innards.sae.optim import (
     Signum,
     build_optimizers
 )
-from sae.decoders import kmeans
-from sae.model import (
+from innards.sae.decoders import kmeans
+from innards.sae.model import (
     SAE,
     SAEConfig
 )
-from sae.trainer import (
+from innards.sae.trainer import (
     KLFinetuneConfig,
     SAETrainer,
     TrainerConfig
@@ -524,8 +524,8 @@ def test_transcoder_config_and_target_checks():
 
 
 def test_transcoder_store_cache_kl_and_interventions(tmp_path):
-    from sae.cache import CachedActivations, cache_activations
-    from sae.interventions import splice_sae, zero_ablate
+    from innards.sae.cache import CachedActivations, cache_activations
+    from innards.sae.interventions import splice_sae, zero_ablate
 
     torch.manual_seed(0)
     vit = ToyViT()
@@ -563,7 +563,7 @@ def test_transcoder_store_cache_kl_and_interventions(tmp_path):
         with splice_sae(tc, ln, zero_ablate(list(range(128))), target_module=mlp, exclude_positions=(0,)):
             assert not torch.allclose(vit(images[:4]), clean, atol=1e-3)
 
-    from sae.analysis import latent_attribution
+    from innards.sae.analysis import latent_attribution
     attr = latent_attribution(tc, vit, ln, images[:1], lambda o, _: o[:, 2], exclude_positions=(0,),
                               target_module=mlp)
     torch.testing.assert_close(attr.target, clean[:1, 2], atol=1e-5, rtol=1e-5)

@@ -1,5 +1,5 @@
 """
-Activation functions of :class:`sae.model.SAE`: how pre-activations become
+Activation functions of :class:`innards.sae.model.SAE`: how pre-activations become
 sparse latents.
 
 Most SAE architectures differ only here, in the rule that selects active
@@ -186,7 +186,7 @@ class Activation(nn.Module):
     """
     Base class of activation functions.
 
-    All inputs are in the SAE's scaled units (see :class:`sae.model.SAE`).
+    All inputs are in the SAE's scaled units (see :class:`innards.sae.model.SAE`).
     Subclasses implement :meth:`forward` and, where needed, :meth:`penalty`,
     :meth:`update_stats` and :meth:`fold_`. Parameters and buffers they
     register are trained, saved and loaded with the SAE.

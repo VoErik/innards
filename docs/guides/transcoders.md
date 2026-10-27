@@ -9,7 +9,7 @@ a model whose MLPs are sparse and linear given the active latents, which is
 what makes [attribution graphs](circuits.md) clean.
 
 ```python
-from sae import SAE, ActivationStore, SAETrainer, TrainerConfig
+from innards.sae import SAE, ActivationStore, SAETrainer, TrainerConfig
 
 layer = model.gpt_neox.layers[3]
 store = ActivationStore(model, layer.post_attention_layernorm, loader,
@@ -46,7 +46,7 @@ so a feature computed once can explain the same output across several
 layers, which keeps attribution graphs small.
 
 ```python
-from sae import CrossLayerTranscoder, clt_hooks, splice_clt
+from innards.sae import CrossLayerTranscoder, clt_hooks, splice_clt
 
 layers = model.gpt_neox.layers
 ins = [l.post_attention_layernorm for l in layers]

@@ -1,5 +1,5 @@
-# Activations: `sae.activations`
+# Activations: `innards.sae.activations`
 
 ```{eval-rst}
-.. automodule:: sae.activations
+.. automodule:: innards.sae.activations
 ```

@@ -1,5 +1,5 @@
-# Decoders: `sae.decoders`
+# Decoders: `innards.sae.decoders`
 
 ```{eval-rst}
-.. automodule:: sae.decoders
+.. automodule:: innards.sae.decoders
 ```

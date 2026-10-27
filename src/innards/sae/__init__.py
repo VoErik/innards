@@ -2,26 +2,26 @@
 
 Core modules:
 
-* :mod:`sae.model`: the SAE (:class:`SAE`, :class:`SAEConfig`).
-* :mod:`sae.activations`: TopK, BatchTopK, JumpReLU and ReLU activations;
+* :mod:`innards.sae.model`: the SAE (:class:`SAE`, :class:`SAEConfig`).
+* :mod:`innards.sae.activations`: TopK, BatchTopK, JumpReLU and ReLU activations;
   new architectures register here.
-* :mod:`sae.decoders`: unit-norm linear and Archetypal dictionaries.
-* :mod:`sae.trainer`: training, KL fine-tuning and evaluation.
-* :mod:`sae.group`: one SAE per hook point, trained from a single pass.
-* :mod:`sae.clt`: cross-layer transcoders replacing all MLPs at once.
-* :mod:`sae.graph`: attribution graphs over spliced SAEs, transcoders and CLTs.
-* :mod:`sae.dashboard`: self-contained HTML latent dashboards and graph viewers.
-* :mod:`sae.data`: activation harvesting from vision and language models.
-* :mod:`sae.cache`: caching harvested activations to disk.
-* :mod:`sae.optim`: Adam, Muon and Signum (I only use Adam, but sparsify use Muon / Signum as well)
-* :mod:`sae.analysis`: latent statistics, top examples, dictionary
+* :mod:`innards.sae.decoders`: unit-norm linear and Archetypal dictionaries.
+* :mod:`innards.sae.trainer`: training, KL fine-tuning and evaluation.
+* :mod:`innards.sae.group`: one SAE per hook point, trained from a single pass.
+* :mod:`innards.sae.clt`: cross-layer transcoders replacing all MLPs at once.
+* :mod:`innards.sae.graph`: attribution graphs over spliced SAEs, transcoders and CLTs.
+* :mod:`innards.sae.dashboard`: self-contained HTML latent dashboards and graph viewers.
+* :mod:`innards.sae.data`: activation harvesting from vision and language models.
+* :mod:`innards.sae.cache`: caching harvested activations to disk.
+* :mod:`innards.sae.optim`: Adam, Muon and Signum (I only use Adam, but sparsify use Muon / Signum as well)
+* :mod:`innards.sae.analysis`: latent statistics, top examples, dictionary
   geometry, output effects and attributions.
-* :mod:`sae.interventions`: ablating, clamping and steering latents.
-* :mod:`sae.latent_cache`: encoding a dataset once and analysing the cached
+* :mod:`innards.sae.interventions`: ablating, clamping and steering latents.
+* :mod:`innards.sae.latent_cache`: encoding a dataset once and analysing the cached
   latents (statistics, top / quantile examples, co-occurrence).
-* :mod:`sae.interop`: reading and writing the SAELens format.
+* :mod:`innards.sae.interop`: reading and writing the SAELens format.
 
-Optional: :mod:`sae.viz` (plots and HTML views; ``viz`` extra).
+Optional: :mod:`innards.sae.viz` (plots and HTML views; ``viz`` extra).
 """
 
 from .activations import (

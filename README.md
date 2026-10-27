@@ -25,7 +25,7 @@ This assumes you have a *trained* (`torch`) vision or language model:
 
 ```python
 import torch
-from sae import (SAE, ActivationStore, CachedActivations, SAETrainer,
+from innards.sae import (SAE, ActivationStore, CachedActivations, SAETrainer,
                  TrainerConfig, cache_activations)
 
 # 0. Initialize the model and dataloaders etc.
@@ -69,8 +69,8 @@ sae = SAE.load("sae.safetensors", device="cuda")
 
 ```python
 import torch.nn.functional as F
-from sae import LatentCache, cache_latents
-from sae.interventions import clamp, splice_sae, steer, zero_ablate
+from innards.sae import LatentCache, cache_latents
+from innards.sae.interventions import clamp, splice_sae, steer, zero_ablate
 
 # Encode a (deterministic) dataset once, then analyse without the model.
 cache = LatentCache(cache_latents(sae, model, model.blocks[6], val_loader, "latents/block6",
@@ -91,9 +91,9 @@ trainer.evaluate_downstream(model, model.blocks[6], val_loader, kl_cfg,
                             loss_fn=lambda out, batch: F.cross_entropy(out, batch[1]))
 ```
 
-`sae.analysis` covers the rest (single-pass `analyze_dataset`, dictionary
+`innards.sae.analysis` covers the rest (single-pass `analyze_dataset`, dictionary
 geometry, output effects / logit lens, attribution patching, patch maps),
-and `sae.viz` plots it.
+and `innards.sae.viz` plots it.
 
 ## Architectures
 
@@ -101,10 +101,10 @@ An `SAE` is assembled from independent parts, chosen in `SAEConfig`:
 
 | Part | Options | Module |
 |---|---|---|
-| `activation` | `"topk"`, `"batchtopk"` (both with optional `abs_topk`), `"jumprelu"`, `"relu"` (L1) | `sae.activations` |
-| `decoder` | `"linear"` (unit-norm atoms), `"archetypal"` | `sae.decoders` |
-| loss terms | AuxK, `matryoshka`, `multi_topk` (TopK variants) | `sae.model` |
-| target | the input (SAE), or another activation with `transcoder=True` (+ `skip_connection`) | `sae.model` |
+| `activation` | `"topk"`, `"batchtopk"` (both with optional `abs_topk`), `"jumprelu"`, `"relu"` (L1) | `innards.sae.activations` |
+| `decoder` | `"linear"` (unit-norm atoms), `"archetypal"` | `innards.sae.decoders` |
+| loss terms | AuxK, `matryoshka`, `multi_topk` (TopK variants) | `innards.sae.model` |
+| target | the input (SAE), or another activation with `transcoder=True` (+ `skip_connection`) | `innards.sae.model` |
 
 ```python
 SAE(d_in=768, d_sae=16384, activation="topk", k=64, matryoshka=True)
@@ -116,8 +116,8 @@ To add an architecture, subclass `Activation` and register it; the model,
 trainer, saving/loading and analysis code need no changes:
 
 ```python
-from sae import Activation, register_activation
-from sae.activations import dense_code
+from innards.sae import Activation, register_activation
+from innards.sae.activations import dense_code
 
 @register_activation("my_act")
 class MyActivation(Activation):
@@ -130,7 +130,7 @@ class MyActivation(Activation):
 
 Override `update_stats` for running statistics and `fold_` for thresholds
 that must be rescaled when saving. New decoder parametrizations subclass
-`Decoder` and go into `sae.decoders.DECODERS`.
+`Decoder` and go into `innards.sae.decoders.DECODERS`.
 
 ## Many layers at once
 
@@ -138,7 +138,7 @@ Harvesting is usually the expensive part, so capture several hook points in
 one pass and train one SAE per hook in the same loop:
 
 ```python
-from sae import SAEGroup
+from innards.sae import SAEGroup
 
 hooks = {f"block{i}": model.blocks[i] for i in range(12)}
 store = ActivationStore(model, hooks, loader, exclude_positions=(0,))  # dict batches
@@ -158,7 +158,7 @@ Self-contained HTML files (no server, no network): a latent browser built on
 the latent cache, and an interactive viewer for attribution graphs.
 
 ```python
-from sae.dashboard import image_renderer, save_graph_html, save_latent_dashboard, text_renderer
+from innards.sae.dashboard import image_renderer, save_graph_html, save_latent_dashboard, text_renderer
 
 save_latent_dashboard("dashboard.html", cache, text_renderer(val_tokens),  # or image_renderer(images, n_prefix=1)
                       sae=sae, readout=unembed, output_labels=vocab)       # nearest latents, output effects
@@ -197,7 +197,7 @@ write to the MLP outputs of layers `l, l+1, ...` (Ameisen et al., 2025), so
 a feature computed once can explain the same output across layers.
 
 ```python
-from sae import CrossLayerTranscoder, clt_hooks, splice_clt
+from innards.sae import CrossLayerTranscoder, clt_hooks, splice_clt
 
 layers = model.gpt_neox.layers
 ins, outs = [l.post_attention_layernorm for l in layers], [l.mlp for l in layers]
@@ -219,7 +219,7 @@ nodes, edges are direct effects between them (Marks et al., 2024; Ameisen et
 al., 2025):
 
 ```python
-from sae import attribution_graph, clt_site, sae_site
+from innards.sae import attribution_graph, clt_site, sae_site
 
 sites = [sae_site(tcs[i], ins[i], outs[i], name=f"tc{i}") for i in range(n_layers)]  # transcoders
 # or [clt_site(clt, ins, outs)], or residual SAEs: sae_site(sae, model.blocks[i])
@@ -238,10 +238,10 @@ attention and layer norms they are the local linearization at the input
 ## SAELens interop
 
 ```python
-from sae.interop import load_saelens, save_saelens
+from innards.sae.interop import load_saelens, save_saelens
 
 save_saelens(sae, "export/blocks.6", metadata={"model_name": "vit_tiny", "hook_name": "blocks.6"})
-gemma_scope_sae, cfg = load_saelens("path/to/saelens/sae")  # then use sae.analysis etc. on it
+gemma_scope_sae, cfg = load_saelens("path/to/saelens/sae")  # then use innards.sae.analysis etc. on it
 ```
 
 Supported: TopK, AbsTopK, BatchTopK (exported as JumpReLU with a constant

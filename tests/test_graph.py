@@ -4,11 +4,11 @@ import pytest
 import torch
 from torch import nn
 
-from sae.clt import CrossLayerTranscoder, splice_clt
-from sae.data import capture_activation, splice
-from sae.graph import attribution_graph, clt_site, sae_site
-from sae.interventions import splice_sae
-from sae.model import SAE
+from innards.sae.clt import CrossLayerTranscoder, splice_clt
+from innards.sae.data import capture_activation, splice
+from innards.sae.graph import attribution_graph, clt_site, sae_site
+from innards.sae.interventions import splice_sae
+from innards.sae.model import SAE
 
 
 class ToyMixNet(nn.Module):

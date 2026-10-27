@@ -17,7 +17,7 @@ Layout of a cache directory::
 ``token`` indexes the shard's tokens; a token's global id is the shard's
 ``token_offset`` plus that index. ``example`` is the input's index in loader
 order and ``position`` its token position (counting excluded positions), as in
-:class:`sae.analysis.TopExamples`.
+:class:`innards.sae.analysis.TopExamples`.
 
 References:
     Bricken, T. et al. (2023). Towards Monosemanticity: Decomposing Language
@@ -238,10 +238,10 @@ class LatentCache:
 
     def stats(self) -> LatentStats:
         """
-        Per-latent statistics, as in :func:`sae.analysis.analyze_dataset`.
+        Per-latent statistics, as in :func:`innards.sae.analysis.analyze_dataset`.
 
         Returns:
-            A :class:`~sae.analysis.LatentStats`.
+            A :class:`~innards.sae.analysis.LatentStats`.
         """
         count = torch.zeros(self.d_sae)
         total = torch.zeros(self.d_sae)
@@ -266,7 +266,7 @@ class LatentCache:
             n_top: Tokens kept per latent.
 
         Returns:
-            A :class:`~sae.analysis.TopExamples`; empty slots have value 0
+            A :class:`~innards.sae.analysis.TopExamples`; empty slots have value 0
             and example / position -1.
         """
         lat = torch.zeros(0, dtype=torch.long)

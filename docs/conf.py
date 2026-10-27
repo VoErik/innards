@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-project = "sae"
+project = "innards"
 author = "Erik Voigt"
 copyright = "2026, Erik Voigt"
 
@@ -36,7 +36,7 @@ napoleon_attr_annotations = True
 napoleon_use_ivar = True  # attributes as fields, so dataclass members are not documented twice
 
 html_theme = "furo"
-html_title = "sae"
+html_title = "innards"
 html_theme_options = {
     "source_repository": "https://github.com/VoErik/sparse-autoencoder",
     "source_branch": "main",

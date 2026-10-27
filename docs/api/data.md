@@ -1,5 +1,5 @@
-# Activation harvesting: `sae.data`
+# Activation harvesting: `innards.sae.data`
 
 ```{eval-rst}
-.. automodule:: sae.data
+.. automodule:: innards.sae.data
 ```

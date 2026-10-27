@@ -23,7 +23,7 @@ attention, skip connections).
 ## Building a graph
 
 ```python
-from sae import attribution_graph, clt_site, sae_site
+from innards.sae import attribution_graph, clt_site, sae_site
 
 # transcoders replacing each MLP
 sites = [sae_site(tcs[i], ins[i], outs[i], name=f"tc{i}") for i in range(n_layers)]
@@ -39,9 +39,9 @@ pruned.edges(threshold=0.01)           # (source, target, weight), strongest fir
 ```
 
 `max_nodes` latent nodes are kept (by |attribution|), plus all error nodes.
-{meth}`~sae.graph.AttributionGraph.influence` combines direct and indirect
+{meth}`~innards.sae.graph.AttributionGraph.influence` combines direct and indirect
 effects on the metric (normalized absolute edges, $(I - A)^{-1}$, as in
-Ameisen et al.), and {meth}`~sae.graph.AttributionGraph.prune` keeps the
+Ameisen et al.), and {meth}`~innards.sae.graph.AttributionGraph.prune` keeps the
 nodes covering a fraction of the total influence.
 
 Residual-stream SAE sites cut the stream, so their graphs only link
@@ -52,7 +52,7 @@ attention, so edges can skip layers and positions.
 ## Viewing a graph
 
 ```python
-from sae.dashboard import save_graph_html
+from innards.sae.dashboard import save_graph_html
 
 save_graph_html(pruned, "graph.html", tokens=tokenizer.convert_ids_to_tokens(input_ids[0]),
                 metric_label='logit(" Paris")',

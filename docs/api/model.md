@@ -1,5 +1,5 @@
-# Model: `sae.model`
+# Model: `innards.sae.model`
 
 ```{eval-rst}
-.. automodule:: sae.model
+.. automodule:: innards.sae.model
 ```

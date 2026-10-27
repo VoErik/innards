@@ -7,10 +7,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from sae.dashboard import graph_html, image_renderer, latent_dashboard_html, save_latent_dashboard, text_renderer
-from sae.graph import attribution_graph, sae_site
-from sae.latent_cache import LatentCache, cache_latents
-from sae.model import SAE
+from innards.sae.dashboard import graph_html, image_renderer, latent_dashboard_html, save_latent_dashboard, text_renderer
+from innards.sae.graph import attribution_graph, sae_site
+from innards.sae.latent_cache import LatentCache, cache_latents
+from innards.sae.model import SAE
 from test_graph import ToyMixNet, _transcoders
 
 

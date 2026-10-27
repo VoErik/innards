@@ -9,12 +9,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from sae import analysis as A
-from sae import viz
-from sae.cache import CachedActivations, cache_activations
-from sae.data import ActivationStore
-from sae.model import SAE
-from sae.trainer import SAETrainer, TrainerConfig
+from innards.sae import analysis as A
+from innards.sae import viz
+from innards.sae.cache import CachedActivations, cache_activations
+from innards.sae.data import ActivationStore
+from innards.sae.model import SAE
+from innards.sae.trainer import SAETrainer, TrainerConfig
 
 
 class ToyViT(nn.Module):
@@ -121,7 +121,7 @@ def test_latent_attribution_matches_ablation(setup):
         tok[:, 1:] = sae.decode(acts) + err
         return tok
 
-    from sae.data import replace_activation
+    from innards.sae.data import replace_activation
 
     with torch.no_grad(), replace_activation(vit.block, ablate):
         ablated = vit(x)[:, 3]
@@ -202,8 +202,8 @@ def test_cached_activations_order_and_prefetch(tmp_path, bs):
 
 
 def test_interventions(setup):
-    from sae.data import capture_activation, patch_kept_tokens, replace_activation
-    from sae.interventions import clamp, mean_ablate, scale, splice_sae, steer, zero_ablate
+    from innards.sae.data import capture_activation, patch_kept_tokens, replace_activation
+    from innards.sae.interventions import clamp, mean_ablate, scale, splice_sae, steer, zero_ablate
 
     vit, images, *_, sae = setup
     x = images[:4]
@@ -244,7 +244,7 @@ def test_interventions(setup):
 
 
 def test_latent_cache_matches_analysis(tmp_path, setup):
-    from sae.latent_cache import LatentCache, cache_latents
+    from innards.sae.latent_cache import LatentCache, cache_latents
 
     vit, images, loader, _, sae = setup
     # Small shards and chunks so merging across shards is exercised.

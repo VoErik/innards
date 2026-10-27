@@ -1,5 +1,5 @@
-# Analysis: `sae.analysis`
+# Analysis: `innards.sae.analysis`
 
 ```{eval-rst}
-.. automodule:: sae.analysis
+.. automodule:: innards.sae.analysis
 ```

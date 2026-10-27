@@ -38,5 +38,5 @@ matters, and where it would go.
 - **Auto-interpretation.** LLM-written explanations of latents scored by
   detection / fuzzing (as in EleutherAI's `delphi`), built on the latent cache
   (`LatentCache.top_examples`, `quantile_examples`).
-- **SAEBench runs.** Export with `sae.interop.save_saelens` and run SAEBench's
+- **SAEBench runs.** Export with `innards.sae.interop.save_saelens` and run SAEBench's
   absorption, sparse probing, RAVEL, etc.; document the setup.

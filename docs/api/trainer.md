@@ -1,5 +1,5 @@
-# Training: `sae.trainer`
+# Training: `innards.sae.trainer`
 
 ```{eval-rst}
-.. automodule:: sae.trainer
+.. automodule:: innards.sae.trainer
 ```

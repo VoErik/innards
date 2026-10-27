@@ -20,7 +20,7 @@ and language models, in plain PyTorch.
 - **Interop**: read and write the SAELens format.
 
 ```python
-from sae import SAE, ActivationStore, SAETrainer, TrainerConfig
+from innards.sae import SAE, ActivationStore, SAETrainer, TrainerConfig
 
 store = ActivationStore(model, model.blocks[6], loader, exclude_positions=(0,))
 sae = SAE(d_in=768, d_sae=16384, activation="batchtopk", k=32)

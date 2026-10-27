@@ -1,8 +1,8 @@
 # Training
 
-{class}`~sae.trainer.SAETrainer` trains any model that follows its small
-protocol: single SAEs and transcoders, {class}`~sae.group.SAEGroup` and
-{class}`~sae.clt.CrossLayerTranscoder`.
+{class}`~innards.sae.trainer.SAETrainer` trains any model that follows its small
+protocol: single SAEs and transcoders, {class}`~innards.sae.group.SAEGroup` and
+{class}`~innards.sae.clt.CrossLayerTranscoder`.
 
 ```python
 trainer = SAETrainer(sae, TrainerConfig(total_tokens=100_000_000, loggers=("wandb",)))
@@ -29,7 +29,7 @@ Optimizers `"muon"` and `"signum"` are available (as in EleutherAI's
 ## Common settings
 
 `total_tokens` / `num_epochs`
-: Stream for a token budget (needed for an {class}`~sae.data.ActivationStore`,
+: Stream for a token budget (needed for an {class}`~innards.sae.data.ActivationStore`,
   which has no length) or run whole epochs over a cache or `DataLoader`.
 
 `k_decay_steps`, `k_initial`
@@ -49,7 +49,7 @@ Optimizers `"muon"` and `"signum"` are available (as in EleutherAI's
 
 ## Checkpoints and resuming
 
-{meth}`~sae.trainer.SAETrainer.save` writes the exported SAE (input scale
+{meth}`~innards.sae.trainer.SAETrainer.save` writes the exported SAE (input scale
 folded, EMA weights if enabled). For resuming, `checkpoint_every` writes a
 full training checkpoint (weights, optimizer and EMA state, counters, RNG):
 
@@ -70,7 +70,7 @@ jointly, so every batch holds the same tokens at every hook) and train one
 SAE per hook in the same loop:
 
 ```python
-from sae import SAEGroup
+from innards.sae import SAEGroup
 
 hooks = {f"block{i}": model.blocks[i] for i in range(12)}
 store = ActivationStore(model, hooks, loader, exclude_positions=(0,))
@@ -98,9 +98,9 @@ default follows the largest member.
 
 ## KL fine-tuning
 
-{meth}`~sae.trainer.SAETrainer.finetune_kl` trains the SAE spliced into the
+{meth}`~innards.sae.trainer.SAETrainer.finetune_kl` trains the SAE spliced into the
 model on $\tfrac12(L_{SAE} + \alpha\,KL)$ with $\alpha$ balancing the two terms,
 which shrinks the downstream loss gap at a few percent of the training budget
 (Karvonen, 2025). Configure it with
-{class}`~sae.trainer.KLFinetuneConfig` (`output_fn` maps the model output to
+{class}`~innards.sae.trainer.KLFinetuneConfig` (`output_fn` maps the model output to
 logits; `exclude_positions` and `token_mask_fn` should match training).

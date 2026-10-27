@@ -10,7 +10,7 @@ write to the MLP outputs of layer ``l`` *and every later layer*:
 
 so a feature computed once can explain the same output across several
 layers, which keeps attribution graphs small. The activation is any
-:mod:`sae.activations` entry (Ameisen et al. use JumpReLU; TopK and BatchTopK
+:mod:`innards.sae.activations` entry (Ameisen et al. use JumpReLU; TopK and BatchTopK
 work as well). Each latent's decoder vectors are unit-norm jointly over all
 layers it writes to. The loss is the mean normalised MSE over layers plus the
 activation's sparsity penalty (summed over layers) and AuxK.
@@ -98,7 +98,7 @@ FORMAT_NAME = "sae-clt"
 
 def clt_hooks(inputs: Sequence[nn.Module], outputs: Sequence[nn.Module]) -> dict[str, nn.Module]:
     """
-    Hook dict for a multi-hook :class:`~sae.data.ActivationStore` feeding a CLT.
+    Hook dict for a multi-hook :class:`~innards.sae.data.ActivationStore` feeding a CLT.
 
     Args:
         inputs: Module whose output is each layer's MLP input (e.g. the norm
@@ -125,7 +125,7 @@ class CLTConfig:
     """
     Configuration of a :class:`CrossLayerTranscoder`.
 
-    Activation-related fields mean the same as in :class:`~sae.model.SAEConfig`
+    Activation-related fields mean the same as in :class:`~innards.sae.model.SAEConfig`
     and apply to every layer.
 
     Attributes:
@@ -133,7 +133,7 @@ class CLTConfig:
         d_in: Width of the MLP inputs.
         d_sae: Latents per layer.
         d_out: Width of the MLP outputs; ``None`` means ``d_in``.
-        activation: Activation name (see :data:`sae.activations.ACTIVATIONS`).
+        activation: Activation name (see :data:`innards.sae.activations.ACTIVATIONS`).
         k: Active latents per token and layer for TopK-style activations.
         abs_topk: Signed TopK selection.
         sparsity_coeff: Penalty weight for JumpReLU / ReLU (summed over layers).
@@ -171,7 +171,7 @@ class CLTConfig:
         self.k_aux, self.aux_coeff = layer.k_aux, layer.aux_coeff
 
     def layer_config(self) -> SAEConfig:
-        """The per-layer settings as an :class:`~sae.model.SAEConfig` (used to build activations)."""
+        """The per-layer settings as an :class:`~innards.sae.model.SAEConfig` (used to build activations)."""
         return SAEConfig(
             d_in=self.d_in, d_sae=self.d_sae, activation=self.activation, k=self.k, abs_topk=self.abs_topk,
             sparsity_coeff=self.sparsity_coeff, jumprelu_bandwidth=self.jumprelu_bandwidth,
@@ -198,8 +198,8 @@ class CrossLayerTranscoder(nn.Module):
 
     Inputs are stacked per layer: ``x`` of shape ``(..., n_layers, d_in)`` (MLP
     inputs) and ``target`` of shape ``(..., n_layers, d_out)`` (MLP outputs).
-    Implements the trainer protocol of :class:`~sae.model.SAE`, so it trains
-    with :class:`~sae.trainer.SAETrainer` on batches from :func:`clt_hooks`.
+    Implements the trainer protocol of :class:`~innards.sae.model.SAE`, so it trains
+    with :class:`~innards.sae.trainer.SAETrainer` on batches from :func:`clt_hooks`.
 
     Args:
         cfg: Configuration; if ``None``, ``kwargs`` build a :class:`CLTConfig`.
@@ -357,7 +357,7 @@ class CrossLayerTranscoder(nn.Module):
             return_acts: Return the ``(..., n_layers, d_sae)`` activations.
 
         Returns:
-            An :class:`~sae.model.SAEOutput`; metrics include the mean and
+            An :class:`~innards.sae.model.SAEOutput`; metrics include the mean and
             per-layer (``layer<i>/nmse``) normalised MSE, and ``latent_counts``
             has shape ``(n_layers, d_sae)``.
 
@@ -444,7 +444,7 @@ class CrossLayerTranscoder(nn.Module):
         """
         Sets per-layer input / target scales (``E||.|| = sqrt(d)``), the output
         biases, and a global encoder scale chosen as for transcoders (see
-        :meth:`sae.model.SAE.calibrate_encoder_scale_`).
+        :meth:`innards.sae.model.SAE.calibrate_encoder_scale_`).
 
         Args:
             x: MLP inputs, ``(..., n_layers, d_in)``.
@@ -452,7 +452,7 @@ class CrossLayerTranscoder(nn.Module):
             normalize_input: Estimate the scales.
             b_dec_init: ``"geometric_median"``, ``"mean"`` or ``"zeros"``.
             calibrate_encoder: Rescale the encoder as for transcoders (see
-                :meth:`sae.model.SAE.calibrate_encoder_scale_`).
+                :meth:`innards.sae.model.SAE.calibrate_encoder_scale_`).
 
         Raises:
             ValueError: If ``b_dec_init`` is unknown.

@@ -1,5 +1,5 @@
-# Optimizers: `sae.optim`
+# Optimizers: `innards.sae.optim`
 
 ```{eval-rst}
-.. automodule:: sae.optim
+.. automodule:: innards.sae.optim
 ```

@@ -5,7 +5,7 @@ Activation harvesting for SAE training on vision and language models.
 output of one module with a forward hook, drops excluded tokens and serves
 shuffled token batches from a large buffer, so a batch mixes tokens from many
 images or sequences. The same hook utilities splice the SAE into the model for
-KL fine-tuning (see :meth:`sae.trainer.SAETrainer.finetune_kl`).
+KL fine-tuning (see :meth:`innards.sae.trainer.SAETrainer.finetune_kl`).
 
 Three activation layouts are supported:
 

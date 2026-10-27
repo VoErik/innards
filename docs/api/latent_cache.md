@@ -1,5 +1,5 @@
-# Latent cache: `sae.latent_cache`
+# Latent cache: `innards.sae.latent_cache`
 
 ```{eval-rst}
-.. automodule:: sae.latent_cache
+.. automodule:: innards.sae.latent_cache
 ```

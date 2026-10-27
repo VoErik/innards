@@ -3,9 +3,9 @@ Sparse autoencoders.
 
 :class:`SAE` is one model class assembled from three independent parts:
 
-* an **activation** (:mod:`sae.activations`): TopK, BatchTopK, JumpReLU or
+* an **activation** (:mod:`innards.sae.activations`): TopK, BatchTopK, JumpReLU or
   ReLU + L1, i.e. what usually distinguishes SAE "architectures";
-* a **decoder** (:mod:`sae.decoders`): unit-norm linear or Archetypal;
+* a **decoder** (:mod:`innards.sae.decoders`): unit-norm linear or Archetypal;
 * **loss terms** shared by all of them: normalised MSE, AuxK, Matryoshka and
   Multi-TopK.
 
@@ -15,12 +15,12 @@ Chlenski & Nanda, 2024), optionally with a linear skip connection (Paulo,
 Shabalin & Belrose, 2025).
 
 Optimization-side tricks (learning-rate schedule, optimizers, k annealing,
-sparsity warmup, KL fine-tuning, logging) live in :mod:`sae.trainer`.
+sparsity warmup, KL fine-tuning, logging) live in :mod:`innards.sae.trainer`.
 
 Typical usage::
 
     sae = SAE(d_in=768, d_sae=32768, activation="batchtopk", k=64)
-    ...  # train with sae.trainer.SAETrainer
+    ...  # train with innards.sae.trainer.SAETrainer
     sae.save("sae.safetensors")
     sae = SAE.load("sae.safetensors", device="cuda")
     acts = sae.encode(x)  # (..., d_sae), x in raw activation units
@@ -92,7 +92,7 @@ MODEL_TYPES: dict[str, type[nn.Module]] = {}
 
 
 def register_model_type(cls: type[nn.Module]) -> type[nn.Module]:
-    """Class decorator registering a trainable model for :meth:`sae.trainer.SAETrainer.from_checkpoint`."""
+    """Class decorator registering a trainable model for :meth:`innards.sae.trainer.SAETrainer.from_checkpoint`."""
     MODEL_TYPES[cls.__name__] = cls
     return cls
 
@@ -105,9 +105,9 @@ class SAEConfig:
     Attributes:
         d_in: Width of the input activations.
         d_sae: Number of latents (dictionary size).
-        activation: Name in :data:`sae.activations.ACTIVATIONS`: ``"topk"``,
+        activation: Name in :data:`innards.sae.activations.ACTIVATIONS`: ``"topk"``,
             ``"batchtopk"``, ``"jumprelu"`` or ``"relu"``.
-        decoder: Name in :data:`sae.decoders.DECODERS`: ``"linear"`` or
+        decoder: Name in :data:`innards.sae.decoders.DECODERS`: ``"linear"`` or
             ``"archetypal"``.
         k: Active latents per token (``topk``; batch average for
             ``batchtopk``). Unused by penalty-based activations.
@@ -354,9 +354,9 @@ class SAE(nn.Module):
 
     The encoder is ``f(x) = sigma(W_enc^T (x - b_dec) + b_enc)`` with the
     pre-encoder bias of Bricken et al. (2023) and ``sigma`` the configured
-    :class:`~sae.activations.Activation`. The decoder is
+    :class:`~innards.sae.activations.Activation`. The decoder is
     ``x_hat = f(x) D + b_dec`` with ``D`` from the configured
-    :class:`~sae.decoders.Decoder`.
+    :class:`~innards.sae.decoders.Decoder`.
 
     Internally the model works on ``x * input_scale``, a single scalar chosen
     so that ``E||x|| = sqrt(d_in)`` (Conerly et al., 2024). Everything the
@@ -544,7 +544,7 @@ class SAE(nn.Module):
         """Constraint projections to run after every optimizer step."""
         self.decoder.post_step()
 
-    # ---- trainer protocol (see sae.trainer.SAETrainer) ----
+    # ---- trainer protocol (see innards.sae.trainer.SAETrainer) ----
 
     def batch_tensors(self, batch: Any) -> tuple[Tensor, ...]:
         """
@@ -669,7 +669,7 @@ class SAE(nn.Module):
         return einsum(x_s.to(self.w_skip.dtype), self.w_skip, "n d_in, d_in d_out -> n d_out")
 
     def _decode(self, code: SparseCode, weight: Tensor, latent_mask: Tensor | None = None) -> Tensor:
-        """Decodes without bias, returning ``(n, d_out)`` (see :func:`~sae.activations.decode_code`)."""
+        """Decodes without bias, returning ``(n, d_out)`` (see :func:`~innards.sae.activations.decode_code`)."""
         return decode_code(code, weight, latent_mask)
 
     def _to_dense(self, code: SparseCode) -> Tensor:

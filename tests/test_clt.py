@@ -5,10 +5,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from sae.clt import CLTConfig, CrossLayerTranscoder, clt_hooks, splice_clt
-from sae.data import ActivationStore
-from sae.model import SAE
-from sae.trainer import KLFinetuneConfig, SAETrainer, TrainerConfig
+from innards.sae.clt import CLTConfig, CrossLayerTranscoder, clt_hooks, splice_clt
+from innards.sae.data import ActivationStore
+from innards.sae.model import SAE
+from innards.sae.trainer import KLFinetuneConfig, SAETrainer, TrainerConfig
 
 
 def tcfg(tmp_path, **kw):

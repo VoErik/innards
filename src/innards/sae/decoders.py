@@ -1,5 +1,5 @@
 """
-Decoder dictionaries of :class:`sae.model.SAE`.
+Decoder dictionaries of :class:`innards.sae.model.SAE`.
 
 ``SAEConfig.decoder`` selects one of:
 

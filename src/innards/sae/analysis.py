@@ -8,7 +8,7 @@ Analysis of trained SAEs:
 * and attributions.
 
 Everything here is modality-agnostic. Activations are captured with the hook
-utilities of :mod:`sae.data`, so the same functions work for ViTs, CNNs
+utilities of :mod:`innards.sae.data`, so the same functions work for ViTs, CNNs
 (``layout="bchw"``) and language models.
 
 References:

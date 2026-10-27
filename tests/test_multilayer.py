@@ -4,11 +4,11 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from sae.cache import CachedActivations, cache_activations
-from sae.data import ActivationStore
-from sae.group import SAEGroup
-from sae.model import SAE
-from sae.trainer import SAETrainer, TrainerConfig
+from innards.sae.cache import CachedActivations, cache_activations
+from innards.sae.data import ActivationStore
+from innards.sae.group import SAEGroup
+from innards.sae.model import SAE
+from innards.sae.trainer import SAETrainer, TrainerConfig
 from test_core import synthetic
 
 
