@@ -8,11 +8,12 @@ import torch
 from common import NAME, figure_path, normalisation, parse, setup, stack
 
 from innards import RowLoader, extract_to_disk, unwrap
-from innards.analysis import causal, metrics, plot
+from innards.analysis import causal, interp, metrics, plot
+from innards.edits import zero
+from innards.extract import layer_tokens
 from innards.reduce import drop
-from innards.sae import SAE, SAETrainer, TrainerConfig, analyze_dataset, latent_patch_maps, viz
-from innards.sae.analysis import encode_inputs
-from innards.sae.interventions import sae_edits, zero_ablate
+from innards.sae import SAE, SAETrainer, TrainerConfig, analyze_dataset, encode_inputs, latent_fn
+from innards.sae.interventions import sae_edits
 
 args = parse(__doc__, "vit_tiny_patch16_224.augreg_in21k_ft_in1k", n=500)
 model, data, loader = setup(args)
@@ -32,7 +33,8 @@ sae = trainer.export_model().eval()
 
 # 2. Which latents fire, and on what? (one pass over the data through the live model)
 analysis = analyze_dataset(sae, model, L, loader, exclude=prefix)
-ax = viz.plot_latent_density(analysis.stats.frequency)
+ax = plot.histogram(analysis.stats.frequency, log10=True, xlabel="log10 firing frequency", ylabel="latents",
+                    title="latent density")
 plot.save(ax.figure, figure_path(args, "sae_latent_density"))
 freq = analysis.stats.frequency
 latent = int(torch.where(freq < 0.05, freq, torch.zeros_like(freq)).argmax())   # the most frequent non-dense latent
@@ -42,14 +44,15 @@ with torch.no_grad():
                       for x, _ in loader])
 examples = peak.topk(8).indices.tolist()
 images, labels = stack(data, examples)
-maps = latent_patch_maps(sae, model, L, images.to(args.device), latent, exclude=prefix,
-                         grid=tuple(vit.patch_embed.grid_size))
+with torch.no_grad():   # the latent as a function of the layer's tokens: any direction tool takes it
+    tokens = layer_tokens(model, images.to(args.device), L)
+    maps = interp.spatial_map(tokens, latent_fn(sae, latent), tuple(vit.patch_embed.grid_size), exclude=prefix)
 fig = plot.images(images, maps=maps.cpu(), titles=[NAME[int(l)] for l in labels],
                   title=f"SAE latent {latent} at {L}: top images", **normalisation(model))
 plot.save(fig, figure_path(args, "sae_latent_top_images"))
 
 # 3. What does the latent do? Ablate it (the SAE error is kept, so only the latent changes).
-edits = sae_edits(sae, L, zero_ablate([latent]), exclude=prefix)
+edits = sae_edits(sae, L, zero([latent]), exclude=prefix)
 change = causal.effect(model, loader, edits, metrics.change(metrics.logit("label")))
 mean, lo, hi = metrics.bootstrap_ci(change)
 print(f"ablating latent {latent}: label logit change {mean:+.4f} [{lo:+.4f}, {hi:+.4f}]")

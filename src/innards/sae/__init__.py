@@ -12,9 +12,11 @@ Core modules:
 * :mod:`innards.sae.graph`: attribution graphs over spliced SAEs, transcoders and CLTs.
 * :mod:`innards.sae.dashboard`: self-contained HTML latent dashboards and graph viewers.
 * :mod:`innards.sae.optim`: Adam, Muon and Signum (I only use Adam, but sparsify use Muon / Signum as well)
-* :mod:`innards.sae.analysis`: latent statistics, top examples, dictionary
-  geometry, output effects and attributions.
-* :mod:`innards.sae.interventions`: ablating, clamping and steering latents.
+* :mod:`innards.sae.analysis`: latent statistics, top examples, attributions,
+  and :func:`latent_fn` to use latents wherever :mod:`innards.analysis` scores
+  directions.
+* :mod:`innards.sae.interventions`: splicing the SAE in, with latents edited
+  by the unit edits of :mod:`innards.edits`.
 * :mod:`innards.sae.latent_cache`: encoding a dataset once and analysing the cached
   latents (statistics, top / quantile examples, co-occurrence).
 * :mod:`innards.sae.interop`: reading and writing the SAELens format.
@@ -34,10 +36,9 @@ from .activations import (
 )
 from .analysis import (
     analyze_dataset,
+    encode_inputs,
     latent_attribution,
-    latent_patch_maps,
-    max_cosine_similarity,
-    output_effects,
+    latent_fn,
 )
 from .clt import (
     CLTConfig,
@@ -92,10 +93,9 @@ __all__ = [
     "cache_latents",
     "clt_hooks",
     "clt_site",
+    "encode_inputs",
     "latent_attribution",
-    "latent_patch_maps",
-    "max_cosine_similarity",
-    "output_effects",
+    "latent_fn",
     "register_activation",
     "sae_site",
     "clt_edits",

@@ -157,11 +157,12 @@ Analysis and interventions use the same machinery as the rest of innards:
 
 ```python
 from innards.sae import LatentCache, cache_latents
-from innards.sae.interventions import sae_edits, zero_ablate
+from innards.edits import zero
+from innards.sae.interventions import sae_edits
 
 cache = LatentCache(cache_latents(sae, model, "blocks.6", val_loader, "latents/b6", exclude=(0,)))
 cache.stats(), cache.top_examples(n_top=20), cache.quantile_examples(latent=42)
-logits, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([42]), exclude=(0,)))
+logits, _ = run(model, images, sae_edits(sae, "blocks.6", zero([42]), exclude=(0,)))
 V = sae.decoder_weight()                    # the dictionary is a set of directions for innards.analysis
 ```
 

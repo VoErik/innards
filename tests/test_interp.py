@@ -105,3 +105,25 @@ def test_attention_maps_and_rollout(vit):
     torch.testing.assert_close(I.attention_rollout([eye, eye]), torch.eye(4, dtype=torch.float64)[None])
     with pytest.raises(ValueError):
         I.attention_rollout([eye], head_fusion="median")
+
+
+def test_scores_accept_functions_and_direction_sets():
+    X = torch.randn(3, 5, 4, generator=torch.Generator().manual_seed(0))
+    V = torch.randn(2, 4, generator=torch.Generator().manual_seed(1))
+    torch.testing.assert_close(I.scores(X, V), X.double() @ V.double().T)
+    torch.testing.assert_close(I.scores(X, V[0]), X.double() @ V[0].double())
+    torch.testing.assert_close(I.scores(X, lambda t: t @ V[0]), I.scores(X, V[0]), atol=1e-6, rtol=1e-6)
+    vals, ex, pos = I.top_k(X, lambda t: t[..., 2], k=2)
+    assert vals[0] == X[..., 2].max() and X[ex[0], pos[0], 2] == vals[0]
+    maps = I.spatial_map(X[:, 1:], lambda t: t[..., :2], grid=(2, 2))
+    assert maps.shape == (3, 2, 2, 2)
+    single = I.spatial_map(X[:, 1:], lambda t: t[..., 1], grid=(2, 2))
+    torch.testing.assert_close(single, maps[:, 1])
+
+
+def test_top_outputs():
+    effects = torch.tensor([[0.5, -1.0, 2.0, 0.0], [1.0, 3.0, -2.0, -0.5]])
+    top_v, top_i, bot_v, bot_i = I.top_outputs(effects, n=2)
+    assert top_i.tolist() == [[2, 0], [1, 0]] and bot_i.tolist() == [[1, 3], [2, 3]]
+    assert top_v.tolist() == [[2.0, 0.5], [3.0, 1.0]] and bot_v.tolist() == [[-1.0, 0.0], [-2.0, -0.5]]
+    assert I.top_outputs(effects, n=10)[0].shape == (2, 4)
