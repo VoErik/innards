@@ -5,8 +5,8 @@ import json
 import pytest
 import torch
 
-from sae.interop import load_saelens, save_saelens
-from sae.model import SAE
+from innards.sae.interop import load_saelens, save_saelens
+from innards.sae.model import SAE
 
 CASES = [
     dict(activation="topk", k=6),

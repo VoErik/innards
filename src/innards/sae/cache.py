@@ -1,7 +1,7 @@
 """
 Caching harvested activations to disk as safetensors shards.
 
-Streaming from an :class:`sae.data.ActivationStore` re-runs the model
+Streaming from an :class:`innards.sae.data.ActivationStore` re-runs the model
 every epoch. Caching is worth it when the same activations are used more than
 once: several epochs, hyperparameter sweeps, or several SAEs on one layer.
 Storage is ``n_tokens * d_in * 2`` bytes in bf16, e.g. about 0.7 GB for 1.9M
@@ -16,7 +16,7 @@ Layout of a cache directory::
 
 Batches may be tensors, ``(input, target)`` pairs (fields ``activations`` /
 ``targets``) or dicts of tensors (one field per key, e.g. several layers
-from a multi-hook :class:`~sae.data.ActivationStore`); the cache serves them
+from a multi-hook :class:`~innards.sae.data.ActivationStore`); the cache serves them
 back in the same structure.
 
 Typical usage::
@@ -65,7 +65,7 @@ def cache_activations(
     Args:
         source: Iterable of activation batches ``(..., d_in)``, of
             ``(input, target)`` pairs for transcoders, or of dicts of
-            ``(..., d)`` tensors, e.g. an :class:`~sae.data.ActivationStore`
+            ``(..., d)`` tensors, e.g. an :class:`~innards.sae.data.ActivationStore`
             (whose batches are already shuffled across inputs).
         out_dir: Output directory; created if needed. Existing shards with the
             same names are overwritten.

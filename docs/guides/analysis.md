@@ -6,11 +6,11 @@ Everything here is modality-agnostic: the same functions work for ViTs, CNNs
 ## Latent statistics and examples
 
 For a single pass over a (deterministic) loader,
-{func}`~sae.analysis.analyze_dataset` returns per-latent statistics and the
+{func}`~innards.sae.analysis.analyze_dataset` returns per-latent statistics and the
 top-activating tokens:
 
 ```python
-from sae import analysis as A
+from innards.sae import analysis as A
 
 res = A.analyze_dataset(sae, model, model.blocks[6], val_loader, n_top=20, exclude_positions=(0,))
 res.stats.frequency, res.stats.dead, res.stats.dense(0.1)
@@ -18,11 +18,11 @@ res.top.unique_examples(latent)          # [(value, example index, token positio
 ```
 
 For repeated analysis, **cache the latents once** and query the cache without
-running the model again. {func}`~sae.latent_cache.cache_latents` stores the
+running the model again. {func}`~innards.sae.latent_cache.cache_latents` stores the
 sparse codes and each token's (example, position):
 
 ```python
-from sae import LatentCache, cache_latents
+from innards.sae import LatentCache, cache_latents
 
 cache = LatentCache(cache_latents(sae, model, model.blocks[6], val_loader, "latents/block6",
                                   exclude_positions=(0,)))
@@ -51,37 +51,41 @@ exact only for the final residual stream.
 
 ## Attribution
 
-{func}`~sae.analysis.latent_attribution` splices the SAE in with its error
+{func}`~innards.sae.analysis.latent_attribution` splices the SAE in with its error
 term kept (so the model is unchanged) and returns, per position and latent,
 the attribution-patching estimate of how much a scalar target drops if the
 latent is zero-ablated (Nanda, 2023; Syed et al., 2023; Marks et al., 2024).
-{func}`~sae.analysis.input_attribution` gives a pixel- or token-level saliency
-map of one latent, and {func}`~sae.analysis.latent_patch_maps` activation maps
+{func}`~innards.sae.analysis.input_attribution` gives a pixel- or token-level saliency
+map of one latent, and {func}`~innards.sae.analysis.latent_patch_maps` activation maps
 over the patch grid.
 
 ## Interventions
 
-{mod}`sae.interventions` makes causal edits with the error term kept, so only
-the edit changes the model:
+{mod}`innards.sae.interventions` makes causal edits with the error term kept, so only
+the edit changes the model. {func}`~innards.sae.interventions.sae_edits` returns edits
+for {func}`innards.edits.run` (see [Interventions](interventions.md)), which applies them
+in one nnsight trace:
 
 ```python
-from sae.interventions import clamp, mean_ablate, scale, splice_sae, steer, zero_ablate
+from innards.edits import rows, run, steer
+from innards.sae.interventions import clamp, mean_ablate, sae_edits, scale, zero_ablate
 
-with splice_sae(sae, model.blocks[6], zero_ablate([42]), exclude_positions=(0,)):
-    ablated = model(images)
-with splice_sae(sae, model.blocks[6], clamp(42, value=5 * stats.max_activation[42])):
-    clamped = model(images)
-with steer(model.blocks[6], sae.decoder_weight()[42], alpha=8.0):   # no SAE needed; works in generation
-    out = model.generate(**inputs)
+ablated, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([42]), exclude_positions=(0,)))
+clamped, _ = run(model, images, sae_edits(sae, "blocks.6", clamp(42, value=5 * stats.max_activation[42])))
+steered, _ = run(model, images, {"blocks.6": rows(steer(sae.decoder_weight()[42], 8.0), exclude=(0,))})
 ```
+
+For a transcoder pass ``target=`` (the layer whose output it replaces).
+Modules work in place of layer names when ``model=`` is given, e.g.
+``sae_edits(sae, model.blocks[6], model=model)``.
 
 ## Dashboards
 
-{mod}`sae.dashboard` writes self-contained HTML pages (no server, no network,
+{mod}`innards.sae.dashboard` writes self-contained HTML pages (no server, no network,
 light and dark themes):
 
 ```python
-from sae.dashboard import image_renderer, save_latent_dashboard, text_renderer
+from innards.sae.dashboard import image_renderer, save_latent_dashboard, text_renderer
 
 save_latent_dashboard("dashboard.html", cache, text_renderer(val_tokens),
                       sae=sae, readout=unembed, output_labels=vocab)
@@ -100,7 +104,7 @@ with `max_latents`.
 
 ## Plots
 
-{mod}`sae.viz` (needs the `viz` extra) draws latent density, max cosine
+{mod}`innards.sae.viz` (needs the `viz` extra) draws latent density, max cosine
 similarity, dictionary maps, similarity matrices, output effects,
 attribution bars, image heatmap overlays and top-image grids on matplotlib
 axes, and HTML token views for notebooks.

@@ -1,5 +1,5 @@
-# Interventions: `sae.interventions`
+# Interventions: `innards.sae.interventions`
 
 ```{eval-rst}
-.. automodule:: sae.interventions
+.. automodule:: innards.sae.interventions
 ```

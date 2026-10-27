@@ -7,7 +7,7 @@ lets the analysis code here run on published SAEs. The SAELens package itself
 is not needed.
 
 ```python
-from sae.interop import load_saelens, save_saelens
+from innards.sae.interop import load_saelens, save_saelens
 
 save_saelens(sae, "export/blocks.6", metadata={"model_name": "vit_tiny", "hook_name": "blocks.6"})
 sae, cfg = load_saelens("path/to/saelens/sae")   # cfg["metadata"]["hook_name"], ...

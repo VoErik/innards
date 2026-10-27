@@ -1,5 +1,5 @@
-# Activation cache: `sae.cache`
+# Activation cache: `innards.sae.cache`
 
 ```{eval-rst}
-.. automodule:: sae.cache
+.. automodule:: innards.sae.cache
 ```

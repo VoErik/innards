@@ -5,7 +5,7 @@
 The project is managed with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv sync                    # core: torch, einops, safetensors, numpy
+uv sync                    # core: torch, nnsight, einops, safetensors, numpy
 uv sync --extra viz        # + matplotlib plots
 uv sync --extra notebooks  # everything the example notebooks need
 uv sync --extra wandb      # or mlflow / tensorboard, for experiment logging
@@ -23,13 +23,13 @@ models; only the hook point and the tokens to exclude change.
 
 ### 1. Harvest activations
 
-{class}`~sae.data.ActivationStore` runs the frozen model, captures the output
-of one module with a forward hook, drops excluded tokens and serves shuffled
+{class}`~innards.sae.data.ActivationStore` runs the frozen model, reads the output
+of one module with nnsight, drops excluded tokens and serves shuffled
 token batches from a large buffer:
 
 ```python
 import torch
-from sae import ActivationStore
+from innards.sae import ActivationStore
 
 store = ActivationStore(
     model=model,
@@ -52,7 +52,7 @@ more than once (several epochs, sweeps, several SAEs on one layer), cache
 them to disk:
 
 ```python
-from sae import CachedActivations, cache_activations
+from innards.sae import CachedActivations, cache_activations
 
 cache_activations(store, "activations/block6", metadata={"hook": "blocks.6"})
 acts = CachedActivations("activations/block6", batch_tokens=4096, device="cuda")
@@ -61,7 +61,7 @@ acts = CachedActivations("activations/block6", batch_tokens=4096, device="cuda")
 ### 3. Train
 
 ```python
-from sae import SAE, SAETrainer, TrainerConfig
+from innards.sae import SAE, SAETrainer, TrainerConfig
 
 sae = SAE(d_in=768, d_sae=16 * 768, activation="batchtopk", k=32)
 trainer = SAETrainer(sae, TrainerConfig(num_epochs=5, loggers=("tensorboard",)))
@@ -78,7 +78,7 @@ at the end. See [Training](guides/training.md) for the knobs.
 
 ```python
 import torch.nn.functional as F
-from sae import KLFinetuneConfig
+from innards.sae import KLFinetuneConfig
 
 def next_token_loss(out, batch):        # e.g. for a Hugging Face causal LM
     logits, ids = out.logits[:, :-1], batch["input_ids"][:, 1:]

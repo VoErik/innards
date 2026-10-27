@@ -17,7 +17,7 @@ Layout of a cache directory::
 ``token`` indexes the shard's tokens; a token's global id is the shard's
 ``token_offset`` plus that index. ``example`` is the input's index in loader
 order and ``position`` its token position (counting excluded positions), as in
-:class:`sae.analysis.TopExamples`.
+:class:`innards.sae.analysis.TopExamples`.
 
 References:
     Bricken, T. et al. (2023). Towards Monosemanticity: Decomposing Language
@@ -67,7 +67,7 @@ META_NAME = "meta.json"
 def cache_latents(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module,
+    hook_module: nn.Module | str,
     input_loader: Iterable,
     out_dir: str | Path,
     layout: str = "btd",
@@ -89,7 +89,7 @@ def cache_latents(
     Args:
         sae: The SAE.
         model: The model the SAE was trained on.
-        hook_module: Module whose output the SAE reads.
+        hook_module: Module (or layer name) whose output the SAE reads.
         input_loader: Iterable of model inputs.
         out_dir: Output directory; created if needed.
         layout: Activation layout at the hook.
@@ -134,7 +134,7 @@ def cache_latents(
         if max_batches is not None and i >= max_batches:
             break
         batch = _to_device(batch, device)
-        tokens = to_tokens(run_capture(model, hook_module, batch, input_fn, stop=True), layout)
+        tokens = to_tokens(run_capture(model, hook_module, batch, input_fn), layout)
         b, t, _ = tokens.shape
         keep = token_keep_mask(tokens, exclude_positions, token_mask_fn, batch)
         flat_idx = rearrange(keep, "b t -> (b t)").nonzero().squeeze(-1)
@@ -238,10 +238,10 @@ class LatentCache:
 
     def stats(self) -> LatentStats:
         """
-        Per-latent statistics, as in :func:`sae.analysis.analyze_dataset`.
+        Per-latent statistics, as in :func:`innards.sae.analysis.analyze_dataset`.
 
         Returns:
-            A :class:`~sae.analysis.LatentStats`.
+            A :class:`~innards.sae.analysis.LatentStats`.
         """
         count = torch.zeros(self.d_sae)
         total = torch.zeros(self.d_sae)
@@ -266,7 +266,7 @@ class LatentCache:
             n_top: Tokens kept per latent.
 
         Returns:
-            A :class:`~sae.analysis.TopExamples`; empty slots have value 0
+            A :class:`~innards.sae.analysis.TopExamples`; empty slots have value 0
             and example / position -1.
         """
         lat = torch.zeros(0, dtype=torch.long)

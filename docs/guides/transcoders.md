@@ -9,7 +9,7 @@ a model whose MLPs are sparse and linear given the active latents, which is
 what makes [attribution graphs](circuits.md) clean.
 
 ```python
-from sae import SAE, ActivationStore, SAETrainer, TrainerConfig
+from innards.sae import SAE, ActivationStore, SAETrainer, TrainerConfig
 
 layer = model.gpt_neox.layers[3]
 store = ActivationStore(model, layer.post_attention_layernorm, loader,
@@ -46,7 +46,8 @@ so a feature computed once can explain the same output across several
 layers, which keeps attribution graphs small.
 
 ```python
-from sae import CrossLayerTranscoder, clt_hooks, splice_clt
+from innards.edits import run
+from innards.sae import CrossLayerTranscoder, clt_edits, clt_hooks
 
 layers = model.gpt_neox.layers
 ins = [l.post_attention_layernorm for l in layers]
@@ -59,13 +60,12 @@ trainer.train(store)
 trainer.evaluate(val_store)        # eval/fve and eval/layer<i>/fve, eval/layer<i>/l0
 trainer.evaluate_downstream(model, ins, val_loader, kl_cfg, target_module=outs, loss_fn=...)
 
-with splice_clt(clt, ins, outs):   # run the replacement model
-    logits = model(**inputs)
+logits, _ = run(model, inputs, clt_edits(clt, ins, outs, model=model))   # the replacement model
 ```
 
 Any registered activation works (Ameisen et al. use JumpReLU). Each latent's
 decoder vectors are unit-norm jointly over all layers it writes to; AuxK is
-applied per layer; `splice_clt` can keep each layer's error term and edit
+applied per layer; `clt_edits` can keep each layer's error term and edit
 latents (`edit=lambda layer, acts: ...`). The CLT keeps its per-layer scales
 as buffers (its latents write to layers with different scales), so its
 activations are in normalized units.

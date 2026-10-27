@@ -1,5 +1,5 @@
-# Plots: `sae.viz`
+# Plots: `innards.sae.viz`
 
 ```{eval-rst}
-.. automodule:: sae.viz
+.. automodule:: innards.sae.viz
 ```

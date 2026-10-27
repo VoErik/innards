@@ -29,7 +29,7 @@ matters, and where it would go.
 
 - **KL fine-tuning for CLTs (`sae/trainer.py`, `sae/clt.py`).**
   `SAETrainer.finetune_kl` supports single SAEs and transcoders only. For a
-  CLT, the patched pass must splice all layers at once (as `splice_clt` does)
+  CLT, the patched pass must splice all layers at once (as `clt_edits` does)
   while collecting every layer's inputs and outputs to compute the CLT loss
   next to the KL term.
 
@@ -38,5 +38,5 @@ matters, and where it would go.
 - **Auto-interpretation.** LLM-written explanations of latents scored by
   detection / fuzzing (as in EleutherAI's `delphi`), built on the latent cache
   (`LatentCache.top_examples`, `quantile_examples`).
-- **SAEBench runs.** Export with `sae.interop.save_saelens` and run SAEBench's
+- **SAEBench runs.** Export with `innards.sae.interop.save_saelens` and run SAEBench's
   absorption, sparse probing, RAVEL, etc.; document the setup.

@@ -6,14 +6,14 @@ Both functions write a single HTML file with inline CSS, JavaScript and data
 hosted anywhere. Pages follow the system light / dark preference.
 
 * :func:`save_latent_dashboard` builds a browsable feature dashboard from a
-  :class:`~sae.latent_cache.LatentCache` (Bricken et al., 2023): an index with
+  :class:`~innards.sae.latent_cache.LatentCache` (Bricken et al., 2023): an index with
   a searchable, sortable table of latents and one page per latent with
   statistics, an activation histogram, top examples, examples sampled across
   activation quantiles, nearest latents and output effects. How an example is
   shown is up to a *renderer*: :func:`text_renderer` for token sequences,
   :func:`image_renderer` for images with patch heatmaps, or your own
   ``fn(example, position, token_acts, vmax) -> html``.
-* :func:`save_graph_html` draws an :class:`~sae.graph.AttributionGraph` with
+* :func:`save_graph_html` draws an :class:`~innards.sae.graph.AttributionGraph` with
   sites as rows and token positions as columns; edges can be filtered by
   strength and a clicked node shows its strongest inputs and outputs.
 
@@ -258,7 +258,7 @@ def latent_dashboard_html(
     Builds a self-contained latent dashboard page.
 
     Args:
-        cache: Latent cache (see :func:`sae.latent_cache.cache_latents`).
+        cache: Latent cache (see :func:`innards.sae.latent_cache.cache_latents`).
         render: Example renderer; ``None`` shows example and position only.
         latents: Latents to include; ``None`` takes the ``max_latents`` most
             frequent live latents.

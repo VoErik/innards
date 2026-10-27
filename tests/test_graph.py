@@ -4,11 +4,15 @@ import pytest
 import torch
 from torch import nn
 
-from sae.clt import CrossLayerTranscoder, splice_clt
-from sae.data import capture_activation, splice
-from sae.graph import attribution_graph, clt_site, sae_site
-from sae.interventions import splice_sae
-from sae.model import SAE
+from _hooks import capture_output
+from innards.edits import (
+    cross,
+    run
+)
+from innards.sae.clt import CrossLayerTranscoder, clt_edits
+from innards.sae.graph import attribution_graph, clt_site, sae_site
+from innards.sae.interventions import splice_fn
+from innards.sae.model import SAE
 
 
 class ToyMixNet(nn.Module):
@@ -35,7 +39,7 @@ class ToyMixNet(nn.Module):
 
 
 def _pairs(net, layer, inputs):
-    with torch.no_grad(), capture_activation(net.inp[layer]) as a, capture_activation(net.mlps[layer]) as b:
+    with torch.no_grad(), capture_output(net.inp[layer]) as a, capture_output(net.mlps[layer]) as b:
         net(inputs)
     return a["act"].reshape(-1, 16), b["act"].reshape(-1, 16)
 
@@ -49,11 +53,11 @@ def _transcoders(net, inputs, **kw):
     return tcs
 
 
-def _pre(net, sae, layer, x, run_ctx):
-    """Pre-activations of ``sae`` at layer ``layer``'s MLP input, under ``run_ctx``."""
-    with torch.no_grad(), run_ctx, capture_activation(net.inp[layer]) as cap:
-        net(x)
-        return sae.pre_activations(cap["act"])[0]  # (tokens, d_sae)
+def _pre(net, sae, layer, x, edits=None):
+    """Pre-activations of ``sae`` at layer ``layer``'s MLP input, with ``edits`` applied."""
+    with torch.no_grad():
+        _, reads = run(net, x, edits, read=f"inp.{layer}")
+        return sae.pre_activations(reads[f"inp.{layer}"])[0]  # (tokens, d_sae)
 
 
 # Edges are *direct* effects: intermediate latents and errors stay fixed. Re-running the model after
@@ -81,10 +85,9 @@ def test_transcoder_graph_is_exact(kw):
 
     # Completeness: the metric is linear in the leaves, so attributions sum to m - m(all leaves = 0).
     def zero_leaves(i):  # latents and error 0: the MLP output becomes the bias (+ skip of the actual input)
-        return splice(net.inp[i], lambda x_, y_: tcs[i].decode(torch.zeros(len(x_), 64)) + tcs[i].skip(x_),
-                      net.mlps[i])
-    with torch.no_grad(), zero_leaves(0), zero_leaves(1), zero_leaves(2):
-        baseline = METRIC(net(x), None).item()
+        return cross(f"inp.{i}", f"mlps.{i}", lambda x_, y_: tcs[i].decode(torch.zeros(len(x_), 64)) + tcs[i].skip(x_))
+    with torch.no_grad():
+        baseline = METRIC(run(net, x, {**zero_leaves(0), **zero_leaves(1), **zero_leaves(2)})[0], None).item()
     if not kw.get("skip_connection"):  # with a skip, the zero-leaf model is not the linearization point
         assert graph.attributions.sum().item() == pytest.approx(clean - baseline, rel=1e-4, abs=1e-5)
 
@@ -103,8 +106,8 @@ def test_transcoder_graph_is_exact(kw):
             acts[row, lat] = 0
             return acts
 
-        ablated = _pre(net, tcs[d], d, x, splice_sae(tcs[s], net.inp[s], edit, target_module=net.mlps[s]))
-        before = _pre(net, tcs[d], d, x, splice_sae(tcs[s], net.inp[s], target_module=net.mlps[s]))
+        ablated = _pre(net, tcs[d], d, x, cross(f"inp.{s}", f"mlps.{s}", splice_fn(tcs[s], edit)))
+        before = _pre(net, tcs[d], d, x, cross(f"inp.{s}", f"mlps.{s}", splice_fn(tcs[s])))
         assert before[dst.position, dst.latent] - ablated[dst.position, dst.latent] == pytest.approx(w, rel=1e-4,
                                                                                                     abs=1e-6)
         checked += 1
@@ -121,8 +124,8 @@ def test_transcoder_graph_is_exact(kw):
         out[row] = tcs[s].reconstruct(x_[row])
         return out
 
-    ablated = _pre(net, tcs[d], d, x, splice(net.inp[s], drop_error, net.mlps[s]))
-    before = _pre(net, tcs[d], d, x, torch.no_grad())
+    ablated = _pre(net, tcs[d], d, x, cross(f"inp.{s}", f"mlps.{s}", drop_error))
+    before = _pre(net, tcs[d], d, x)
     assert before[dst.position, dst.latent] - ablated[dst.position, dst.latent] == pytest.approx(w, rel=1e-4, abs=1e-6)
 
 
@@ -139,14 +142,15 @@ def test_clt_graph_is_exact():
     graph = attribution_graph(net, [clt_site(clt, ins, outs)], x, METRIC, max_nodes=10_000)
     clean = METRIC(net(x), None).item()
     assert graph.metric == pytest.approx(clean, abs=1e-5)
-    with torch.no_grad(), splice_clt(clt, ins, outs, edit=lambda layer, a: torch.zeros_like(a)):
-        baseline = METRIC(net(x), None).item()  # all latents and errors 0
+    with torch.no_grad():  # all latents and errors 0
+        baseline = METRIC(run(net, x, clt_edits(clt, ins, outs, edit=lambda layer, a: torch.zeros_like(a),
+                                                model=net))[0], None).item()
     assert graph.attributions.sum().item() == pytest.approx(clean - baseline, rel=1e-4, abs=1e-5)
 
-    def clt_pre(layer, ctx):
-        with torch.no_grad(), ctx, capture_activation(net.inp[layer]) as cap:
-            net(x)
-        x_s = cap["act"][0] * clt.input_scale[layer]
+    def clt_pre(layer, edits):
+        with torch.no_grad():
+            _, reads = run(net, x, edits, read=f"inp.{layer}")
+        x_s = reads[f"inp.{layer}"][0] * clt.input_scale[layer]
         return x_s @ clt.w_enc[layer] + clt.b_enc[layer]
 
     sites_seen = set()
@@ -164,8 +168,8 @@ def test_clt_graph_is_exact():
                 acts[row, lat] = 0
             return acts
 
-        delta = clt_pre(d, splice_clt(clt, ins, outs, keep_error=True))[dst.position, dst.latent] - \
-            clt_pre(d, splice_clt(clt, ins, outs, keep_error=True, edit=edit))[dst.position, dst.latent]
+        delta = clt_pre(d, clt_edits(clt, ins, outs, keep_error=True, model=net))[dst.position, dst.latent] - \
+            clt_pre(d, clt_edits(clt, ins, outs, keep_error=True, edit=edit, model=net))[dst.position, dst.latent]
         assert delta.item() == pytest.approx(w, rel=1e-4, abs=1e-6)
     assert sites_seen == {(0, 1), (1, 2)}
     assert any(s.site == "clt.0" and d.site == "clt.2" for s, d, _ in graph.edges(1e-6))  # cross-layer edges
@@ -177,7 +181,7 @@ def test_residual_sae_graph_prune_and_export():
     inputs = torch.randn(64, 5, 8)
     saes = []
     for layer in range(2):
-        with torch.no_grad(), capture_activation(net.inp[layer]) as cap:
+        with torch.no_grad(), capture_output(net.inp[layer]) as cap:
             net(inputs)
         sae = SAE(d_in=16, d_sae=64, k=4)
         sae.initialize_from_data(cap["act"].reshape(-1, 16))

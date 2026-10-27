@@ -1,5 +1,5 @@
-# Multi-layer training: `sae.group`
+# Multi-layer training: `innards.sae.group`
 
 ```{eval-rst}
-.. automodule:: sae.group
+.. automodule:: innards.sae.group
 ```

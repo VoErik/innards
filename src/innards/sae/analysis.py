@@ -8,7 +8,7 @@ Analysis of trained SAEs:
 * and attributions.
 
 Everything here is modality-agnostic. Activations are captured with the hook
-utilities of :mod:`sae.data`, so the same functions work for ViTs, CNNs
+utilities of :mod:`innards.sae.data`, so the same functions work for ViTs, CNNs
 (``layout="bchw"``) and language models.
 
 References:
@@ -50,14 +50,17 @@ from torch import (
     nn
 )
 
+from ..edits import (
+    cross,
+    keep_mask,
+    run
+)
+from ..models import layer_name
 from .data import (
     _to_device,
-    capture_activation,
     default_input_fn,
     keep_positions,
-    replace_activation,
     run_capture,
-    splice,
     to_tokens,
     token_keep_mask,
 )
@@ -271,7 +274,7 @@ def tokens_to_grid(values: Tensor, grid: tuple[int, int] | None = None) -> Tenso
 def encode_inputs(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module,
+    hook_module: nn.Module | str,
     batch: Any,
     layout: str = "btd",
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
@@ -282,7 +285,7 @@ def encode_inputs(
     Args:
         sae: The SAE (put in eval mode).
         model: The model the SAE was trained on.
-        hook_module: Module whose output the SAE reads.
+        hook_module: Module (or layer name) whose output the SAE reads.
         batch: Model inputs, already on the right device.
         layout: Activation layout at the hook.
         input_fn: Maps the batch to model ``(args, kwargs)``.
@@ -293,7 +296,7 @@ def encode_inputs(
     """
     sae.eval()
     model.eval()
-    act = run_capture(model, hook_module, batch, input_fn, stop=True)
+    act = run_capture(model, hook_module, batch, input_fn)
     return sae.encode(to_tokens(act, layout).to(sae.w_enc.dtype))
 
 
@@ -301,7 +304,7 @@ def encode_inputs(
 def analyze_dataset(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module,
+    hook_module: nn.Module | str,
     input_loader: Iterable,
     n_top: int = 16,
     layout: str = "btd",
@@ -323,7 +326,7 @@ def analyze_dataset(
     Args:
         sae: The SAE.
         model: The model the SAE was trained on.
-        hook_module: Module whose output the SAE reads.
+        hook_module: Module (or layer name) whose output the SAE reads.
         input_loader: Iterable of model inputs.
         n_top: Number of top tokens kept per latent.
         layout: Activation layout at the hook.
@@ -355,7 +358,7 @@ def analyze_dataset(
         if max_batches is not None and i >= max_batches:
             break
         batch = _to_device(batch, device)
-        tokens = to_tokens(run_capture(model, hook_module, batch, input_fn, stop=True), layout)
+        tokens = to_tokens(run_capture(model, hook_module, batch, input_fn), layout)
         b, t, _ = tokens.shape
         keep = token_keep_mask(tokens, exclude_positions, token_mask_fn, batch)
         flat_idx = rearrange(keep, "b t -> (b t)").nonzero().squeeze(-1)  # into the (b t) grid
@@ -559,14 +562,14 @@ def output_effects(
 def latent_attribution(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module,
+    hook_module: nn.Module | str,
     batch: Any,
     target_fn: Callable[[Any, Any], Tensor],
     layout: str = "btd",
     exclude_positions: Sequence[int] = (),
     token_mask_fn: Callable[[Any], Tensor] | None = None,
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
-    target_module: nn.Module | None = None,
+    target_module: nn.Module | str | None = None,
 ) -> Attribution:
     """
     Attributes a scalar model output to SAE latents at every position.
@@ -580,7 +583,7 @@ def latent_attribution(
     Args:
         sae: The SAE.
         model: The model the SAE was trained on.
-        hook_module: Module whose output the SAE reads.
+        hook_module: Module (or layer name) whose output the SAE reads.
         batch: Model inputs, already on the right device.
         target_fn: ``fn(model_output, batch) -> (batch,)`` scalar per
             example, e.g. the logit of the predicted class, or of the correct
@@ -600,6 +603,9 @@ def latent_attribution(
     """
     sae.eval()
     model.eval()
+    name = layer_name(model, hook_module)
+    target = name if target_module is None else layer_name(model, target_module)
+    mask = token_mask_fn(batch) if token_mask_fn is not None else None
     store: dict[str, Tensor] = {}
 
     def splice_fn(x: Tensor, y: Tensor) -> Tensor:
@@ -613,15 +619,18 @@ def latent_attribution(
         store.update(acts=acts, error=error)
         return recon + skip + error
 
-    def read_keep(act: Tensor) -> Tensor:
-        store["keep"] = token_keep_mask(to_tokens(act, layout), exclude_positions, token_mask_fn, batch)
-        return act
+    edits = cross(name, target, splice_fn, exclude_positions, mask)
+    write = edits[target]
 
-    args, kwargs = input_fn(batch)
-    with _frozen(model, sae), replace_activation(hook_module, read_keep), \
-            splice(hook_module, splice_fn, target_module, layout, exclude_positions, token_mask_fn, batch):
-        target = target_fn(model(*args, **kwargs), batch)
-        target.sum().backward()
+    def record_keep(tokens: Tensor) -> Tensor:
+        store["keep"] = keep_mask(tokens, exclude_positions, mask)
+        return write(tokens)
+
+    edits[target] = record_keep
+    with _frozen(model, sae):
+        out, _ = run(model, batch, edits, layouts=layout, input_fn=input_fn)
+        target_value = target_fn(out, batch)
+        target_value.sum().backward()
     acts, error, keep = store["acts"], store["error"], store["keep"]
 
     def scatter(values: Tensor) -> Tensor:
@@ -634,14 +643,14 @@ def latent_attribution(
         attribution=scatter((acts * acts.grad).detach()),
         error_attribution=scatter((error * error.grad).sum(-1).detach()),
         keep=keep,
-        target=target.detach(),
+        target=target_value.detach(),
     )
 
 
 def input_attribution(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module,
+    hook_module: nn.Module | str,
     inputs: Tensor,
     latent: int,
     layout: str = "btd",
@@ -657,7 +666,7 @@ def input_attribution(
     Args:
         sae: The SAE.
         model: The model, called as ``model(inputs)``.
-        hook_module: Module whose output the SAE reads.
+        hook_module: Module (or layer name) whose output the SAE reads.
         inputs: Float input tensor, e.g. images ``(batch, 3, H, W)``.
         latent: Latent index.
         layout: Activation layout at the hook.
@@ -673,9 +682,7 @@ def input_attribution(
     model.eval()
     x = inputs.detach().clone().requires_grad_(True)
     with _frozen(model, sae):
-        with capture_activation(hook_module, stop=False) as store:
-            model(x)
-        tokens = to_tokens(store["act"], layout)
+        tokens = to_tokens(run_capture(model, hook_module, x), layout)
         pos = keep_positions(tokens.shape[1], exclude_positions, tokens.device)
         kept = tokens[:, pos].to(sae.w_enc.dtype)
         values = sae.pre_activations(kept) if use_preactivation else sae.encode(kept)
@@ -687,7 +694,7 @@ def input_attribution(
 def latent_patch_maps(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module,
+    hook_module: nn.Module | str,
     images: Tensor,
     latents: int | Sequence[int],
     exclude_positions: Sequence[int] = (0,),
@@ -700,7 +707,7 @@ def latent_patch_maps(
     Args:
         sae: The SAE.
         model: A ViT (``layout="btd"``) or CNN (``layout="bchw"``).
-        hook_module: Module whose output the SAE reads.
+        hook_module: Module (or layer name) whose output the SAE reads.
         images: Images ``(batch, 3, H, W)`` on the model's device.
         latents: One latent or a list of latents.
         exclude_positions: Non-patch tokens to drop (CLS, registers). Ignored
@@ -713,7 +720,7 @@ def latent_patch_maps(
         Maps of shape ``(batch, h, w)`` for one latent, or
         ``(batch, n_latents, h, w)`` for a list.
     """
-    act = run_capture(model, hook_module, images, default_input_fn, stop=True)
+    act = run_capture(model, hook_module, images)
     if layout == "bchw":
         grid = grid or (act.shape[2], act.shape[3])
         exclude_positions = ()

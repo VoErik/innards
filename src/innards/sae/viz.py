@@ -2,7 +2,7 @@
 Plots and HTML views for SAE analysis (needs the ``viz`` extra).
 
 Plotting functions take arrays or tensors computed by
-:mod:`sae.analysis` and draw on a matplotlib ``Axes`` (a new figure is
+:mod:`innards.sae.analysis` and draw on a matplotlib ``Axes`` (a new figure is
 created when ``ax`` is ``None``), so they compose into custom figures. Text
 views return HTML strings; :func:`show_html` displays them in Jupyter.
 
@@ -83,7 +83,7 @@ def plot_max_cosine_similarity(values: Tensor | np.ndarray, ax: Axes | None = No
     Histogram of each atom's highest cosine similarity to another atom.
 
     Args:
-        values: Output of :func:`sae.analysis.max_cosine_similarity`.
+        values: Output of :func:`innards.sae.analysis.max_cosine_similarity`.
         ax: Axes to draw on.
         bins: Number of histogram bins.
 
@@ -108,7 +108,7 @@ def plot_dictionary_map(
     """Scatter plot of a 2-D embedding of the decoder atoms.
 
     Args:
-        coords: Output of :func:`sae.analysis.dictionary_embedding`.
+        coords: Output of :func:`innards.sae.analysis.dictionary_embedding`.
         color: Optional per-latent values for the colour scale, e.g.
             ``log10(frequency)``.
         color_label: Colour-bar label.
@@ -138,7 +138,7 @@ def plot_similarity_matrix(matrix: Tensor | np.ndarray, latents: Sequence[int], 
     Heatmap of pairwise decoder cosine similarities.
 
     Args:
-        matrix: Output of :func:`sae.analysis.decoder_similarity_matrix`.
+        matrix: Output of :func:`innards.sae.analysis.decoder_similarity_matrix`.
         latents: Latent ids, for tick labels.
         ax: Axes to draw on.
 
@@ -166,7 +166,7 @@ def plot_output_effects(
     """
     Bar chart of the outputs a latent promotes and suppresses.
 
-    Pass one row of :class:`sae.analysis.OutputEffects`.
+    Pass one row of :class:`innards.sae.analysis.OutputEffects`.
 
     Args:
         top_values: Largest effects, shape ``(n,)``.
@@ -269,7 +269,7 @@ def overlay_heatmap(
     Args:
         image: ``(H, W, 3)`` image in [0, 1] (see :func:`to_display_image`).
         heat: Patch grid ``(h, w)``, e.g. from
-            :func:`sae.analysis.latent_patch_maps`.
+            :func:`innards.sae.analysis.latent_patch_maps`.
         ax: Axes to draw on.
         alpha: Maximum heatmap opacity; opacity scales with the magnitude.
         cmap: Colour map; defaults to ``"inferno"``, or ``"RdBu_r"`` when

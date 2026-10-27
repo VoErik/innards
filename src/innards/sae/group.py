@@ -3,9 +3,9 @@ Training one SAE per hook point from a single pass over the model.
 
 Harvesting is usually the expensive part of SAE training, so it pays to
 capture many layers at once (as EleutherAI's ``sparsify`` does): a
-multi-hook :class:`~sae.data.ActivationStore` yields dict batches, and an
+multi-hook :class:`~innards.sae.data.ActivationStore` yields dict batches, and an
 :class:`SAEGroup` holding one SAE per key trains them all in one loop with
-:class:`~sae.trainer.SAETrainer`. Members never share parameters, so they
+:class:`~innards.sae.trainer.SAETrainer`. Members never share parameters, so they
 train independently; only gradient clipping and the learning-rate schedule
 are shared.
 
@@ -44,9 +44,9 @@ class SAEGroup(nn.Module):
     """
     Several SAEs trained together on dict batches, one per key.
 
-    Implements the trainer protocol of :class:`~sae.model.SAE` (batch
+    Implements the trainer protocol of :class:`~innards.sae.model.SAE` (batch
     unpacking, initialization, k annealing, saving), so it trains with
-    :class:`~sae.trainer.SAETrainer` like a single SAE. The loss is the sum of
+    :class:`~innards.sae.trainer.SAETrainer` like a single SAE. The loss is the sum of
     the members' losses; metrics are prefixed with the member names.
 
     Args:
@@ -94,7 +94,7 @@ class SAEGroup(nn.Module):
             return_acts: Passed to the members.
 
         Returns:
-            An :class:`~sae.model.SAEOutput` with the summed loss, prefixed
+            An :class:`~innards.sae.model.SAEOutput` with the summed loss, prefixed
             metrics, concatenated latent counts and the members' outputs in
             ``parts``.
         """

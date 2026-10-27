@@ -10,7 +10,7 @@ write to the MLP outputs of layer ``l`` *and every later layer*:
 
 so a feature computed once can explain the same output across several
 layers, which keeps attribution graphs small. The activation is any
-:mod:`sae.activations` entry (Ameisen et al. use JumpReLU; TopK and BatchTopK
+:mod:`innards.sae.activations` entry (Ameisen et al. use JumpReLU; TopK and BatchTopK
 work as well). Each latent's decoder vectors are unit-norm jointly over all
 layers it writes to. The loss is the mean normalised MSE over layers plus the
 activation's sparsity penalty (summed over layers) and AuxK.
@@ -40,12 +40,7 @@ import json
 import math
 from collections.abc import (
     Callable,
-    Iterator,
     Sequence
-)
-from contextlib import (
-    ExitStack,
-    contextmanager
 )
 from dataclasses import (
     asdict,
@@ -69,20 +64,23 @@ from safetensors.torch import (
     load_file,
     save_file
 )
+from nnsight.intervention.envoy import Envoy
 from torch import (
     Tensor,
     nn
 )
 
+from ..edits import (
+    Edit,
+    compose,
+    rows
+)
+from ..models import layer_name
 from .activations import (
     ACTIVATIONS,
     SparseCode,
     decode_code,
     rowwise_topk
-)
-from .data import (
-    patch_kept_tokens,
-    replace_activation
 )
 from .model import (
     SAEConfig,
@@ -98,7 +96,7 @@ FORMAT_NAME = "sae-clt"
 
 def clt_hooks(inputs: Sequence[nn.Module], outputs: Sequence[nn.Module]) -> dict[str, nn.Module]:
     """
-    Hook dict for a multi-hook :class:`~sae.data.ActivationStore` feeding a CLT.
+    Hook dict for a multi-hook :class:`~innards.sae.data.ActivationStore` feeding a CLT.
 
     Args:
         inputs: Module whose output is each layer's MLP input (e.g. the norm
@@ -125,7 +123,7 @@ class CLTConfig:
     """
     Configuration of a :class:`CrossLayerTranscoder`.
 
-    Activation-related fields mean the same as in :class:`~sae.model.SAEConfig`
+    Activation-related fields mean the same as in :class:`~innards.sae.model.SAEConfig`
     and apply to every layer.
 
     Attributes:
@@ -133,7 +131,7 @@ class CLTConfig:
         d_in: Width of the MLP inputs.
         d_sae: Latents per layer.
         d_out: Width of the MLP outputs; ``None`` means ``d_in``.
-        activation: Activation name (see :data:`sae.activations.ACTIVATIONS`).
+        activation: Activation name (see :data:`innards.sae.activations.ACTIVATIONS`).
         k: Active latents per token and layer for TopK-style activations.
         abs_topk: Signed TopK selection.
         sparsity_coeff: Penalty weight for JumpReLU / ReLU (summed over layers).
@@ -171,7 +169,7 @@ class CLTConfig:
         self.k_aux, self.aux_coeff = layer.k_aux, layer.aux_coeff
 
     def layer_config(self) -> SAEConfig:
-        """The per-layer settings as an :class:`~sae.model.SAEConfig` (used to build activations)."""
+        """The per-layer settings as an :class:`~innards.sae.model.SAEConfig` (used to build activations)."""
         return SAEConfig(
             d_in=self.d_in, d_sae=self.d_sae, activation=self.activation, k=self.k, abs_topk=self.abs_topk,
             sparsity_coeff=self.sparsity_coeff, jumprelu_bandwidth=self.jumprelu_bandwidth,
@@ -198,8 +196,8 @@ class CrossLayerTranscoder(nn.Module):
 
     Inputs are stacked per layer: ``x`` of shape ``(..., n_layers, d_in)`` (MLP
     inputs) and ``target`` of shape ``(..., n_layers, d_out)`` (MLP outputs).
-    Implements the trainer protocol of :class:`~sae.model.SAE`, so it trains
-    with :class:`~sae.trainer.SAETrainer` on batches from :func:`clt_hooks`.
+    Implements the trainer protocol of :class:`~innards.sae.model.SAE`, so it trains
+    with :class:`~innards.sae.trainer.SAETrainer` on batches from :func:`clt_hooks`.
 
     Args:
         cfg: Configuration; if ``None``, ``kwargs`` build a :class:`CLTConfig`.
@@ -357,7 +355,7 @@ class CrossLayerTranscoder(nn.Module):
             return_acts: Return the ``(..., n_layers, d_sae)`` activations.
 
         Returns:
-            An :class:`~sae.model.SAEOutput`; metrics include the mean and
+            An :class:`~innards.sae.model.SAEOutput`; metrics include the mean and
             per-layer (``layer<i>/nmse``) normalised MSE, and ``latent_counts``
             has shape ``(n_layers, d_sae)``.
 
@@ -444,7 +442,7 @@ class CrossLayerTranscoder(nn.Module):
         """
         Sets per-layer input / target scales (``E||.|| = sqrt(d)``), the output
         biases, and a global encoder scale chosen as for transcoders (see
-        :meth:`sae.model.SAE.calibrate_encoder_scale_`).
+        :meth:`innards.sae.model.SAE.calibrate_encoder_scale_`).
 
         Args:
             x: MLP inputs, ``(..., n_layers, d_in)``.
@@ -452,7 +450,7 @@ class CrossLayerTranscoder(nn.Module):
             normalize_input: Estimate the scales.
             b_dec_init: ``"geometric_median"``, ``"mean"`` or ``"zeros"``.
             calibrate_encoder: Rescale the encoder as for transcoders (see
-                :meth:`sae.model.SAE.calibrate_encoder_scale_`).
+                :meth:`innards.sae.model.SAE.calibrate_encoder_scale_`).
 
         Raises:
             ValueError: If ``b_dec_init`` is unknown.
@@ -575,46 +573,48 @@ class CrossLayerTranscoder(nn.Module):
         return model.to(device).eval()
 
 
-@contextmanager
-def splice_clt(
+def clt_edits(
     clt: CrossLayerTranscoder,
-    inputs: Sequence[nn.Module],
-    outputs: Sequence[nn.Module],
+    inputs: Sequence[str | nn.Module],
+    outputs: Sequence[str | nn.Module],
     keep_error: bool = False,
     edit: Callable[[int, Tensor], Tensor] | None = None,
-    layout: str = "btd",
     exclude_positions: Sequence[int] = (),
-    token_mask_fn: Callable[[Any], Tensor] | None = None,
-    batch: Any = None,
-) -> Iterator[None]:
+    mask: Tensor | None = None,
+    model: nn.Module | Envoy | None = None,
+) -> dict[str, Edit]:
     """
-    Replaces every MLP output by the CLT's prediction during forward passes.
+    Edits replacing every MLP output by the CLT's prediction, for :func:`innards.edits.run`.
 
     Latents of layer ``l`` are computed from the (possibly already patched)
     MLP input of layer ``l``; MLP ``m``'s output is replaced at kept tokens by
     the sum of the contributions of layers ``<= m``. With ``keep_error`` the
     CLT error of each layer is added back, so only ``edit`` changes the model.
 
+    Typical usage::
+
+        logits, _ = run(model, batch, clt_edits(clt, ins, outs, model=model))
+
     Args:
         clt: The CLT (should be in eval mode).
-        inputs: Modules whose outputs are the MLP inputs, in layer order.
+        inputs: Layers whose outputs are the MLP inputs, in layer order, as
+            names (or modules, with ``model`` given).
         outputs: The MLPs, in layer order.
         keep_error: Add each layer's error ``y_m - y_hat_m`` back.
         edit: Optional ``fn(layer, acts) -> acts`` on a layer's
             ``(n, d_sae)`` activations (normalised units).
-        layout: Activation layout at the hooks.
         exclude_positions: Positions left unchanged.
-        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask.
-        batch: The model input batch passed to ``token_mask_fn``.
+        mask: Optional boolean ``(batch, tokens)`` mask of tokens to replace.
+        model: Needed only to resolve modules given as layers.
 
-    Yields:
-        None.
+    Returns:
+        Layer name -> edit.
     """
     n, d_out = clt.cfg.n_layers, clt.cfg.d_out
     state: dict[int, Any] = {}
 
     def read(layer: int):
-        def fn(x: Tensor, y: Tensor) -> Tensor:
+        def fn(x: Tensor) -> Tensor:
             x_s = x.to(clt.w_enc.dtype) * clt.input_scale[layer]
             pre = einsum(x_s, clt.w_enc[layer], "b d, d s -> b s") + clt.b_enc[layer]
             code = clt.activations[layer](pre, clt.k_current)
@@ -623,11 +623,11 @@ def splice_clt(
             edited = clean if edit is None else (edit(layer, acts) @ clt.decoder_weight(layer)).view(-1, n - layer, d_out)
             skip = x_s @ clt.w_skip[layer] if clt.cfg.skip_connection else 0.0
             state[layer] = (clean, edited, skip)
-            return y
+            return x
         return fn
 
     def write(m: int):
-        def fn(x: Tensor, y: Tensor) -> Tensor:
+        def fn(y: Tensor) -> Tensor:
             clean = clt.b_dec[m] + sum(state[layer][0][:, m - layer] for layer in range(m + 1)) + state[m][2]
             edited = clt.b_dec[m] + sum(state[layer][1][:, m - layer] for layer in range(m + 1)) + state[m][2]
             scale = clt.target_scale[m]
@@ -635,13 +635,10 @@ def splice_clt(
             return out + (y.to(out.dtype) - clean / scale) if keep_error else out
         return fn
 
-    hooks = []
+    edits: dict[str, Edit] = {}
     for layer in range(n):
-        hooks.append(replace_activation(inputs[layer], lambda a, f=read(layer): patch_kept_tokens(
-            a, f, layout, exclude_positions, token_mask_fn, batch)))
-        hooks.append(replace_activation(outputs[layer], lambda a, f=write(layer): patch_kept_tokens(
-            a, f, layout, exclude_positions, token_mask_fn, batch)))
-    with ExitStack() as stack:
-        for h in hooks:
-            stack.enter_context(h)
-        yield
+        for module, fn in ((inputs[layer], read(layer)), (outputs[layer], write(layer))):
+            name = layer_name(model, module)
+            e = rows(fn, exclude_positions, mask)
+            edits[name] = compose(edits[name], e) if name in edits else e
+    return edits

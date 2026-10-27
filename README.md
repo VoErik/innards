@@ -9,7 +9,7 @@ reference; build locally with `uv run --group docs sphinx-build docs docs/_build
 ## Install
 
 ```bash
-uv sync                       # core: torch, einops, safetensors, numpy
+uv sync                       # core: torch, nnsight, einops, safetensors, numpy
 uv sync --extra viz           # + matplotlib plots and HTML views
 uv sync --extra notebooks     # everything the example notebooks need
 uv sync --extra wandb         # or mlflow / tensorboard, for experiment logging
@@ -19,13 +19,46 @@ Extras: `wandb`, `mlflow`, `tensorboard`, `viz`, `umap`, `vision` (timm,
 torchvision), `language` (transformers, datasets), `notebooks`. The `dev`
 group adds pytest and notebook tooling (`uv sync --group dev`).
 
+## Extracting activations
+
+Any timm model, read through [nnsight](https://nnsight.net) (see the
+[extraction guide](docs/guides/extraction.md)):
+
+```python
+from innards import extract, extract_to_disk, load_acts, load_model
+from innards.reduce import token
+
+model, preprocess = load_model("vit_base_patch16_224")
+loader = ...  # any DataLoader over preprocess-ed images, e.g. (image, label) batches
+acts, labels = extract(model, loader, ["blocks.6", "blocks.11"], reduce=token(0))
+extract_to_disk(model, loader, ["blocks.6"], "acts/vit_b_val")   # each layer dir is an SAE cache
+acts, labels = load_acts("acts/vit_b_val")
+```
+
+## Analysing representations
+
+`innards.analysis` works on extracted activations (tensors) and directions
+`V (k, d)`, so its modules combine freely (see the
+[guide](docs/guides/representations.md)):
+
+```python
+from innards.analysis import causal, directions, geometry, metrics, spline
+from innards.edits import ablate
+
+W, b, classes = directions.linear_probe(acts["blocks.6"], labels)      # decodable ...
+used = causal.effect(model, loader, {"blocks.6": ablate(W)}, metrics.change(metrics.correct()))  # ... and used?
+V_grad, _ = causal.relevant_subspace(model, loader, "blocks.6", metrics.logit("label"), k=10)
+geometry.subspace_angles(V_grad, geometry.pca(acts["blocks.6"], k=10)[0])  # variance vs. what matters
+spline.local_complexity(model, images, spline.activation_layers(model))   # partition density near data
+```
+
 ## Workflow
 
 This assumes you have a *trained* (`torch`) vision or language model:
 
 ```python
 import torch
-from sae import (SAE, ActivationStore, CachedActivations, SAETrainer,
+from innards.sae import (SAE, ActivationStore, CachedActivations, SAETrainer,
                  TrainerConfig, cache_activations)
 
 # 0. Initialize the model and dataloaders etc.
@@ -69,8 +102,9 @@ sae = SAE.load("sae.safetensors", device="cuda")
 
 ```python
 import torch.nn.functional as F
-from sae import LatentCache, cache_latents
-from sae.interventions import clamp, splice_sae, steer, zero_ablate
+from innards.sae import LatentCache, cache_latents
+from innards.edits import rows, run, steer
+from innards.sae.interventions import sae_edits, zero_ablate
 
 # Encode a (deterministic) dataset once, then analyse without the model.
 cache = LatentCache(cache_latents(sae, model, model.blocks[6], val_loader, "latents/block6",
@@ -80,20 +114,18 @@ top = cache.top_examples(n_top=20)          # (value, example, position) per lat
 bins = cache.quantile_examples(latent=42)   # samples across activation quantiles
 co = cache.cooccurrence([42, 7, 1001])      # pairwise co-firing counts
 
-# Causal edits: the SAE error term is kept, so only the edit changes the model.
-with splice_sae(sae, model.blocks[6], zero_ablate([42]), exclude_positions=(0,)):
-    ablated_logits = model(images)
-with steer(model.blocks[6], sae.decoder_weight()[42], alpha=8.0):
-    steered_logits = model(images)
+# Causal edits through nnsight: the SAE error term is kept, so only the edit changes the model.
+ablated_logits, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([42]), exclude_positions=(0,)))
+steered_logits, _ = run(model, images, {"blocks.6": rows(steer(sae.decoder_weight()[42], 8.0), exclude=(0,))})
 
 # Downstream fidelity: KL, top-1 agreement and fraction of loss recovered.
 trainer.evaluate_downstream(model, model.blocks[6], val_loader, kl_cfg,
                             loss_fn=lambda out, batch: F.cross_entropy(out, batch[1]))
 ```
 
-`sae.analysis` covers the rest (single-pass `analyze_dataset`, dictionary
+`innards.sae.analysis` covers the rest (single-pass `analyze_dataset`, dictionary
 geometry, output effects / logit lens, attribution patching, patch maps),
-and `sae.viz` plots it.
+and `innards.sae.viz` plots it.
 
 ## Architectures
 
@@ -101,10 +133,10 @@ An `SAE` is assembled from independent parts, chosen in `SAEConfig`:
 
 | Part | Options | Module |
 |---|---|---|
-| `activation` | `"topk"`, `"batchtopk"` (both with optional `abs_topk`), `"jumprelu"`, `"relu"` (L1) | `sae.activations` |
-| `decoder` | `"linear"` (unit-norm atoms), `"archetypal"` | `sae.decoders` |
-| loss terms | AuxK, `matryoshka`, `multi_topk` (TopK variants) | `sae.model` |
-| target | the input (SAE), or another activation with `transcoder=True` (+ `skip_connection`) | `sae.model` |
+| `activation` | `"topk"`, `"batchtopk"` (both with optional `abs_topk`), `"jumprelu"`, `"relu"` (L1) | `innards.sae.activations` |
+| `decoder` | `"linear"` (unit-norm atoms), `"archetypal"` | `innards.sae.decoders` |
+| loss terms | AuxK, `matryoshka`, `multi_topk` (TopK variants) | `innards.sae.model` |
+| target | the input (SAE), or another activation with `transcoder=True` (+ `skip_connection`) | `innards.sae.model` |
 
 ```python
 SAE(d_in=768, d_sae=16384, activation="topk", k=64, matryoshka=True)
@@ -116,8 +148,8 @@ To add an architecture, subclass `Activation` and register it; the model,
 trainer, saving/loading and analysis code need no changes:
 
 ```python
-from sae import Activation, register_activation
-from sae.activations import dense_code
+from innards.sae import Activation, register_activation
+from innards.sae.activations import dense_code
 
 @register_activation("my_act")
 class MyActivation(Activation):
@@ -130,7 +162,7 @@ class MyActivation(Activation):
 
 Override `update_stats` for running statistics and `fold_` for thresholds
 that must be rescaled when saving. New decoder parametrizations subclass
-`Decoder` and go into `sae.decoders.DECODERS`.
+`Decoder` and go into `innards.sae.decoders.DECODERS`.
 
 ## Many layers at once
 
@@ -138,7 +170,7 @@ Harvesting is usually the expensive part, so capture several hook points in
 one pass and train one SAE per hook in the same loop:
 
 ```python
-from sae import SAEGroup
+from innards.sae import SAEGroup
 
 hooks = {f"block{i}": model.blocks[i] for i in range(12)}
 store = ActivationStore(model, hooks, loader, exclude_positions=(0,))  # dict batches
@@ -158,7 +190,7 @@ Self-contained HTML files (no server, no network): a latent browser built on
 the latent cache, and an interactive viewer for attribution graphs.
 
 ```python
-from sae.dashboard import image_renderer, save_graph_html, save_latent_dashboard, text_renderer
+from innards.sae.dashboard import image_renderer, save_graph_html, save_latent_dashboard, text_renderer
 
 save_latent_dashboard("dashboard.html", cache, text_renderer(val_tokens),  # or image_renderer(images, n_prefix=1)
                       sae=sae, readout=unembed, output_labels=vocab)       # nearest latents, output effects
@@ -197,7 +229,8 @@ write to the MLP outputs of layers `l, l+1, ...` (Ameisen et al., 2025), so
 a feature computed once can explain the same output across layers.
 
 ```python
-from sae import CrossLayerTranscoder, clt_hooks, splice_clt
+from innards.edits import run
+from innards.sae import CrossLayerTranscoder, clt_edits, clt_hooks
 
 layers = model.gpt_neox.layers
 ins, outs = [l.post_attention_layernorm for l in layers], [l.mlp for l in layers]
@@ -207,8 +240,7 @@ trainer = SAETrainer(clt, TrainerConfig(total_tokens=100_000_000))
 trainer.train(store)
 trainer.evaluate(val_store)                                         # eval/fve, eval/layer3/fve, ...
 trainer.evaluate_downstream(model, ins, loader, kl_cfg, target_module=outs, loss_fn=...)
-with splice_clt(clt, ins, outs):                                    # run the replacement model
-    logits = model(**inputs)
+logits, _ = run(model, inputs, clt_edits(clt, ins, outs, model=model))   # the replacement model
 ```
 
 ## Attribution graphs
@@ -219,7 +251,7 @@ nodes, edges are direct effects between them (Marks et al., 2024; Ameisen et
 al., 2025):
 
 ```python
-from sae import attribution_graph, clt_site, sae_site
+from innards.sae import attribution_graph, clt_site, sae_site
 
 sites = [sae_site(tcs[i], ins[i], outs[i], name=f"tc{i}") for i in range(n_layers)]  # transcoders
 # or [clt_site(clt, ins, outs)], or residual SAEs: sae_site(sae, model.blocks[i])
@@ -238,10 +270,10 @@ attention and layer norms they are the local linearization at the input
 ## SAELens interop
 
 ```python
-from sae.interop import load_saelens, save_saelens
+from innards.sae.interop import load_saelens, save_saelens
 
 save_saelens(sae, "export/blocks.6", metadata={"model_name": "vit_tiny", "hook_name": "blocks.6"})
-gemma_scope_sae, cfg = load_saelens("path/to/saelens/sae")  # then use sae.analysis etc. on it
+gemma_scope_sae, cfg = load_saelens("path/to/saelens/sae")  # then use innards.sae.analysis etc. on it
 ```
 
 Supported: TopK, AbsTopK, BatchTopK (exported as JumpReLU with a constant

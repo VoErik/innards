@@ -1,15 +1,15 @@
 # Architectures
 
-Most SAE variants differ in only a few places. An {class}`~sae.model.SAE` is
+Most SAE variants differ in only a few places. An {class}`~innards.sae.model.SAE` is
 assembled from three independent parts, all chosen in
-{class}`~sae.model.SAEConfig`:
+{class}`~innards.sae.model.SAEConfig`:
 
 | Part | Options | Module |
 |---|---|---|
-| `activation` | `"topk"`, `"batchtopk"` (both with optional `abs_topk`), `"jumprelu"`, `"relu"` | {mod}`sae.activations` |
-| `decoder` | `"linear"` (unit-norm atoms), `"archetypal"` | {mod}`sae.decoders` |
-| loss terms | AuxK, `matryoshka`, `multi_topk` | {mod}`sae.model` |
-| target | the input (SAE), or another activation (`transcoder=True`) | {mod}`sae.model` |
+| `activation` | `"topk"`, `"batchtopk"` (both with optional `abs_topk`), `"jumprelu"`, `"relu"` | {mod}`innards.sae.activations` |
+| `decoder` | `"linear"` (unit-norm atoms), `"archetypal"` | {mod}`innards.sae.decoders` |
+| loss terms | AuxK, `matryoshka`, `multi_topk` | {mod}`innards.sae.model` |
+| target | the input (SAE), or another activation (`transcoder=True`) | {mod}`innards.sae.model` |
 
 The encoder is $f(x) = \sigma(W_{enc}^\top (x - b_{dec}) + b_{enc})$ with the
 pre-encoder bias of Bricken et al. (2023); the decoder is
@@ -89,20 +89,20 @@ in training mode:
 Internally the model works on `x * input_scale`, a scalar chosen at
 initialization so that $E\|x\| = \sqrt{d_{in}}$ (Conerly et al., 2024); all
 public methods take and return activations in input units.
-{meth}`~sae.model.SAE.save` folds the scale into the weights (as done for
+{meth}`~innards.sae.model.SAE.save` folds the scale into the weights (as done for
 Gemma Scope), so a saved SAE works on raw activations. Files are a single
 safetensors file with the config in its metadata.
 
 ## Adding an architecture
 
-A new activation is a subclass of {class}`~sae.activations.Activation`,
+A new activation is a subclass of {class}`~innards.sae.activations.Activation`,
 registered under a name. The model, trainer, saving / loading and the
 analysis code need no changes:
 
 ```python
 import torch
-from sae import Activation, register_activation
-from sae.activations import dense_code
+from innards.sae import Activation, register_activation
+from innards.sae.activations import dense_code
 
 @register_activation("my_act")
 class MyActivation(Activation):
@@ -116,9 +116,9 @@ sae = SAE(d_in=768, d_sae=16384, activation="my_act")
 ```
 
 Return a sparse code (rows / cols / values, as the TopK activations do) when
-only few latents are active; return {func}`~sae.activations.dense_code` when
+only few latents are active; return {func}`~innards.sae.activations.dense_code` when
 gradients must reach latents that did not fire (JumpReLU does this). Override
-{meth}`~sae.activations.Activation.update_stats` for running statistics and
-{meth}`~sae.activations.Activation.fold_` for thresholds that must be
-rescaled on save. New decoders subclass {class}`~sae.decoders.Decoder` and
-are added to {data}`sae.decoders.DECODERS`.
+{meth}`~innards.sae.activations.Activation.update_stats` for running statistics and
+{meth}`~innards.sae.activations.Activation.fold_` for thresholds that must be
+rescaled on save. New decoders subclass {class}`~innards.sae.decoders.Decoder` and
+are added to {data}`innards.sae.decoders.DECODERS`.

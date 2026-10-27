@@ -4,6 +4,32 @@ Generated from the docstrings.
 
 ```{toctree}
 :maxdepth: 1
+:caption: Model access
+
+models
+layouts
+reduce
+extract
+store
+edits
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Analysis
+
+analysis_geometry
+analysis_similarity
+analysis_directions
+analysis_spline
+analysis_causal
+analysis_metrics
+analysis_interp
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Sparse autoencoders
 
 model
 activations

@@ -1,5 +1,5 @@
-# Attribution graphs: `sae.graph`
+# Attribution graphs: `innards.sae.graph`
 
 ```{eval-rst}
-.. automodule:: sae.graph
+.. automodule:: innards.sae.graph
 ```

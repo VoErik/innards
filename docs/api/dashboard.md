@@ -1,5 +1,5 @@
-# Dashboards: `sae.dashboard`
+# Dashboards: `innards.sae.dashboard`
 
 ```{eval-rst}
-.. automodule:: sae.dashboard
+.. automodule:: innards.sae.dashboard
 ```

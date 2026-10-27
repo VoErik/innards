@@ -10,28 +10,27 @@ from torch.utils.data import (
     TensorDataset
 )
 
-from sae.activations import (
+from innards.sae.activations import (
     ACTIVATIONS,
     Activation,
     register_activation,
     dense_code
 )
-from sae.data import (
+from innards.sae.data import (
     ActivationStore,
     from_tokens,
-    patch_kept_tokens,
     to_tokens
 )
-from sae.optim import (
+from innards.sae.optim import (
     Signum,
     build_optimizers
 )
-from sae.decoders import kmeans
-from sae.model import (
+from innards.sae.decoders import kmeans
+from innards.sae.model import (
     SAE,
     SAEConfig
 )
-from sae.trainer import (
+from innards.sae.trainer import (
     KLFinetuneConfig,
     SAETrainer,
     TrainerConfig
@@ -307,12 +306,12 @@ def test_conv_layout_kl(tmp_path):
     assert tr.evaluate_downstream(cnn, cnn[1], img_loader, kl_cfg)["downstream/top1_agreement"] > 0.3
 
 
-def test_patch_kept_tokens_respects_masks():
+def test_rows_edit_respects_masks():
+    from innards.edits import rows
+
     act = torch.randn(2, 6, 4)
-    mask_fn = lambda batch: batch
-    batch = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.bool)  # padding in row 0
-    out = patch_kept_tokens(act, lambda x, y: torch.zeros_like(y), "btd", exclude_positions=(0,), token_mask_fn=mask_fn,
-                            batch=batch)
+    mask = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.bool)  # padding in row 0
+    out = rows(torch.zeros_like, exclude=(0,), mask=mask)(act)
     assert torch.equal(out[:, 0], act[:, 0]) and torch.equal(out[0, 4:], act[0, 4:])
     assert (out[0, 1:4] == 0).all() and (out[1, 1:] == 0).all()
 
@@ -524,8 +523,9 @@ def test_transcoder_config_and_target_checks():
 
 
 def test_transcoder_store_cache_kl_and_interventions(tmp_path):
-    from sae.cache import CachedActivations, cache_activations
-    from sae.interventions import splice_sae, zero_ablate
+    from innards.sae.cache import CachedActivations, cache_activations
+    from innards.edits import run
+    from innards.sae.interventions import sae_edits, zero_ablate
 
     torch.manual_seed(0)
     vit = ToyViT()
@@ -558,12 +558,13 @@ def test_transcoder_store_cache_kl_and_interventions(tmp_path):
     tc = tr.model.eval()
     with torch.no_grad():
         clean = vit(images[:4])
-        with splice_sae(tc, ln, target_module=mlp, exclude_positions=(0,)):
-            torch.testing.assert_close(vit(images[:4]), clean, atol=1e-5, rtol=1e-5)
-        with splice_sae(tc, ln, zero_ablate(list(range(128))), target_module=mlp, exclude_positions=(0,)):
-            assert not torch.allclose(vit(images[:4]), clean, atol=1e-3)
+        out, _ = run(vit, images[:4], sae_edits(tc, ln, target=mlp, exclude_positions=(0,), model=vit))
+        torch.testing.assert_close(out, clean, atol=1e-5, rtol=1e-5)
+        out, _ = run(vit, images[:4], sae_edits(tc, ln, zero_ablate(list(range(128))), target=mlp,
+                                               exclude_positions=(0,), model=vit))
+        assert not torch.allclose(out, clean, atol=1e-3)
 
-    from sae.analysis import latent_attribution
+    from innards.sae.analysis import latent_attribution
     attr = latent_attribution(tc, vit, ln, images[:1], lambda o, _: o[:, 2], exclude_positions=(0,),
                               target_module=mlp)
     torch.testing.assert_close(attr.target, clean[:1, 2], atol=1e-5, rtol=1e-5)

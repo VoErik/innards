@@ -20,7 +20,7 @@ and language models, in plain PyTorch.
 - **Interop**: read and write the SAELens format.
 
 ```python
-from sae import SAE, ActivationStore, SAETrainer, TrainerConfig
+from innards.sae import SAE, ActivationStore, SAETrainer, TrainerConfig
 
 store = ActivationStore(model, model.blocks[6], loader, exclude_positions=(0,))
 sae = SAE(d_in=768, d_sae=16384, activation="batchtopk", k=32)
@@ -31,6 +31,9 @@ sae.save("sae.safetensors")
 ## Where to start
 
 - [Getting started](getting-started.md): install, then harvest, train, evaluate and save an SAE.
+- [Extracting activations](guides/extraction.md): any timm model through nnsight, in memory or to disk.
+- [Interventions](guides/interventions.md): steering, ablating and patching activations with nnsight.
+- [Analysing representations](guides/representations.md): geometry, spline partitions, causal effects and interpretation, and how they combine.
 - [Architectures](guides/architectures.md): activations, decoders, loss terms, and adding your own.
 - [Training](guides/training.md): defaults, schedules, checkpoints, several layers at once, KL fine-tuning.
 - [Transcoders](guides/transcoders.md): transcoders, skip connections and cross-layer transcoders.
@@ -44,6 +47,9 @@ sae.save("sae.safetensors")
 :hidden:
 
 getting-started
+guides/extraction
+guides/interventions
+guides/representations
 guides/architectures
 guides/training
 guides/transcoders
