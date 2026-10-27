@@ -13,9 +13,9 @@ its activation code, the on/off pattern of all units.
 * :func:`local_complexity`: how many unit boundaries pass near an input
   (Humayun, Balestriero & Baraniuk, 2024).
 * :func:`boundary_distance`: distances to the hyperplanes of a linear layer.
-* :func:`path_crossings`, :func:`slice_partition`: the partition along a line
-  and on a 2-d slice through three inputs (a grid-based SplineCam, Humayun et
-  al., 2023).
+* :func:`path_crossings`, :func:`slice_partition`, :func:`flip_density`: the
+  partition along a line and on a 2-d slice through three inputs (a
+  grid-based SplineCam, Humayun et al., 2023).
 * :func:`jacobian_spectrum`: singular values of the local (affine) map
   between two layers.
 * :func:`in_hull`: interpolation vs. extrapolation (Balestriero, Pesenti &
@@ -402,6 +402,37 @@ def slice_partition(
         joined.append(c[name])
         ids[name] = region_ids(joined).reshape(res, res)
     return ids, (u.cpu(), v.cpu())
+
+
+def flip_density(codes: Tensor, res: int) -> Tensor:
+    """
+    How densely region boundaries pass through each cell of a sampled grid.
+
+    For a large layer, almost every grid point of a slice lies in its own
+    region, so region ids carry little information; the number of units that
+    switch between neighbouring grid points shows where the partition is
+    dense instead.
+
+    Args:
+        codes: Codes of the ``res * res`` grid points, row-major ``(res * res, ...)``,
+            e.g. ``codes(model, [points], layer)[layer]`` on the points of
+            :func:`slice_partition`.
+        res: Grid points per axis.
+
+    Returns:
+        ``(res, res)`` mean number of units flipping to the right and lower
+        neighbours.
+    """
+    c = codes.reshape(res, res, -1)
+    right = (c[:, 1:] != c[:, :-1]).sum(-1).float()
+    down = (c[1:] != c[:-1]).sum(-1).float()
+    out = torch.zeros(res, res)
+    count = torch.zeros(res, res)
+    out[:, :-1] += right
+    count[:, :-1] += 1
+    out[:-1] += down
+    count[:-1] += 1
+    return out / count.clamp_min(1)
 
 
 def boundaries(ids: Tensor) -> Tensor:

@@ -1,7 +1,7 @@
 [project]
 name = "innards"
 version = "0.2.0"
-description = "Sparse autoencoders (TopK, BatchTopK, JumpReLU, ReLU; Matryoshka, Archetypal) for vision and language models"
+description = "Interpretability for vision and language models on nnsight: extraction, interventions, representation geometry, causal analysis and sparse autoencoders"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

@@ -3,8 +3,10 @@ Plots and HTML views for SAE analysis (needs the ``viz`` extra).
 
 Plotting functions take arrays or tensors computed by
 :mod:`innards.sae.analysis` and draw on a matplotlib ``Axes`` (a new figure is
-created when ``ax`` is ``None``), so they compose into custom figures. Text
-views return HTML strings; :func:`show_html` displays them in Jupyter.
+created when ``ax`` is ``None``), so they compose into custom figures. They
+draw in the innards style (:mod:`innards.style`), like
+:mod:`innards.analysis.plot`, whose image helpers they share. Text views
+return HTML strings; :func:`show_html` displays them in Jupyter.
 
 The latent dashboards follow the feature-browser format by
 Bricken et al. (2023): activation density, top-activating examples and output
@@ -31,10 +33,22 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from torch import Tensor
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
+from ..analysis.plot import (  # noqa: F401  (re-exported)
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    images as _image_grid,
+    overlay_heatmap,
+    styled,
+    to_display_image
+)
+from ..style import (
+    DIVERGING,
+    INK,
+    color
+)
 
-# TODO: make colorscheme selectable, deliver custom mpl.style file
+POSITIVE, NEGATIVE = DIVERGING[8], DIVERGING[2]  # the diverging poles: red promotes, blue suppresses
+
 
 def _np(x) -> np.ndarray:
     if isinstance(x, Tensor):
@@ -42,9 +56,9 @@ def _np(x) -> np.ndarray:
     return np.asarray(x)
 
 
-def _ax(ax: Axes | None, figsize=(5, 3.5)) -> Axes:
+def _ax(ax: Axes | None, figsize=None) -> Axes:
     if ax is None:
-        _, ax = plt.subplots(figsize=figsize, layout="constrained")
+        _, ax = plt.subplots(figsize=figsize)
     return ax
 
 
@@ -54,6 +68,7 @@ def _label(labels: Sequence[str] | Callable[[int], str] | None, i: int) -> str:
     return labels(i) if callable(labels) else labels[i]
 
 
+@styled
 def plot_latent_density(frequency: Tensor | np.ndarray, ax: Axes | None = None, bins: int = 60) -> Axes:
     """
     Histogram of log10 latent firing frequency.
@@ -71,13 +86,15 @@ def plot_latent_density(frequency: Tensor | np.ndarray, ax: Axes | None = None, 
     ax = _ax(ax)
     f = _np(frequency)
     alive = f[f > 0]
-    ax.hist(np.log10(alive), bins=bins, color="#4C72B0")
+    ax.hist(np.log10(alive), bins=bins, color=color(0), edgecolor=INK["surface"], linewidth=0.4)
+    ax.grid(axis="y")
     ax.set_xlabel("log10 firing frequency")
     ax.set_ylabel("latents")
     ax.set_title(f"Latent density ({(f == 0).sum()} dead of {f.size})")
     return ax
 
 
+@styled
 def plot_max_cosine_similarity(values: Tensor | np.ndarray, ax: Axes | None = None, bins: int = 60) -> Axes:
     """
     Histogram of each atom's highest cosine similarity to another atom.
@@ -91,13 +108,15 @@ def plot_max_cosine_similarity(values: Tensor | np.ndarray, ax: Axes | None = No
         The axes.
     """
     ax = _ax(ax)
-    ax.hist(_np(values), bins=bins, color="#55A868")
-    ax.set_xlabel("Max Cosine Similarity")
-    ax.set_ylabel("SAE Dimension")
+    ax.hist(_np(values), bins=bins, color=color(0), edgecolor=INK["surface"], linewidth=0.4)
+    ax.grid(axis="y")
+    ax.set_xlabel("max cosine similarity")
+    ax.set_ylabel("latents")
     ax.set_title("Decoder redundancy")
     return ax
 
 
+@styled
 def plot_dictionary_map(
     coords: Tensor | np.ndarray,
     color: Tensor | np.ndarray | None = None,
@@ -118,21 +137,25 @@ def plot_dictionary_map(
     Returns:
         The axes.
     """
-    ax = _ax(ax, figsize=(5.5, 5))
+    ax = _ax(ax, figsize=(3.2, 3.0))
     c = _np(coords)
-    sc = ax.scatter(c[:, 0], c[:, 1], s=3, c=None if color is None else _np(color), cmap="viridis",
-                    alpha=0.7, linewidths=0)
-    if color is not None:
-        ax.figure.colorbar(sc, ax=ax, label=color_label)
+    if color is None:
+        ax.scatter(c[:, 0], c[:, 1], s=3, color=INK["context"], linewidths=0)
+    else:
+        sc = ax.scatter(c[:, 0], c[:, 1], s=3, c=_np(color), cmap="innards_seq", linewidths=0)
+        cb = ax.figure.colorbar(sc, ax=ax, shrink=0.8, aspect=25, label=color_label)
+        cb.outline.set_visible(False)
     for i in highlight:
-        ax.scatter(c[i, 0], c[i, 1], s=40, facecolors="none", edgecolors="red")
-        ax.annotate(str(i), (c[i, 0], c[i, 1]), fontsize=8, color="red")
+        ax.scatter(c[i, 0], c[i, 1], s=30, facecolors="none", edgecolors=INK["primary"], linewidths=0.8)
+        ax.annotate(str(i), (c[i, 0], c[i, 1]), xytext=(3, 3), textcoords="offset points", fontsize=6.5,
+                    color=INK["primary"])
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_title("Dictionary Map")
+    ax.set_title("Dictionary map")
     return ax
 
 
+@styled
 def plot_similarity_matrix(matrix: Tensor | np.ndarray, latents: Sequence[int], ax: Axes | None = None) -> Axes:
     """
     Heatmap of pairwise decoder cosine similarities.
@@ -145,15 +168,20 @@ def plot_similarity_matrix(matrix: Tensor | np.ndarray, latents: Sequence[int], 
     Returns:
         The axes.
     """
-    ax = _ax(ax, figsize=(5, 4.5))
-    im = ax.imshow(_np(matrix), cmap="RdBu_r", vmin=-1, vmax=1)
-    ax.figure.colorbar(im, ax=ax, label="cosine similarity")
+    ax = _ax(ax, figsize=(3.5, 3.0))
+    im = ax.imshow(_np(matrix), cmap="innards_div", vmin=-1, vmax=1)
+    cb = ax.figure.colorbar(im, ax=ax, shrink=0.8, aspect=25, label="cosine similarity")
+    cb.outline.set_visible(False)
     ticks = range(len(latents))
-    ax.set_xticks(ticks, [str(l) for l in latents], rotation=90, fontsize=7)
-    ax.set_yticks(ticks, [str(l) for l in latents], fontsize=7)
+    ax.set_xticks(ticks, [str(l) for l in latents], rotation=90)
+    ax.set_yticks(ticks, [str(l) for l in latents])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(length=0)
     return ax
 
 
+@styled
 def plot_output_effects(
     top_values: Tensor | np.ndarray,
     top_ids: Tensor | np.ndarray,
@@ -181,25 +209,28 @@ def plot_output_effects(
     Returns:
         The axes.
     """
-    ax = _ax(ax, figsize=(5, 4))
+    ax = _ax(ax, figsize=(3.5, 3.2))
     vals = np.concatenate([_np(top_values), _np(bottom_values)[::-1]])
     ids = np.concatenate([_np(top_ids), _np(bottom_ids)[::-1]]).astype(int)
     names = [_label(labels, int(i)) for i in ids]
     y = np.arange(len(vals))[::-1]
-    ax.barh(y, vals, color=["#C44E52" if v > 0 else "#4C72B0" for v in vals])
-    ax.set_yticks(y, names, fontsize=8)
-    ax.axvline(0, color="black", linewidth=0.8)
-    ax.set_xlabel("Direct Effect")
+    ax.barh(y, vals, height=0.7, color=[POSITIVE if v > 0 else NEGATIVE for v in vals])
+    ax.set_yticks(y, names)
+    ax.axvline(0, color=INK["axis"], linewidth=0.8)
+    ax.grid(axis="x")
+    ax.tick_params(axis="y", length=0)
+    ax.set_xlabel("direct effect")
     ax.set_title(title)
     return ax
 
 
+@styled
 def plot_attribution_bars(
     values: Tensor | np.ndarray,
     latents: Tensor | np.ndarray,
     error: float | None = None,
     descriptions: Callable[[int], str] | None = None,
-    title: str = "Latent Attribution",
+    title: str = "Latent attribution",
     ax: Axes | None = None,
 ) -> Axes:
     """
@@ -217,88 +248,24 @@ def plot_attribution_bars(
     Returns:
         The axes.
     """
-    ax = _ax(ax, figsize=(5, 4))
+    ax = _ax(ax, figsize=(3.5, 3.2))
     v = list(_np(values))
     names = [f"#{int(l)}" + (f" {descriptions(int(l))}" if descriptions else "") for l in _np(latents)]
     if error is not None:
         v.append(float(error))
         names.append("SAE error")
     y = np.arange(len(v))[::-1]
-    ax.barh(y, v, color=["#C44E52" if x > 0 else "#4C72B0" for x in v])
-    ax.set_yticks(y, names, fontsize=8)
-    ax.axvline(0, color="black", linewidth=0.8)
-    ax.set_xlabel("Attribution (first-order effect of ablation)")
+    ax.barh(y, v, height=0.7, color=[POSITIVE if x > 0 else NEGATIVE for x in v])
+    ax.set_yticks(y, names)
+    ax.axvline(0, color=INK["axis"], linewidth=0.8)
+    ax.grid(axis="x")
+    ax.tick_params(axis="y", length=0)
+    ax.set_xlabel("attribution (first-order effect of ablation)")
     ax.set_title(title)
     return ax
 
 
-def to_display_image(
-    image: Tensor | np.ndarray,
-    mean: Sequence[float] | None = IMAGENET_MEAN,
-    std: Sequence[float] | None = IMAGENET_STD,
-) -> np.ndarray:
-    """
-    Converts a normalized ``(3, H, W)`` tensor to an ``(H, W, 3)`` array in [0, 1].
-
-    Args:
-        image: Image tensor or array, channels first.
-        mean: Normalisation mean to undo; ``None`` skips it.
-        std: Normalisation std to undo; ``None`` skips it.
-
-    Returns:
-        Displayable image.
-    """
-    img = _np(image).astype(np.float32)
-    if mean is not None and std is not None:
-        img = img * np.asarray(std)[:, None, None] + np.asarray(mean)[:, None, None]
-    return np.clip(np.transpose(img, (1, 2, 0)), 0, 1)
-
-
-def overlay_heatmap(
-    image: np.ndarray,
-    heat: Tensor | np.ndarray,
-    ax: Axes | None = None,
-    alpha: float = 0.55,
-    cmap: str | None = None,
-    vmax: float | None = None,
-    signed: bool = False,
-) -> Axes:
-    """
-    Draws an image with a patch-level heatmap upsampled on top.
-
-    Args:
-        image: ``(H, W, 3)`` image in [0, 1] (see :func:`to_display_image`).
-        heat: Patch grid ``(h, w)``, e.g. from
-            :func:`innards.sae.analysis.latent_patch_maps`.
-        ax: Axes to draw on.
-        alpha: Maximum heatmap opacity; opacity scales with the magnitude.
-        cmap: Colour map; defaults to ``"inferno"``, or ``"RdBu_r"`` when
-            ``signed``.
-        vmax: Magnitude mapped to full intensity; ``None`` uses the max.
-        signed: Keep the sign (red positive, blue negative), e.g. for
-            attributions or AbsTopK activations. Otherwise magnitudes are
-            shown.
-
-    Returns:
-        The axes.
-    """
-    ax = _ax(ax, figsize=(3, 3))
-    h = torch.as_tensor(_np(heat)).float()[None, None]
-    h = F.interpolate(h, size=image.shape[:2], mode="bilinear", align_corners=False)[0, 0].numpy()
-    mag = np.abs(h)
-    vmax = vmax or max(float(mag.max()), 1e-8)
-    mag = np.clip(mag / vmax, 0, 1)
-    if signed:
-        colours = plt.get_cmap(cmap or "RdBu_r")(np.clip(0.5 + 0.5 * h / vmax, 0, 1))
-    else:
-        colours = plt.get_cmap(cmap or "inferno")(mag)
-    colours[..., 3] = alpha * mag
-    ax.imshow(image)
-    ax.imshow(colours)
-    ax.axis("off")
-    return ax
-
-
+@styled
 def plot_top_images(
     images: Sequence[np.ndarray],
     heatmaps: Tensor | np.ndarray | None = None,
@@ -324,32 +291,15 @@ def plot_top_images(
     Returns:
         The figure.
     """
-    n = len(images)
-    nrows = int(np.ceil(n / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(2.4 * ncols, 2.5 * nrows), layout="constrained",
-                             squeeze=False)
-    vmax = float(np.abs(_np(heatmaps)).max()) if heatmaps is not None and shared_scale else None
-    for i, ax in enumerate(axes.flat):
-        if i >= n:
-            ax.axis("off")
-            continue
-        if heatmaps is not None:
-            overlay_heatmap(images[i], heatmaps[i], ax=ax, vmax=vmax)
-        else:
-            ax.imshow(images[i])
-            ax.axis("off")
-        if titles is not None:
-            ax.set_title(titles[i], fontsize=8)
-        elif values is not None:
-            ax.set_title(f"{values[i]:.3g}", fontsize=8)
-    if suptitle:
-        fig.suptitle(suptitle)
-    return fig
+    if titles is None and values is not None:
+        titles = [f"{v:.3g}" for v in values]
+    return _image_grid.__wrapped__(list(images), maps=heatmaps, titles=titles, ncols=ncols, shared_scale=shared_scale,
+                              title=suptitle)
 
 
 def _colour(value: float, vmax: float) -> str:
     a = min(abs(value) / vmax, 1.0) if vmax > 0 else 0.0
-    rgb = (220, 60, 50) if value >= 0 else (50, 100, 220)
+    rgb = (208, 59, 59) if value >= 0 else (42, 120, 214)  # the diverging poles
     return f"rgba({rgb[0]},{rgb[1]},{rgb[2]},{a:.3f})"
 
 
@@ -415,7 +365,7 @@ def text_examples_html(
         lo, hi = max(0, pos - context), min(len(tokens), pos + context + 1)
         v = _np(values)
         snippet = token_activation_html(tokens[lo:hi], v[lo:hi], vmax=vmax, highlight=pos - lo)
-        rows.append(f'<div style="margin:2px 0"><span style="color:#888;font-size:80%">'
+        rows.append(f'<div style="margin:2px 0"><span style="color:#898781;font-size:80%">'
                     f'{float(v[pos]):.3g}</span> {snippet}</div>')
     head = f"<h4 style='margin:6px 0'>{html.escape(title)}</h4>" if title else ""
     return head + "".join(rows)
