@@ -12,6 +12,8 @@ Model access:
 
 Subpackages:
 
+* :mod:`innards.analysis`: geometry, similarity, directions, spline partitions,
+  causal effects and interpretation of representations.
 * :mod:`innards.sae`: sparse autoencoders, transcoders and their analysis.
 """
 

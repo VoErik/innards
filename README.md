@@ -35,6 +35,23 @@ extract_to_disk(model, loader, ["blocks.6"], "acts/vit_b_val")   # each layer di
 acts, labels = load_acts("acts/vit_b_val")
 ```
 
+## Analysing representations
+
+`innards.analysis` works on extracted activations (tensors) and directions
+`V (k, d)`, so its modules combine freely (see the
+[guide](docs/guides/representations.md)):
+
+```python
+from innards.analysis import causal, directions, geometry, metrics, spline
+from innards.edits import ablate
+
+W, b, classes = directions.linear_probe(acts["blocks.6"], labels)      # decodable ...
+used = causal.effect(model, loader, {"blocks.6": ablate(W)}, metrics.change(metrics.correct()))  # ... and used?
+V_grad, _ = causal.relevant_subspace(model, loader, "blocks.6", metrics.logit("label"), k=10)
+geometry.subspace_angles(V_grad, geometry.pca(acts["blocks.6"], k=10)[0])  # variance vs. what matters
+spline.local_complexity(model, images, spline.activation_layers(model))   # partition density near data
+```
+
 ## Workflow
 
 This assumes you have a *trained* (`torch`) vision or language model:

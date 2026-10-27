@@ -245,9 +245,11 @@ def patch(source: Tensor, exclude: Sequence[int] = (), mask: Tensor | None = Non
     source = source.detach()
 
     def edit(tokens: Tensor) -> Tensor:
+        src = source.to(tokens)
+        src = src.unsqueeze(1) if src.ndim == tokens.ndim - 1 else src  # "bd" reads are (batch, d)
         keep = keep_mask(tokens, exclude, mask)
         out = tokens.clone()
-        out[keep] = source.to(tokens)[keep]
+        out[keep] = src[keep]
         return out
 
     return edit
