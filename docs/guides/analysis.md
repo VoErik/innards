@@ -62,18 +62,22 @@ over the patch grid.
 ## Interventions
 
 {mod}`innards.sae.interventions` makes causal edits with the error term kept, so only
-the edit changes the model:
+the edit changes the model. {func}`~innards.sae.interventions.sae_edits` returns edits
+for {func}`innards.edits.run` (see [Interventions](interventions.md)), which applies them
+in one nnsight trace:
 
 ```python
-from innards.sae.interventions import clamp, mean_ablate, scale, splice_sae, steer, zero_ablate
+from innards.edits import rows, run, steer
+from innards.sae.interventions import clamp, mean_ablate, sae_edits, scale, zero_ablate
 
-with splice_sae(sae, model.blocks[6], zero_ablate([42]), exclude_positions=(0,)):
-    ablated = model(images)
-with splice_sae(sae, model.blocks[6], clamp(42, value=5 * stats.max_activation[42])):
-    clamped = model(images)
-with steer(model.blocks[6], sae.decoder_weight()[42], alpha=8.0):   # no SAE needed; works in generation
-    out = model.generate(**inputs)
+ablated, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([42]), exclude_positions=(0,)))
+clamped, _ = run(model, images, sae_edits(sae, "blocks.6", clamp(42, value=5 * stats.max_activation[42])))
+steered, _ = run(model, images, {"blocks.6": rows(steer(sae.decoder_weight()[42], 8.0), exclude=(0,))})
 ```
+
+For a transcoder pass ``target=`` (the layer whose output it replaces).
+Modules work in place of layer names when ``model=`` is given, e.g.
+``sae_edits(sae, model.blocks[6], model=model)``.
 
 ## Dashboards
 

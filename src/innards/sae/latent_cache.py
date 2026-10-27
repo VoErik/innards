@@ -67,7 +67,7 @@ META_NAME = "meta.json"
 def cache_latents(
     sae: SAE,
     model: nn.Module,
-    hook_module: nn.Module,
+    hook_module: nn.Module | str,
     input_loader: Iterable,
     out_dir: str | Path,
     layout: str = "btd",
@@ -89,7 +89,7 @@ def cache_latents(
     Args:
         sae: The SAE.
         model: The model the SAE was trained on.
-        hook_module: Module whose output the SAE reads.
+        hook_module: Module (or layer name) whose output the SAE reads.
         input_loader: Iterable of model inputs.
         out_dir: Output directory; created if needed.
         layout: Activation layout at the hook.
@@ -134,7 +134,7 @@ def cache_latents(
         if max_batches is not None and i >= max_batches:
             break
         batch = _to_device(batch, device)
-        tokens = to_tokens(run_capture(model, hook_module, batch, input_fn, stop=True), layout)
+        tokens = to_tokens(run_capture(model, hook_module, batch, input_fn), layout)
         b, t, _ = tokens.shape
         keep = token_keep_mask(tokens, exclude_positions, token_mask_fn, batch)
         flat_idx = rearrange(keep, "b t -> (b t)").nonzero().squeeze(-1)

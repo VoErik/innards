@@ -37,6 +37,7 @@ from collections.abc import (
 from itertools import chain
 from pathlib import Path
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import torch
 from nnsight.intervention.envoy import Envoy
@@ -196,6 +197,45 @@ def describe(
     return info
 
 
+_PLANS: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def plan(
+    model: nn.Module | Envoy,
+    batch: Any,
+    layers: Layers,
+    layouts: str | dict[str, str] | None = None,
+    input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
+) -> tuple[list[str], dict[str, str]]:
+    """
+    Execution order and layouts of layers, cached per model.
+
+    Runs :func:`describe` the first time a set of layers is used with a
+    model; later calls reuse the result. A single layer with a given layout
+    needs no forward pass at all.
+
+    Args:
+        model: An nnsight model or a plain module.
+        batch: An input batch (on the model's device), used on a cache miss.
+        layers: Layer names.
+        layouts: Layouts, see :func:`describe`.
+        input_fn: Maps the batch to ``(args, kwargs)``.
+
+    Returns:
+        ``(order, layouts)``: the layers in execution order and the layout of each.
+    """
+    layers = _as_list(layers)
+    given = {n: layouts.get(n) if isinstance(layouts, dict) else layouts for n in layers}
+    if len(layers) <= 1 and all(given.values()):
+        return layers, given
+    cache = _PLANS.setdefault(unwrap(model), {})
+    key = tuple(given.items())
+    if key not in cache:
+        info = describe(model, batch, layers, layouts, input_fn)
+        cache[key] = (list(info), {n: i["layout"] for n, i in info.items()})
+    return cache[key]
+
+
 def capture(
     model: nn.Module | Envoy,
     batch: Any,
@@ -206,18 +246,21 @@ def capture(
     Raw outputs of several layers, from one nnsight trace.
 
     The forward pass stops after the last layer. Tuple outputs are reduced to
-    their first element.
+    their first element. Gradients flow through the outputs unless the call
+    is wrapped in ``torch.no_grad``.
 
     Args:
         model: An nnsight model or a plain module.
         batch: An input batch (on the model's device).
-        layers: Layer names, in execution order (see :func:`describe`).
+        layers: Layer names, in any order (see :func:`plan`).
         input_fn: Maps the batch to ``(args, kwargs)``.
 
     Returns:
         Layer name -> output.
     """
     model, layers = wrap(model), _as_list(layers)
+    if len(layers) > 1:
+        layers = plan(model, batch, layers, input_fn=input_fn)[0]
     args, kwargs = input_fn(batch)
     out: dict[str, Tensor] = {}
     with model.trace(*args, **kwargs) as tracer:

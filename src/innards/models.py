@@ -54,6 +54,32 @@ def unwrap(model: nn.Module | Envoy) -> nn.Module:
     return model._module if isinstance(model, Envoy) else model
 
 
+def layer_name(model: nn.Module | Envoy, layer: str | nn.Module | Envoy) -> str:
+    """
+    Dotted path of a layer, given as a path, a module or an nnsight envoy.
+
+    Lets functions accept ``model.blocks[6]`` (of the plain or the wrapped
+    model) as well as ``"blocks.6"``.
+
+    Args:
+        model: The model the layer belongs to.
+        layer: The layer.
+
+    Returns:
+        The layer's path in ``model``.
+
+    Raises:
+        ValueError: If the module is not part of the model.
+    """
+    if isinstance(layer, str):
+        return layer
+    module = unwrap(layer)
+    for name, m in unwrap(model).named_modules():
+        if m is module and name:
+            return name
+    raise ValueError(f"{type(module).__name__} is not a submodule of the model")
+
+
 def load(
     name: str,
     pretrained: bool = True,

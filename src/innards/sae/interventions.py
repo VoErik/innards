@@ -1,19 +1,20 @@
 """
 Causal interventions through an SAE: ablating, clamping and steering latents.
 
-:func:`splice_sae` replaces a module's output by the SAE's reconstruction
-with the latents edited, optionally keeping the SAE error term so that only
-the edit changes the model (Marks et al., 2024). Edits are plain functions
-on the ``(n, d_sae)`` activations; the factories below cover the usual ones.
-:func:`steer` adds a direction (e.g. a decoder atom) to the activations
-without running the SAE, which also works during generation.
+:func:`sae_edits` splices the SAE into a layer, as edits for
+:func:`innards.edits.run`: the layer's output is replaced by the SAE's
+reconstruction with the latents edited, optionally keeping the SAE error term
+so that only the edit changes the model (Marks et al., 2024). Latent edits are
+plain functions on the ``(n, d_sae)`` activations; the factories below cover
+the usual ones. To add a direction without running the SAE (e.g. a decoder
+atom), use :func:`innards.edits.steer`.
 
 Typical usage::
 
-    with splice_sae(sae, model.blocks[6], zero_ablate([123]), exclude_positions=(0,)):
-        ablated = model(images)
-    with steer(model.gpt_neox.layers[3], sae.decoder_weight()[42], alpha=8.0):
-        model.generate(**inputs)
+    from innards.edits import run, rows, steer
+
+    logits, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([123]), exclude_positions=(0,)))
+    logits, _ = run(model, images, {"blocks.6": rows(steer(sae.decoder_weight()[42], 8.0), exclude=(0,))})
 
 References:
     Marks, S. et al. (2024). Sparse Feature Circuits: Discovering and Editing
@@ -21,37 +22,37 @@ References:
     Templeton, A. et al. (2024). Scaling Monosemanticity: Extracting
         Interpretable Features from Claude 3 Sonnet. Transformer Circuits
         Thread. (Feature clamping / steering.)
-    Turner, A. et al. (2023). Steering Language Models With Activation
-        Engineering. arXiv:2308.10248.
 """
 
 from __future__ import annotations
 
 from collections.abc import (
     Callable,
-    Iterator,
     Sequence
 )
-from contextlib import contextmanager
-from typing import Any
 
 import torch
+from nnsight.intervention.envoy import Envoy
 from torch import (
     Tensor,
     nn
 )
 
-from .data import splice
+from ..edits import (
+    Edit,
+    cross
+)
+from ..models import layer_name
 from .model import SAE
 
-Edit = Callable[[Tensor], Tensor]
+LatentEdit = Callable[[Tensor], Tensor]
 
 
 def _index(latents: int | Sequence[int] | Tensor, device: torch.device) -> Tensor:
     return torch.as_tensor([latents] if isinstance(latents, int) else latents, device=device, dtype=torch.long)
 
 
-def zero_ablate(latents: int | Sequence[int] | Tensor) -> Edit:
+def zero_ablate(latents: int | Sequence[int] | Tensor) -> LatentEdit:
     """
     Edit setting ``latents`` to 0.
 
@@ -70,7 +71,7 @@ def zero_ablate(latents: int | Sequence[int] | Tensor) -> Edit:
     return edit
 
 
-def mean_ablate(latents: int | Sequence[int] | Tensor, means: Tensor) -> Edit:
+def mean_ablate(latents: int | Sequence[int] | Tensor, means: Tensor) -> LatentEdit:
     """
     Edit setting ``latents`` to their mean activation.
 
@@ -93,7 +94,7 @@ def mean_ablate(latents: int | Sequence[int] | Tensor, means: Tensor) -> Edit:
     return edit
 
 
-def clamp(latents: int | Sequence[int] | Tensor, value: float, only_active: bool = False) -> Edit:
+def clamp(latents: int | Sequence[int] | Tensor, value: float, only_active: bool = False) -> LatentEdit:
     """
     Edit clamping ``latents`` to ``value`` (Templeton et al., 2024).
 
@@ -117,7 +118,7 @@ def clamp(latents: int | Sequence[int] | Tensor, value: float, only_active: bool
     return edit
 
 
-def scale(latents: int | Sequence[int] | Tensor, factor: float) -> Edit:
+def scale(latents: int | Sequence[int] | Tensor, factor: float) -> LatentEdit:
     """
     Edit multiplying ``latents`` by ``factor``.
 
@@ -138,45 +139,24 @@ def scale(latents: int | Sequence[int] | Tensor, factor: float) -> Edit:
     return edit
 
 
-@contextmanager
-def splice_sae(
-    sae: SAE,
-    hook_module: nn.Module,
-    edit: Edit | None = None,
-    keep_error: bool = True,
-    layout: str = "btd",
-    exclude_positions: Sequence[int] = (),
-    token_mask_fn: Callable[[Any], Tensor] | None = None,
-    batch: Any = None,
-    target_module: nn.Module | None = None,
-) -> Iterator[None]:
+def splice_fn(sae: SAE, edit: LatentEdit | None = None, keep_error: bool = True) -> Callable[[Tensor, Tensor], Tensor]:
     """
-    Splices the SAE into ``hook_module``, optionally editing its latents.
+    The SAE splice as a function of kept tokens ``x`` (read) and ``y`` (replaced).
 
-    At every kept token the output ``x`` becomes ``decode(edit(encode(x)))``
-    plus, with ``keep_error``, the SAE error ``x - decode(encode(x))``. With
-    the error kept and no edit the model is unchanged; with an edit, the
-    output moves by exactly the edited latents' decoder contributions.
-    Without the error term and without an edit, the model runs on the SAE
-    reconstruction. For a transcoder (``target_module`` set) the latents are
-    read from ``hook_module`` and ``target_module``'s output ``y`` is replaced
-    by ``decode(edit(encode(x))) + skip(x)`` plus the error ``y - (decode(encode(x)) + skip(x))``.
+    Returns ``decode(edit(encode(x))) + skip(x)``, plus with ``keep_error``
+    the SAE error ``y - (decode(encode(x)) + skip(x))``. With the error kept
+    and no edit, ``y`` is unchanged; with an edit, it moves by exactly the
+    edited latents' decoder contributions. Without the error term and without
+    an edit, it is the SAE reconstruction. For an SAE ``x is y``.
 
     Args:
-        sae: The SAE (should be in eval mode).
-        hook_module: Module whose output the SAE reads.
+        sae: The SAE or transcoder (should be in eval mode).
         edit: Function on the ``(n, d_sae)`` activations (input units), e.g.
             from :func:`zero_ablate` or :func:`clamp`.
         keep_error: Add the SAE error term back.
-        layout: Activation layout at the hook.
-        exclude_positions: Positions left unchanged (e.g. CLS / BOS).
-        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
-            tokens to change, e.g. non-padding tokens.
-        batch: The model input batch passed to ``token_mask_fn``.
-        target_module: For transcoders: the module whose output is replaced.
 
-    Yields:
-        None.
+    Returns:
+        ``fn(x, y) -> y'``, e.g. for :func:`innards.edits.cross`.
     """
 
     def fn(x: Tensor, y: Tensor) -> Tensor:
@@ -187,44 +167,41 @@ def splice_sae(
         new = sae.decode(edit(acts)) + skip if edit is not None else recon
         return new + (y - recon) if keep_error else new
 
-    with splice(hook_module, fn, target_module, layout, exclude_positions, token_mask_fn, batch):
-        yield
+    return fn
 
 
-@contextmanager
-def steer(
-    hook_module: nn.Module,
-    direction: Tensor,
-    alpha: float = 1.0,
-    layout: str = "btd",
+def sae_edits(
+    sae: SAE,
+    layer: str | nn.Module | Envoy,
+    edit: LatentEdit | None = None,
+    keep_error: bool = True,
     exclude_positions: Sequence[int] = (),
-    token_mask_fn: Callable[[Any], Tensor] | None = None,
-    batch: Any = None,
-) -> Iterator[None]:
+    mask: Tensor | None = None,
+    target: str | nn.Module | Envoy | None = None,
+    model: nn.Module | Envoy | None = None,
+) -> dict[str, Edit]:
     """
-    Adds ``alpha * direction`` to the output of ``hook_module`` (Turner et al., 2023).
+    Edits splicing the SAE into ``layer``, optionally editing its latents.
 
-    With a unit-norm decoder atom as ``direction``, ``alpha`` is the latent
-    activation being added. No SAE runs, so this also works token by token
-    during generation.
+    See :func:`splice_fn` for what the kept tokens become. For a transcoder
+    (``target`` set) the latents are read from ``layer`` and ``target``'s
+    output is replaced.
 
     Args:
-        hook_module: Module to steer.
-        direction: Vector of shape ``(d,)``, e.g. ``sae.decoder_weight()[latent]``.
-        alpha: Scale.
-        layout: Activation layout at the hook.
-        exclude_positions: Positions left unchanged. Positions count within
-            each forward call: with KV-cached generation every new token is
-            position 0 of its call, so leave this empty there.
-        token_mask_fn: Optional ``fn(batch) -> bool (batch, tokens)`` mask of
-            tokens to steer.
-        batch: The model input batch passed to ``token_mask_fn``.
+        sae: The SAE (should be in eval mode).
+        layer: Layer whose output the SAE reads, as a name (or a module, with
+            ``model`` given).
+        edit: Function on the ``(n, d_sae)`` activations.
+        keep_error: Add the SAE error term back.
+        exclude_positions: Positions left unchanged (e.g. CLS / BOS).
+        mask: Optional boolean ``(batch, tokens)`` mask of tokens to change,
+            e.g. non-padding tokens.
+        target: For transcoders: the layer whose output is replaced.
+        model: Needed only to resolve modules given as ``layer`` / ``target``.
 
-    Yields:
-        None.
+    Returns:
+        Layer name -> edit, for :func:`innards.edits.run`.
     """
-    direction = direction.detach()
-
-    with splice(hook_module, lambda x, y: y + alpha * direction.to(y), None, layout, exclude_positions,
-                token_mask_fn, batch):
-        yield
+    name = layer if isinstance(layer, str) else layer_name(model, layer)
+    target = name if target is None else target if isinstance(target, str) else layer_name(model, target)
+    return cross(name, target, splice_fn(sae, edit, keep_error), exclude_positions, mask)

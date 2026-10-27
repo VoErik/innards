@@ -1,11 +1,13 @@
 """
 Activation harvesting for SAE training on vision and language models.
 
-:class:`ActivationStore` runs a frozen model over an input loader, captures the
-output of one module with a forward hook, drops excluded tokens and serves
-shuffled token batches from a large buffer, so a batch mixes tokens from many
-images or sequences. The same hook utilities splice the SAE into the model for
-KL fine-tuning (see :meth:`innards.sae.trainer.SAETrainer.finetune_kl`).
+:class:`ActivationStore` runs a frozen model over an input loader, reads the
+output of one module with nnsight (:func:`innards.extract.capture`), drops
+excluded tokens and serves shuffled token batches from a large buffer, so a
+batch mixes tokens from many images or sequences. Interventions (splicing the
+SAE in, e.g. for KL fine-tuning) go through :mod:`innards.edits`; the
+low-level forward-hook utilities here are used by :mod:`innards.sae.clt` and
+:mod:`innards.sae.graph`.
 
 The activation layouts (see :mod:`innards.layouts`) are:
 
@@ -55,6 +57,7 @@ from torch import (
 )
 
 from ..extract import (  # noqa: F401  (re-exported)
+    capture,
     default_input_fn,
     to_device as _to_device
 )
@@ -63,6 +66,10 @@ from ..layouts import (  # noqa: F401  (re-exported)
     from_tokens,
     keep_positions,
     to_tokens
+)
+from ..models import (
+    layer_name,
+    wrap
 )
 
 
@@ -274,72 +281,27 @@ def split_fields(
 
 def run_capture(
     model: nn.Module,
-    hook_module: nn.Module,
+    hook_module: nn.Module | str,
     batch: Any,
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
-    stop: bool = True,
 ) -> Tensor:
     """
     Runs ``model`` on ``batch`` and returns the output of ``hook_module``.
 
+    Reads with nnsight and stops the forward pass after the module; tuple
+    outputs are reduced to their first element.
+
     Args:
-        model: The model.
-        hook_module: Module whose output to capture.
+        model: The model (plain or nnsight).
+        hook_module: Module (or layer name) whose output to capture.
         batch: Input batch (already on the right device).
         input_fn: Maps the batch to ``(args, kwargs)``.
-        stop: Stop the forward pass after ``hook_module``.
 
     Returns:
         The captured activation.
     """
-    return run_capture_many(model, [hook_module], batch, input_fn, stop)[0]
-
-
-def run_capture_many(
-    model: nn.Module,
-    modules: Sequence[nn.Module],
-    batch: Any,
-    input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
-    stop: bool = True,
-) -> list[Tensor]:
-    """
-    Runs ``model`` once and returns the outputs of several modules.
-
-    Args:
-        model: The model.
-        modules: Modules whose outputs to capture (tuple outputs are reduced
-            to their first element).
-        batch: Input batch (already on the right device).
-        input_fn: Maps the batch to ``(args, kwargs)``.
-        stop: Stop the forward pass once every module has run.
-
-    Returns:
-        The captured activations, in the order of ``modules``.
-
-    Raises:
-        RuntimeError: If a module did not run.
-    """
-    store: dict[int, Tensor] = {}
-
-    def make_hook(i: int):
-        def hook(_mod, _inp, out):
-            store[i] = out[0] if isinstance(out, (tuple, list)) else out
-            if stop and len(store) == len(modules):
-                raise _StopForward
-        return hook
-
-    handles = [m.register_forward_hook(make_hook(i)) for i, m in enumerate(modules)]
-    args, kwargs = input_fn(batch)
-    try:
-        model(*args, **kwargs)
-    except _StopForward:
-        pass
-    finally:
-        for h in handles:
-            h.remove()
-    if len(store) != len(modules):
-        raise RuntimeError("some hooked modules did not run during the forward pass")
-    return [store[i] for i in range(len(modules))]
+    name = layer_name(model, hook_module)
+    return capture(model, batch, name, input_fn)[name]
 
 
 class ActivationStore:
@@ -358,10 +320,13 @@ class ActivationStore:
     again for more (the trainer does this when ``total_tokens`` is set).
 
     Args:
-        model: Frozen model; run under ``torch.no_grad`` and in eval mode.
-        hook_module: Module whose output is the activation to train on (the
-            transcoder input when ``target_module`` is set), or a dict of
-            name -> module for several hook points with the same token grid.
+        model: Frozen model (plain or nnsight); run under ``torch.no_grad``
+            and in eval mode. Activations are read with nnsight
+            (:func:`innards.extract.capture`).
+        hook_module: Module (or layer name) whose output is the activation to
+            train on (the transcoder input when ``target_module`` is set), or
+            a dict of name -> module for several hook points with the same
+            token grid.
         input_loader: Iterable of model inputs (images, token dicts, ...).
         batch_tokens: Tokens per served batch.
         buffer_tokens: Shuffle-buffer size in tokens.
@@ -378,7 +343,7 @@ class ActivationStore:
             memory. ``None`` keeps the model's dtype.
         autocast_dtype: Optional autocast dtype for the model forward.
         seed: Shuffle seed.
-        target_module: For transcoders: module whose output is the target.
+        target_module: For transcoders: module (or layer name) whose output is the target.
             Batches are then ``(x, y)`` tuples of matching tokens. It must run
             after ``hook_module``; the forward pass stops after it.
 
@@ -392,7 +357,7 @@ class ActivationStore:
     def __init__(
         self,
         model: nn.Module,
-        hook_module: nn.Module | dict[str, nn.Module],
+        hook_module: nn.Module | str | dict[str, nn.Module | str],
         input_loader: Iterable,
         batch_tokens: int = 4096,
         buffer_tokens: int = 2**19,
@@ -404,7 +369,7 @@ class ActivationStore:
         storage_dtype: torch.dtype | None = None,
         autocast_dtype: torch.dtype | None = None,
         seed: int = 0,
-        target_module: nn.Module | None = None,
+        target_module: nn.Module | str | None = None,
     ):
         if layout not in LAYOUTS:
             raise ValueError(f"unknown layout {layout!r}, expected one of {LAYOUTS}")
@@ -431,6 +396,8 @@ class ActivationStore:
         else:
             self.kind, self.names, self.modules = "tensor", ["activations"], [hook_module]
         self._widths: list[int] = []
+        self._model = wrap(model)
+        self._layers = [layer_name(model, m) for m in self.modules]
 
     @torch.no_grad()
     def harvest(self, batch: Any) -> Tensor:
@@ -448,8 +415,8 @@ class ActivationStore:
         batch = _to_device(batch, self.device)
         with torch.autocast(self.device.type, dtype=self.autocast_dtype or torch.float32,
                             enabled=self.autocast_dtype is not None):
-            acts = run_capture_many(self.model, self.modules, batch, self.input_fn, stop=True)
-        tokens = [to_tokens(a, self.layout) for a in acts]
+            acts = capture(self._model, batch, self._layers, self.input_fn)
+        tokens = [to_tokens(acts[n], self.layout) for n in self._layers]
         keep = token_keep_mask(tokens[0], self.exclude_positions, self.token_mask_fn, batch)
         self._widths = [t.shape[-1] for t in tokens]
         flat = torch.cat([t[keep].to(tokens[0].dtype) for t in tokens], -1)

@@ -11,6 +11,7 @@ layouts
 reduce
 extract
 store
+edits
 ```
 
 ```{toctree}

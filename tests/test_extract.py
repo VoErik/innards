@@ -39,7 +39,6 @@ from innards.reduce import (
     token
 )
 from innards.sae.cache import CachedActivations
-from innards.sae.data import run_capture_many
 from innards.store import (
     load_info,
     load_layer,
@@ -158,11 +157,16 @@ def test_capture_matches_hooks(model_case):
     layers, _ = MODELS[name]
     x = images(2)
     order = list(describe(model, x, layers))
+    ref = {}
+    handles = [unwrap(model).get_submodule(n).register_forward_hook(
+        lambda _m, _i, o, n=n: ref.__setitem__(n, o[0] if isinstance(o, tuple) else o)) for n in layers]
     with torch.no_grad():
         out = capture(model, x, order)
-        ref = run_capture_many(unwrap(model), [unwrap(model).get_submodule(n) for n in layers], x, stop=False)
-    for n, r in zip(layers, ref):
-        assert torch.equal(out[n], r)
+        unwrap(model)(x)
+    for h in handles:
+        h.remove()
+    for n in layers:
+        assert torch.equal(out[n], ref[n])
 
 
 def test_describe_missing_layer():

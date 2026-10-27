@@ -7,7 +7,7 @@ from torch import nn
 from innards.sae.clt import CrossLayerTranscoder, splice_clt
 from innards.sae.data import capture_activation, splice
 from innards.sae.graph import attribution_graph, clt_site, sae_site
-from innards.sae.interventions import splice_sae
+from innards.sae.interventions import splice_fn
 from innards.sae.model import SAE
 
 
@@ -103,8 +103,8 @@ def test_transcoder_graph_is_exact(kw):
             acts[row, lat] = 0
             return acts
 
-        ablated = _pre(net, tcs[d], d, x, splice_sae(tcs[s], net.inp[s], edit, target_module=net.mlps[s]))
-        before = _pre(net, tcs[d], d, x, splice_sae(tcs[s], net.inp[s], target_module=net.mlps[s]))
+        ablated = _pre(net, tcs[d], d, x, splice(net.inp[s], splice_fn(tcs[s], edit), net.mlps[s]))
+        before = _pre(net, tcs[d], d, x, splice(net.inp[s], splice_fn(tcs[s]), net.mlps[s]))
         assert before[dst.position, dst.latent] - ablated[dst.position, dst.latent] == pytest.approx(w, rel=1e-4,
                                                                                                     abs=1e-6)
         checked += 1

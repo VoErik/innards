@@ -202,45 +202,45 @@ def test_cached_activations_order_and_prefetch(tmp_path, bs):
 
 
 def test_interventions(setup):
-    from innards.sae.data import capture_activation, patch_kept_tokens, replace_activation
-    from innards.sae.interventions import clamp, mean_ablate, scale, splice_sae, steer, zero_ablate
+    from innards.edits import rows, run, steer
+    from innards.sae.data import patch_kept_tokens, replace_activation
+    from innards.sae.interventions import clamp, mean_ablate, sae_edits, scale, zero_ablate
 
     vit, images, *_, sae = setup
     x = images[:4]
+
+    def spliced(edit=None, **kw):
+        return run(vit, x, sae_edits(sae, "block", edit, exclude_positions=(0,), **kw))[0]
+
     with torch.no_grad():
         clean = vit(x)
-        with splice_sae(sae, vit.block, exclude_positions=(0,)):  # error kept, no edit: unchanged
-            torch.testing.assert_close(vit(x), clean, atol=1e-5, rtol=1e-5)
-        with splice_sae(sae, vit.block, keep_error=False, exclude_positions=(0,)):
-            spliced = vit(x)
+        torch.testing.assert_close(spliced(), clean, atol=1e-5, rtol=1e-5)  # error kept, no edit: unchanged
+        recon = spliced(keep_error=False)
         with replace_activation(vit.block, lambda a: patch_kept_tokens(a, lambda x, y: sae.reconstruct(x), exclude_positions=(0,))):
-            torch.testing.assert_close(spliced, vit(x), atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(recon, vit(x), atol=1e-5, rtol=1e-5)
+        by_module, _ = run(vit, x, sae_edits(sae, vit.block, keep_error=False, exclude_positions=(0,), model=vit))
+        torch.testing.assert_close(by_module, recon)
 
         lat = int(sae.encode(vit.block(vit.embed(x).flatten(2).transpose(1, 2))).abs().sum((0, 1)).argmax())
-        outs = {}
-        for name, edit in [("zero", zero_ablate(lat)), ("clamp0", clamp([lat], 0.0)), ("scale0", scale(lat, 0.0)),
-                           ("mean0", mean_ablate(lat, torch.zeros(sae.cfg.d_sae)))]:
-            with splice_sae(sae, vit.block, edit, exclude_positions=(0,)):
-                outs[name] = vit(x)
+        outs = {name: spliced(edit) for name, edit in [
+            ("zero", zero_ablate(lat)), ("clamp0", clamp([lat], 0.0)), ("scale0", scale(lat, 0.0)),
+            ("mean0", mean_ablate(lat, torch.zeros(sae.cfg.d_sae)))]}
         assert not torch.allclose(outs["zero"], clean, atol=1e-4)
         for name in ("clamp0", "scale0", "mean0"):
             torch.testing.assert_close(outs[name], outs["zero"])
 
         # The block output moves by exactly -a * d at every patch token where the latent fired.
-        with capture_activation(vit.block) as ref:
-            vit(x)
-        with splice_sae(sae, vit.block, zero_ablate(lat), exclude_positions=(0,)), capture_activation(vit.block) as got:
-            vit(x)
-        a = sae.encode(ref["act"])[..., lat]
-        expected = ref["act"] - a.unsqueeze(-1) * sae.decoder_weight()[lat]
-        torch.testing.assert_close(got["act"][:, 1:], expected[:, 1:], atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(got["act"][:, 0], ref["act"][:, 0])
+        ref = run(vit, x, read="block")[1]["block"]
+        got = run(vit, x, sae_edits(sae, "block", zero_ablate(lat), exclude_positions=(0,)), read="block")[1]["block"]
+        a = sae.encode(ref)[..., lat]
+        expected = ref - a.unsqueeze(-1) * sae.decoder_weight()[lat]
+        torch.testing.assert_close(got[:, 1:], expected[:, 1:], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(got[:, 0], ref[:, 0])
 
         direction = sae.decoder_weight()[lat]
-        with steer(vit.block, direction, alpha=3.0, exclude_positions=(0,)), capture_activation(vit.block) as st:
-            vit(x)
-        torch.testing.assert_close(st["act"][:, 1:], ref["act"][:, 1:] + 3.0 * direction)
-        torch.testing.assert_close(st["act"][:, 0], ref["act"][:, 0])
+        st = run(vit, x, {"block": rows(steer(direction, 3.0), exclude=(0,))}, read="block")[1]["block"]
+        torch.testing.assert_close(st[:, 1:], ref[:, 1:] + 3.0 * direction)
+        torch.testing.assert_close(st[:, 0], ref[:, 0])
 
 
 def test_latent_cache_matches_analysis(tmp_path, setup):

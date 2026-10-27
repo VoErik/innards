@@ -525,7 +525,8 @@ def test_transcoder_config_and_target_checks():
 
 def test_transcoder_store_cache_kl_and_interventions(tmp_path):
     from innards.sae.cache import CachedActivations, cache_activations
-    from innards.sae.interventions import splice_sae, zero_ablate
+    from innards.edits import run
+    from innards.sae.interventions import sae_edits, zero_ablate
 
     torch.manual_seed(0)
     vit = ToyViT()
@@ -558,10 +559,11 @@ def test_transcoder_store_cache_kl_and_interventions(tmp_path):
     tc = tr.model.eval()
     with torch.no_grad():
         clean = vit(images[:4])
-        with splice_sae(tc, ln, target_module=mlp, exclude_positions=(0,)):
-            torch.testing.assert_close(vit(images[:4]), clean, atol=1e-5, rtol=1e-5)
-        with splice_sae(tc, ln, zero_ablate(list(range(128))), target_module=mlp, exclude_positions=(0,)):
-            assert not torch.allclose(vit(images[:4]), clean, atol=1e-3)
+        out, _ = run(vit, images[:4], sae_edits(tc, ln, target=mlp, exclude_positions=(0,), model=vit))
+        torch.testing.assert_close(out, clean, atol=1e-5, rtol=1e-5)
+        out, _ = run(vit, images[:4], sae_edits(tc, ln, zero_ablate(list(range(128))), target=mlp,
+                                               exclude_positions=(0,), model=vit))
+        assert not torch.allclose(out, clean, atol=1e-3)
 
     from innards.sae.analysis import latent_attribution
     attr = latent_attribution(tc, vit, ln, images[:1], lambda o, _: o[:, 2], exclude_positions=(0,),

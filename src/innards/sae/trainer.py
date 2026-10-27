@@ -59,6 +59,15 @@ from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
+from ..edits import (
+    cross,
+    rows,
+    run
+)
+from ..models import (
+    layer_name,
+    wrap
+)
 from .data import (
     _to_device,
     default_input_fn,
@@ -655,10 +664,10 @@ class SAETrainer:
     def finetune_kl(
         self,
         model: nn.Module,
-        hook_module: nn.Module,
+        hook_module: nn.Module | str,
         input_loader: Iterable,
         kl_cfg: KLFinetuneConfig | None = None,
-        target_module: nn.Module | None = None,
+        target_module: nn.Module | str | None = None,
     ) -> SAE:
         """
         Fine-tunes the SAE spliced into ``model`` on KL + reconstruction.
@@ -672,13 +681,15 @@ class SAETrainer:
         after :meth:`train`, for a few percent of the training budget.
 
         Args:
-            model: The model the activations come from (frozen here).
-            hook_module: The module whose output the SAE reconstructs.
+            model: The model the activations come from (frozen here); the SAE
+                is spliced in with nnsight (:func:`innards.edits.run`).
+            hook_module: The module (or layer name) whose output the SAE
+                reconstructs.
             input_loader: Iterable of model inputs (images, token dicts, ...);
                 cycled until ``kl_cfg.steps`` steps are done.
             kl_cfg: Fine-tuning configuration.
-            target_module: For transcoders: the module whose output the
-                transcoder replaces (``hook_module`` is its input).
+            target_module: For transcoders: the module (or layer name) whose
+                output the transcoder replaces (``hook_module`` is its input).
 
         Returns:
             The fine-tuned model (EMA weights if enabled). A checkpoint is
@@ -697,6 +708,9 @@ class SAETrainer:
                               {"sae": asdict(sae.cfg), "kl_finetune": asdict(kc), "lr_resolved": lr})
 
         model.eval()
+        nn_model = wrap(model)
+        hook = layer_name(model, hook_module)
+        target = hook if target_module is None else layer_name(model, target_module)
         grad_flags = [p.requires_grad for p in model.parameters()]
         model.requires_grad_(False)
         sae.train()
@@ -714,12 +728,13 @@ class SAETrainer:
                     captured["out"] = sae(x, target=y if sae.cfg.transcoder else None, return_acts=False)
                     return captured["out"].recon
 
+                mask = kc.token_mask_fn(batch) if kc.token_mask_fn else None
+                edits = cross(hook, target, reconstruct, kc.exclude_positions, mask)
                 with self._autocast():
                     with torch.no_grad():
                         clean = kc.output_fn(model(*args, **kwargs)).float()
-                    with splice(hook_module, reconstruct, target_module, kc.layout, kc.exclude_positions,
-                                kc.token_mask_fn, batch):
-                        patched_logits = kc.output_fn(model(*args, **kwargs)).float()
+                    patched_out, _ = run(nn_model, batch, edits, layouts=kc.layout, input_fn=kc.input_fn)
+                    patched_logits = kc.output_fn(patched_out).float()
 
                 out = captured["out"]
                 kl = self._kl(clean, patched_logits, kc.kl_mask_fn(batch) if kc.kl_mask_fn else None)
@@ -808,13 +823,13 @@ class SAETrainer:
     def evaluate_downstream(
         self,
         model: nn.Module,
-        hook_module: nn.Module,
+        hook_module: nn.Module | str | Sequence[nn.Module],
         input_loader: Iterable,
         kl_cfg: KLFinetuneConfig | None = None,
         max_batches: int | None = None,
         loss_fn: Callable[[Any, Any], Tensor] | None = None,
         ablation: str = "zero",
-        target_module: nn.Module | None = None,
+        target_module: nn.Module | str | Sequence[nn.Module] | None = None,
     ) -> dict[str, float]:
         """
         Downstream fidelity of the model with the SAE spliced in.
@@ -829,7 +844,8 @@ class SAETrainer:
 
         Args:
             model: The model the activations come from.
-            hook_module: The module whose output the SAE reconstructs.
+            hook_module: The module (or layer name) whose output the SAE
+                reconstructs; the SAE is spliced in with nnsight.
             input_loader: Iterable of model inputs.
             kl_cfg: Supplies ``layout``, ``exclude_positions``,
                 ``token_mask_fn``, ``input_fn``, ``output_fn`` and ``kl_mask_fn``.
@@ -864,11 +880,16 @@ class SAETrainer:
         sae.eval()
         model.eval()
         sums = dict(kl=0.0, loss_clean=0.0, loss_sae=0.0, loss_ablated=0.0)
-        agree = rows = 0.0
+        agree = n_rows = 0.0
         n_batches = 0
 
         def ablate(x: Tensor, y: Tensor) -> Tensor:
             return y.mean(0, keepdim=True).expand_as(y) if ablation == "mean" else torch.zeros_like(y)
+
+        if not is_clt:
+            nn_model = wrap(model)
+            hook = layer_name(model, hook_module)
+            target = hook if target_module is None else layer_name(model, target_module)
 
         for i, batch in enumerate(input_loader):
             if max_batches is not None and i >= max_batches:
@@ -876,28 +897,35 @@ class SAETrainer:
             batch = _to_device(batch, self.device)
             args, kwargs = kc.input_fn(batch)
 
-            def replaced():
-                if is_clt:
-                    return splice_clt(sae, hook_module, target_module, layout=kc.layout,
-                                      exclude_positions=kc.exclude_positions, token_mask_fn=kc.token_mask_fn,
-                                      batch=batch)
-                return splice(hook_module, lambda x, y: sae.reconstruct(x), target_module, kc.layout,
-                              kc.exclude_positions, kc.token_mask_fn, batch)
+            def replaced():  # CLTs still splice with forward hooks
+                return splice_clt(sae, hook_module, target_module, layout=kc.layout,
+                                  exclude_positions=kc.exclude_positions, token_mask_fn=kc.token_mask_fn, batch=batch)
 
             def ablated():
                 stack = ExitStack()
-                for m in (target_module if is_clt else [target_module or hook_module]):
+                for m in target_module:
                     stack.enter_context(splice(m, ablate, None, kc.layout, kc.exclude_positions, kc.token_mask_fn,
                                                batch))
                 return stack
 
             with self._autocast():
                 clean_out = model(*args, **kwargs)
-                with replaced():
-                    patched_out = model(*args, **kwargs)
-                if loss_fn is not None:
-                    with ablated():
-                        ablated_out = model(*args, **kwargs)
+                if is_clt:
+                    with replaced():
+                        patched_out = model(*args, **kwargs)
+                    if loss_fn is not None:
+                        with ablated():
+                            ablated_out = model(*args, **kwargs)
+                else:
+                    mask = kc.token_mask_fn(batch) if kc.token_mask_fn else None
+                    patched_out, _ = run(nn_model, batch,
+                                         cross(hook, target, lambda x, y: sae.reconstruct(x), kc.exclude_positions,
+                                               mask),
+                                         layouts=kc.layout, input_fn=kc.input_fn)
+                    if loss_fn is not None:
+                        ablated_out, _ = run(nn_model, batch,
+                                             {target: rows(lambda y: ablate(None, y), kc.exclude_positions, mask)},
+                                             layouts=kc.layout, input_fn=kc.input_fn)
             clean, patched = kc.output_fn(clean_out).float(), kc.output_fn(patched_out).float()
             mask = kc.kl_mask_fn(batch) if kc.kl_mask_fn else None
             sums["kl"] += self._kl(clean, patched, mask).item()
@@ -907,7 +935,7 @@ class SAETrainer:
                 keep = rearrange(mask.to(torch.bool), "... -> (...)")
                 c, p = c[keep], p[keep]
             agree += (c == p).sum().item()
-            rows += c.numel()
+            n_rows += c.numel()
             if loss_fn is not None:
                 sums["loss_clean"] += float(loss_fn(clean_out, batch))
                 sums["loss_sae"] += float(loss_fn(patched_out, batch))
@@ -916,7 +944,7 @@ class SAETrainer:
         sae.train(was_training)
 
         n = max(n_batches, 1)
-        out = {"downstream/kl": sums["kl"] / n, "downstream/top1_agreement": agree / max(rows, 1)}
+        out = {"downstream/kl": sums["kl"] / n, "downstream/top1_agreement": agree / max(n_rows, 1)}
         if loss_fn is not None:
             clean_l, sae_l, abl_l = (sums[k] / n for k in ("loss_clean", "loss_sae", "loss_ablated"))
             out.update({

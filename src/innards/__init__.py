@@ -8,12 +8,17 @@ Model access:
 * :mod:`innards.reduce`: what to keep of each example (CLS token, mean, ...).
 * :mod:`innards.extract`: extracting activations over a dataset, in memory or to disk.
 * :mod:`innards.store`: saving and loading extracted activations.
+* :mod:`innards.edits`: interventions (steering, ablation, patching) applied with nnsight.
 
 Subpackages:
 
 * :mod:`innards.sae`: sparse autoencoders, transcoders and their analysis.
 """
 
+from .edits import (
+    edit_output,
+    run
+)
 from .extract import (
     capture,
     describe,

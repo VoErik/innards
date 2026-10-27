@@ -86,7 +86,8 @@ sae = SAE.load("sae.safetensors", device="cuda")
 ```python
 import torch.nn.functional as F
 from innards.sae import LatentCache, cache_latents
-from innards.sae.interventions import clamp, splice_sae, steer, zero_ablate
+from innards.edits import rows, run, steer
+from innards.sae.interventions import sae_edits, zero_ablate
 
 # Encode a (deterministic) dataset once, then analyse without the model.
 cache = LatentCache(cache_latents(sae, model, model.blocks[6], val_loader, "latents/block6",
@@ -96,11 +97,9 @@ top = cache.top_examples(n_top=20)          # (value, example, position) per lat
 bins = cache.quantile_examples(latent=42)   # samples across activation quantiles
 co = cache.cooccurrence([42, 7, 1001])      # pairwise co-firing counts
 
-# Causal edits: the SAE error term is kept, so only the edit changes the model.
-with splice_sae(sae, model.blocks[6], zero_ablate([42]), exclude_positions=(0,)):
-    ablated_logits = model(images)
-with steer(model.blocks[6], sae.decoder_weight()[42], alpha=8.0):
-    steered_logits = model(images)
+# Causal edits through nnsight: the SAE error term is kept, so only the edit changes the model.
+ablated_logits, _ = run(model, images, sae_edits(sae, "blocks.6", zero_ablate([42]), exclude_positions=(0,)))
+steered_logits, _ = run(model, images, {"blocks.6": rows(steer(sae.decoder_weight()[42], 8.0), exclude=(0,))})
 
 # Downstream fidelity: KL, top-1 agreement and fraction of loss recovered.
 trainer.evaluate_downstream(model, model.blocks[6], val_loader, kl_cfg,
