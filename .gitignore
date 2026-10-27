@@ -1,6 +1,7 @@
 notebooks/activations/
 notebooks/checkpoints/
 notebooks/data/
+examples/data/
 notebooks/runs/
 .idea
 

@@ -1,8 +1,7 @@
 # Figures
 
 {mod}`innards.analysis.plot` draws the results of the analysis tools, and
-{mod}`innards.style` gives every figure in innards (including
-{mod}`innards.sae.viz`) the same look.
+{mod}`innards.style` gives every figure in innards the same look.
 
 ## The style
 

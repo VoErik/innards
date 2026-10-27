@@ -49,6 +49,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from ..analysis.geometry import nearest
+from ..analysis.interp import (
+    readout_effect,
+    top_outputs
+)
 from .graph import (
     AttributionGraph,
     Node
@@ -291,28 +296,21 @@ def latent_dashboard_html(
     neighbors: dict[int, list[list[float]]] = {}
     effects: dict[int, dict[str, list]] = {}
     if sae is not None:
-        atoms = F.normalize(sae.decoder_weight().detach().float().cpu(), dim=-1)
-        for chunk in latents.split(1024):
-            sims = atoms[chunk] @ atoms.T
-            sims[torch.arange(len(chunk)), chunk] = -2.0
-            v, i = sims.topk(min(n_neighbors, atoms.shape[0] - 1), dim=-1)
-            for lat, vs, is_ in zip(chunk.tolist(), v.tolist(), i.tolist()):
-                neighbors[lat] = [[j, round(s, 3)] for j, s in zip(is_, vs)]
+        atoms = sae.decoder_weight().detach().float().cpu()
+        v, i = nearest(atoms, latents, k=n_neighbors)
+        for lat, vs, is_ in zip(latents.tolist(), v.tolist(), i.tolist()):
+            neighbors[lat] = [[j, round(s, 3)] for j, s in zip(is_, vs)]
         if readout is not None:
-            from .analysis import output_effects
-
             def name(i: int) -> str:
                 if output_labels is None:
                     return str(i)
                 return output_labels(i) if callable(output_labels) else str(output_labels[i])
 
-            eff = output_effects(sae, readout, latents=latents, n=8)
-            for row, lat in enumerate(eff.latents.tolist()):
+            top_v, top_i, bot_v, bot_i = top_outputs(readout_effect(atoms[latents], readout.detach().cpu()), n=8)
+            for row, lat in enumerate(latents.tolist()):
                 effects[lat] = {
-                    "top": [[name(i), round(v, 4)] for i, v in zip(eff.top_ids[row].tolist(),
-                                                                   eff.top_values[row].tolist())],
-                    "bottom": [[name(i), round(v, 4)] for i, v in zip(eff.bottom_ids[row].tolist(),
-                                                                      eff.bottom_values[row].tolist())],
+                    "top": [[name(i), round(v, 4)] for i, v in zip(top_i[row].tolist(), top_v[row].tolist())],
+                    "bottom": [[name(i), round(v, 4)] for i, v in zip(bot_i[row].tolist(), bot_v[row].tolist())],
                 }
 
     entries = []

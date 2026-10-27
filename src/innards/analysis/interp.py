@@ -5,12 +5,14 @@ Interpretation: what a direction responds to, where, and what it does.
 * :func:`spatial_map`: where in each image directions fire.
 * :func:`input_attribution`: pixel attribution of a direction (gradient x
   input, integrated gradients).
-* :func:`readout_effect`, :func:`logit_lens`: what directions and
-  intermediate tokens do to the logits.
+* :func:`readout_effect`, :func:`top_outputs`, :func:`logit_lens`: what
+  directions and intermediate tokens do to the logits.
 * :func:`attention_maps`, :func:`attention_rollout`: ViT attention.
 
 Directions are ``v (d,)`` or ``V (k, d)``, e.g. from a probe, PCA,
-``relevant_subspace`` or an SAE decoder (``sae.decoder_weight()``).
+``relevant_subspace`` or an SAE decoder (``sae.decoder_weight()``). Where a
+direction is scored, a function of the tokens works too, e.g. SAE latents
+(``innards.sae.latent_fn(sae, [42])``), see :func:`scores`.
 
 Typical usage::
 
@@ -34,6 +36,7 @@ References:
 from __future__ import annotations
 
 from collections.abc import (
+    Callable,
     Mapping,
     Sequence
 )
@@ -65,13 +68,35 @@ from .geometry import _2d
 Model = nn.Module | Envoy
 
 
-def top_k(X: Tensor, v: Tensor, k: int = 10, largest: bool = True) -> tuple[Tensor, ...]:
+Score = Tensor | Callable[[Tensor], Tensor]
+
+
+def scores(X: Tensor, v: Score) -> Tensor:
     """
-    Examples (and positions) where a direction is most active.
+    Scores of a direction (or several, or any unit) at every row or token.
 
     Args:
         X: Representation ``(n, d)`` or tokens ``(n, t, d)``.
-        v: Direction ``(d,)``; scores are ``X @ v``.
+        v: A direction ``(d,)``, directions ``(k, d)``, or a function of the
+            representation, e.g. an SAE's latents (``innards.sae.latent_fn``).
+
+    Returns:
+        ``X @ v`` (``(n,)`` / ``(n, t)``), ``X @ V.T`` (``(..., k)``), or ``v(X)``.
+    """
+    if callable(v):
+        return v(X).double()
+    v = v.detach().to(X.device, torch.float64)
+    return X.double() @ (v if v.ndim == 1 else v.T)
+
+
+def top_k(X: Tensor, v: Score, k: int = 10, largest: bool = True) -> tuple[Tensor, ...]:
+    """
+    Examples (and positions) where a direction (or unit) is most active.
+
+    Args:
+        X: Representation ``(n, d)`` or tokens ``(n, t, d)``.
+        v: Direction ``(d,)``, or a function giving one score per row or
+            token (see :func:`scores`), e.g. one SAE latent.
         k: Number of results.
         largest: Most positive (``True``) or most negative scores.
 
@@ -79,29 +104,30 @@ def top_k(X: Tensor, v: Tensor, k: int = 10, largest: bool = True) -> tuple[Tens
         ``(values, examples)`` for ``(n, d)`` inputs, ``(values, examples,
         positions)`` for tokens; each ``(k,)``, best first.
     """
-    scores = X.double() @ v.double().to(X.device)
-    values, idx = scores.reshape(-1).topk(min(k, scores.numel()), largest=largest)
-    if scores.ndim == 1:
+    scores_ = scores(X, v)
+    values, idx = scores_.reshape(-1).topk(min(k, scores_.numel()), largest=largest)
+    if scores_.ndim == 1:
         return values.cpu(), idx.cpu()
-    return values.cpu(), (idx // scores.shape[1]).cpu(), (idx % scores.shape[1]).cpu()
+    return values.cpu(), (idx // scores_.shape[1]).cpu(), (idx % scores_.shape[1]).cpu()
 
 
 def spatial_map(
     tokens: Tensor,
-    V: Tensor,
+    V: Score,
     grid: tuple[int, int],
     exclude: Sequence[int] = (),
     size: tuple[int, int] | None = None,
 ) -> Tensor:
     """
-    Activation of directions over the spatial grid of each image.
+    Activation of directions (or units) over the spatial grid of each image.
 
     Works for ViT patch tokens and CNN feature maps alike (both are tokens,
     row-major over the grid).
 
     Args:
         tokens: Tokens ``(n, t, d)``, e.g. from ``extract`` without reduction.
-        V: Direction ``(d,)`` or directions ``(k, d)``.
+        V: Direction ``(d,)``, directions ``(k, d)``, or a function of the
+            tokens (see :func:`scores`), e.g. SAE latents.
         grid: Spatial ``(h, w)`` with ``h * w`` the number of kept tokens,
             e.g. ``load_info(run)["layers"][layer]["grid"]``.
         exclude: Non-spatial tokens to drop, e.g. ``range(model.num_prefix_tokens)``.
@@ -111,17 +137,19 @@ def spatial_map(
         ``(n, h, w)`` for one direction, ``(n, k, h, w)`` for several.
     """
     tokens = tokens[:, keep_positions(tokens.shape[1], list(exclude), tokens.device)]
-    maps = rearrange(tokens.double() @ _2d(V).to(tokens.device).T, "n (h w) k -> n k h w", h=grid[0], w=grid[1])
+    values = scores(tokens, V)
+    single = values.ndim == 2
+    maps = rearrange(values[..., None] if single else values, "n (h w) k -> n k h w", h=grid[0], w=grid[1])
     if size is not None:
         maps = F.interpolate(maps, size=size, mode="bilinear", align_corners=False)
-    return maps[:, 0] if V.ndim == 1 else maps
+    return maps[:, 0] if single else maps
 
 
 def input_attribution(
     model: Model,
     x: Tensor,
     layer: str,
-    v: Tensor,
+    v: Score,
     method: str = "grad_x_input",
     exclude: Sequence[int] = (),
     steps: int = 32,
@@ -129,9 +157,10 @@ def input_attribution(
     layouts: str | dict[str, str] | None = None,
 ) -> Tensor:
     """
-    Input attribution of a direction's activation at a layer.
+    Input attribution of a direction's (or unit's) activation at a layer.
 
-    The attributed score is ``sum over kept tokens of (h . v)``.
+    The attributed score is the sum over kept tokens of ``h . v`` (or of
+    ``v(h)`` for a function, e.g. an SAE latent's pre-activation).
     ``"grad_x_input"`` is gradient times input (Simonyan et al., 2013);
     ``"integrated_gradients"`` averages the gradient along the straight path
     from ``baseline`` (Sundararajan et al., 2017), so the attributions sum to
@@ -141,7 +170,8 @@ def input_attribution(
         model: An nnsight model or a plain module.
         x: Inputs ``(batch, ...)``, e.g. images, on the model's device.
         layer: The layer.
-        v: Direction ``(d,)``.
+        v: Direction ``(d,)``, or a function giving one score per token
+            (see :func:`scores`).
         method: ``"grad_x_input"`` or ``"integrated_gradients"``.
         exclude: Token positions left out of the score, e.g. ``(0,)``.
         steps: Path points for integrated gradients.
@@ -158,14 +188,15 @@ def input_attribution(
         raise ValueError(f"unknown method {method!r}")
     model = wrap(model)
     layout = plan(model, x[:1], [layer], layouts)[1][layer]
-    v = v.detach().to(x)
+    v = v if callable(v) else v.detach().to(x)
 
     def grad(inputs: Tensor) -> Tensor:
         inputs = inputs.detach().requires_grad_(True)
         with torch.enable_grad():
             tokens = to_tokens(capture(model, inputs, layer)[layer], layout)
             tokens = tokens[:, keep_positions(tokens.shape[1], list(exclude), tokens.device)]
-            return torch.autograd.grad((tokens @ v).sum(), inputs)[0]
+            score = v(tokens) if callable(v) else tokens @ v
+            return torch.autograd.grad(score.sum(), inputs)[0]
 
     if method == "grad_x_input":
         return (grad(x) * x).detach()
@@ -192,6 +223,24 @@ def readout_effect(V: Tensor, W: Tensor) -> Tensor:
         ``.topk(5)`` gives the classes a direction promotes.
     """
     return _2d(V) @ W.detach().double().T.to(V.device)
+
+
+def top_outputs(effects: Tensor, n: int = 10) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """
+    The outputs each direction promotes and suppresses most.
+
+    Args:
+        effects: ``(k, outputs)`` effects, e.g. from :func:`readout_effect`.
+        n: Number of outputs per direction and sign (at most the number of outputs).
+
+    Returns:
+        ``(top_values, top_ids, bottom_values, bottom_ids)``, each ``(k, n)``,
+        strongest first.
+    """
+    n = min(n, effects.shape[-1])
+    top_v, top_i = effects.topk(n, dim=-1)
+    bot_v, bot_i = effects.topk(n, dim=-1, largest=False)
+    return top_v, top_i, bot_v, bot_i
 
 
 def logit_lens(model: Model, tokens: Tensor) -> Tensor:

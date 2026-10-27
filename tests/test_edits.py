@@ -8,6 +8,7 @@ timm = pytest.importorskip("timm")
 
 from innards.edits import (
     ablate,
+    clamp,
     compose,
     cross,
     edit_output,
@@ -16,6 +17,7 @@ from innards.edits import (
     patch,
     rows,
     run,
+    scale,
     steer,
     zero
 )
@@ -113,6 +115,19 @@ def test_keep_mask():
     m = torch.tensor([[True, True, False, True], [True, True, True, True]])
     assert keep_mask(t, (0,), m).tolist() == [[False, True, False, True], [False, True, True, True]]
     assert keep_mask(t).all()
+
+
+def test_unit_edits():
+    x = torch.tensor([[[1.0, -2.0, 0.0, 3.0]]])
+    assert zero([1])(x).tolist() == [[[1.0, 0.0, 0.0, 3.0]]]
+    assert zero()(x).abs().sum() == 0
+    assert scale(0, 2.0)(x).tolist() == [[[2.0, -2.0, 0.0, 3.0]]]
+    assert scale(torch.tensor([0, 3]), -1.0)(x).tolist() == [[[-1.0, -2.0, 0.0, -3.0]]]
+    assert clamp([2, 3], 7.0)(x).tolist() == [[[1.0, -2.0, 7.0, 7.0]]]
+    assert clamp([2, 3], 7.0, only_active=True)(x).tolist() == [[[1.0, -2.0, 0.0, 7.0]]]
+    mean = torch.tensor([10.0, 20.0, 30.0, 40.0])
+    assert mean_ablate(mean, [0, 2])(x).tolist() == [[[10.0, -2.0, 30.0, 3.0]]]
+    assert x.tolist() == [[[1.0, -2.0, 0.0, 3.0]]]  # edits do not modify their input
 
 
 class Toy(nn.Module):

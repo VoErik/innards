@@ -52,8 +52,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
-from einops import rearrange
 from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
@@ -62,6 +60,10 @@ from ..edits import (
     cross,
     rows,
     run
+)
+from ..analysis.metrics import (
+    flip,
+    kl
 )
 from ..extract import (
     default_input_fn,
@@ -223,6 +225,14 @@ class KLFinetuneConfig:
     output_fn: Callable[[Any], Tensor] = lambda out: out
     kl_mask_fn: Callable[[Any], Tensor] | None = None
     log_every: int = 50
+
+_KL, _FLIP = kl(), flip()
+
+
+def _masked(values: Tensor, mask: Tensor | None) -> Tensor:
+    """Flattens per-row values ``(...)`` and keeps the rows where ``mask`` is set."""
+    values = values.reshape(-1)
+    return values if mask is None else values[mask.reshape(-1).to(torch.bool)]
 
 
 class MetricLogger:
@@ -733,7 +743,7 @@ class SAETrainer:
                     patched_logits = kc.output_fn(patched_out).float()
 
                 out = captured["out"]
-                kl = self._kl(clean, patched_logits, kc.kl_mask_fn(batch) if kc.kl_mask_fn else None)
+                kl = _masked(_KL(clean, patched_logits, batch), kc.kl_mask_fn(batch) if kc.kl_mask_fn else None).mean()
                 alpha = out.loss.detach() / (kl.detach() + 1e-8)
                 loss = 0.5 * (out.loss + alpha * kl)
                 grad_norm = self._optimizer_step(loss, optimizers, schedulers)
@@ -766,17 +776,6 @@ class SAETrainer:
                     p.copy_(self.ema[name])
             self.model.post_optimizer_step()
         return self.model
-
-    @staticmethod
-    def _kl(clean: Tensor, patched: Tensor, mask: Tensor | None) -> Tensor:
-        """Mean KL(clean || patched) over all logit rows (or the masked ones)."""
-        clean = rearrange(clean, "... c -> (...) c")
-        patched = rearrange(patched, "... c -> (...) c")
-        if mask is not None:
-            keep = rearrange(mask.to(torch.bool), "... -> (...)")
-            clean, patched = clean[keep], patched[keep]
-        return F.kl_div(F.log_softmax(patched, -1), F.log_softmax(clean, -1), log_target=True,
-                        reduction="batchmean")
 
     @torch.no_grad()
     def evaluate(self, dataloader: Iterable, max_batches: int | None = None) -> dict[str, float]:
@@ -911,14 +910,10 @@ class SAETrainer:
                                          input_fn=kc.input_fn)
             clean, patched = kc.output_fn(clean_out).float(), kc.output_fn(patched_out).float()
             mask = kc.kl_mask_fn(batch) if kc.kl_mask_fn else None
-            sums["kl"] += self._kl(clean, patched, mask).item()
-            c = rearrange(clean, "... c -> (...) c").argmax(-1)
-            p = rearrange(patched, "... c -> (...) c").argmax(-1)
-            if mask is not None:
-                keep = rearrange(mask.to(torch.bool), "... -> (...)")
-                c, p = c[keep], p[keep]
-            agree += (c == p).sum().item()
-            n_rows += c.numel()
+            sums["kl"] += _masked(_KL(clean, patched, batch), mask).mean().item()
+            flips = _masked(_FLIP(clean, patched, batch), mask)
+            agree += (1 - flips).sum().item()
+            n_rows += flips.numel()
             if loss_fn is not None:
                 sums["loss_clean"] += float(loss_fn(clean_out, batch))
                 sums["loss_sae"] += float(loss_fn(patched_out, batch))

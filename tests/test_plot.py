@@ -104,6 +104,28 @@ def test_embedding_caps_highlighted_classes():
     plot.embedding(X, method="tsne")
 
 
+def test_embedding_values_annotate_and_coordinates():
+    X = torch.randn(100, 8, generator=gen())
+    ax = plot.embedding(X, values=X[:, 0], values_label="x0", annotate=[3, 7])
+    assert len(ax.figure.axes) == 2  # color bar
+    assert [t.get_text() for t in ax.texts] == ["3", "7"]
+    ax = plot.embedding(X[:, :2], method=None)
+    np.testing.assert_allclose(ax.collections[0].get_offsets(), X[:, :2].numpy(), rtol=1e-6)
+    with pytest.raises(ValueError):
+        plot.embedding(X, torch.zeros(100), values=X[:, 0])
+
+
+def test_bars_and_histogram():
+    ax = plot.bars(torch.tensor([2.0, 0.5, -1.0]), ["a", "b", "c"], xlabel="effect")
+    colors = [to_hex(p.get_facecolor()) for p in ax.patches]
+    assert colors == [style.DIVERGING[8]] * 2 + [style.DIVERGING[2]]
+    top = max(ax.get_yticklabels(), key=lambda t: t.get_position()[1])
+    assert top.get_text() == "a"  # first value on top
+    ax = plot.histogram(torch.tensor([0.0, 0.0, 0.1, 0.01, 1e-3]), log10=True, title="density")
+    assert ax.get_title(loc="left") == "density (2 of 5 zero)"
+    assert sum(p.get_height() for p in ax.patches) == 3
+
+
 def test_partition_and_images():
     torch.manual_seed(0)
     net = torch.nn.Sequential(torch.nn.Linear(2, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2))

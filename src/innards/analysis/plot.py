@@ -47,6 +47,7 @@ from torch import Tensor
 
 from .. import style
 from ..style import (
+    DIVERGING,
     INK,
     color
 )
@@ -401,48 +402,73 @@ def embedding(
     method: str = "pca",
     highlight: Sequence | None = None,
     class_names: Mapping | Sequence[str] | None = None,
+    values: Tensor | np.ndarray | None = None,
+    values_label: str = "",
+    annotate: Sequence[int] = (),
+    metric: str = "euclidean",
     title: str = "",
     seed: int = 0,
 ) -> Axes:
     """
-    2-D embedding of a representation, colored by class.
+    2-D embedding of a representation (or a set of directions), colored by
+    class or by a continuous value.
 
     At most three classes get a color (more cannot be told apart reliably in
-    a scatter); the others are drawn in gray as context.
+    a scatter); the others are drawn in gray as context. For an SAE
+    dictionary, pass the normalised atoms with ``metric="cosine"`` and e.g.
+    ``values=log10(frequency)``.
 
     Args:
-        X: Representation ``(n, d)``.
+        X: Representation ``(n, d)``, or precomputed coordinates ``(n, 2)``
+            with ``method=None``.
         y: Labels ``(n,)``.
         ax: Axes to draw on.
-        method: ``"pca"`` or ``"tsne"`` (scikit-learn).
+        method: ``"pca"``, ``"tsne"`` or ``"umap"`` (:func:`~innards.analysis.geometry.embed`),
+            or ``None`` when ``X`` already holds 2-D coordinates.
         highlight: Up to three classes to color; ``None`` takes the first three.
         class_names: Names of the classes (by label value or index).
+        values: Per-point values ``(n,)`` for a sequential color scale
+            (instead of ``y``).
+        values_label: Color-bar label for ``values``.
+        annotate: Indices of points to circle and label.
+        metric: Distance for t-SNE and UMAP.
         title: Axes title.
-        seed: Seed for t-SNE.
+        seed: Seed for t-SNE and UMAP.
 
     Returns:
         The axes.
 
     Raises:
-        ValueError: For an unknown method or more than three highlighted classes.
+        ValueError: For an unknown method, more than three highlighted
+            classes, or both ``y`` and ``values``.
     """
-    Z = _np(X).reshape(len(X), -1)
-    if method == "pca":
-        from .geometry import pca
+    from .geometry import (
+        embed,
+        pca
+    )
 
-        V, ratio = pca(torch.from_numpy(Z), k=2)
-        P = (Z - Z.mean(0)) @ _np(V).T
+    if y is not None and values is not None:
+        raise ValueError("color by classes (y) or by values, not both")
+    Z = torch.as_tensor(_np(X)).reshape(len(X), -1)
+    if method is None:
+        P = _np(Z)[:, :2]
+        labels = ["", ""]
+    elif method == "pca":
+        _, ratio = pca(Z, k=2)
+        P = _np(embed(Z, "pca"))
         labels = [f"PC1 ({100 * float(ratio[0]):.0f}%)", f"PC2 ({100 * float(ratio[1]):.0f}%)"]
-    elif method == "tsne":
-        from sklearn.manifold import TSNE
-
-        P = TSNE(n_components=2, random_state=seed, init="pca").fit_transform(Z)
-        labels = ["t-SNE 1", "t-SNE 2"]
     else:
-        raise ValueError(f"method must be 'pca' or 'tsne', got {method!r}")
+        P = _np(embed(Z, method, metric=metric, seed=seed))
+        name = {"tsne": "t-SNE", "umap": "UMAP"}.get(method, method)
+        labels = [f"{name} 1", f"{name} 2"]
     ax = _ax(ax, figsize=(3.2, 3.0))
-    if y is None:
-        ax.scatter(P[:, 0], P[:, 1], s=6, color=color(0), alpha=0.8, linewidths=0)
+    size = 6 if len(P) < 5000 else 3
+    if values is not None:
+        sc = ax.scatter(P[:, 0], P[:, 1], s=size, c=_np(values).reshape(-1), cmap="innards_seq", linewidths=0)
+        cb = ax.figure.colorbar(sc, ax=ax, shrink=0.8, aspect=25, label=values_label)
+        cb.outline.set_visible(False)
+    elif y is None:
+        ax.scatter(P[:, 0], P[:, 1], s=size, color=color(0), alpha=0.8, linewidths=0)
     else:
         yy = _np(y).reshape(-1)
         classes = list(np.unique(yy))
@@ -458,10 +484,97 @@ def embedding(
             ax.scatter(P[sel, 0], P[sel, 1], s=7, color=color(i), linewidths=0.3, edgecolors=INK["surface"],
                        label=name)
         ax.legend(loc="best", markerscale=1.5)
+    for i in annotate:
+        ax.scatter(P[i, 0], P[i, 1], s=30, facecolors="none", edgecolors=INK["primary"], linewidths=0.8)
+        ax.annotate(str(int(i)), (P[i, 0], P[i, 1]), xytext=(3, 3), textcoords="offset points", fontsize=6.5,
+                    color=INK["primary"])
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_xlabel(labels[0])
     ax.set_ylabel(labels[1])
+    ax.set_title(title)
+    return ax
+
+
+@styled
+def bars(
+    values: Tensor | np.ndarray,
+    labels: Sequence[str],
+    ax: Axes | None = None,
+    xlabel: str = "",
+    title: str = "",
+) -> Axes:
+    """
+    Horizontal bars of signed values in the given order, top to bottom, e.g.
+    the outputs a direction promotes and suppresses (:func:`~innards.analysis.interp.top_outputs`)
+    or the attribution of the top latents.
+
+    Positive bars take the red pole of the diverging palette, negative bars
+    the blue one.
+
+    Args:
+        values: Values ``(k,)``.
+        labels: Bar names ``(k,)``.
+        ax: Axes to draw on.
+        xlabel: x-axis label.
+        title: Axes title.
+
+    Returns:
+        The axes.
+    """
+    v = _np(values).reshape(-1)
+    ax = _ax(ax, figsize=(3.5, max(1.2, 0.16 * len(v) + 0.5)))
+    y = np.arange(len(v))[::-1]
+    ax.barh(y, v, height=0.7, color=[DIVERGING[8] if x > 0 else DIVERGING[2] for x in v])
+    ax.set_yticks(y, list(labels))
+    ax.axvline(0, color=INK["axis"], linewidth=0.8)
+    ax.grid(axis="x")
+    ax.tick_params(axis="y", length=0)
+    ax.set_xlabel(xlabel)
+    ax.set_title(title)
+    return ax
+
+
+@styled
+def histogram(
+    values: Tensor | np.ndarray,
+    ax: Axes | None = None,
+    bins: int = 60,
+    log10: bool = False,
+    xlabel: str = "",
+    ylabel: str = "count",
+    title: str = "",
+) -> Axes:
+    """
+    Histogram of one quantity, e.g. unit firing frequencies (``log10=True``)
+    or each direction's highest cosine to another (:func:`~innards.analysis.geometry.nearest`).
+
+    With ``log10``, values that are not positive (dead units) cannot be
+    drawn; their count is added to the title.
+
+    Args:
+        values: Values (any shape; flattened).
+        ax: Axes to draw on.
+        bins: Number of bins.
+        log10: Histogram of ``log10(values)``.
+        xlabel: x-axis label.
+        ylabel: y-axis label.
+        title: Axes title.
+
+    Returns:
+        The axes.
+    """
+    ax = _ax(ax)
+    v = _np(values).reshape(-1)
+    if log10:
+        n_out = int((v <= 0).sum())
+        v = np.log10(v[v > 0])
+        if n_out:
+            title = f"{title} ({n_out} of {n_out + v.size} zero)".strip()
+    ax.hist(v, bins=bins, color=color(0), edgecolor=INK["surface"], linewidth=0.4)
+    ax.grid(axis="y")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
     return ax
 

@@ -5,7 +5,6 @@ Representation geometry across layers: decodability, dimensionality, similarity,
 """
 
 import matplotlib.pyplot as plt
-import torch
 from common import IMAGENET_IDX, NAMES, dense, figure_path, parse, setup
 
 from innards import extract, stage_names, unwrap

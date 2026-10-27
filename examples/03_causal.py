@@ -4,9 +4,8 @@ Causal analysis: steering, ablating what a probe finds, activation patching, and
     python examples/03_causal.py --model vit_tiny_patch16_224.augreg_in21k_ft_in1k
 """
 
-import matplotlib.pyplot as plt
 import torch
-from common import IMAGENET_IDX, NAMES, dense, figure_path, parse, setup, stack
+from common import IMAGENET_IDX, dense, figure_path, parse, setup, stack
 
 from innards import extract, unwrap
 from innards.analysis import causal, directions, geometry, metrics, plot
