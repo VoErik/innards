@@ -25,6 +25,8 @@ analysis_spline
 analysis_causal
 analysis_metrics
 analysis_interp
+analysis_plot
+style
 ```
 
 ```{toctree}

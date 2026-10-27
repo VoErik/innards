@@ -156,7 +156,7 @@ def test_viz_smoke(setup):
     maps = A.latent_patch_maps(sae, vit, vit.block, images[:3], 0, exclude_positions=(0,))
     viz.plot_top_images(imgs, maps, values=[1.0, 2.0, 3.0], suptitle="latent 0")
     html = viz.text_examples_html([(["a", "b<", "c"], [0.0, 1.0, -0.5], 1)], title="latent 0", context=1)
-    assert "b&lt;" in html and "rgba(220,60,50,1.000)" in html
+    assert "b&lt;" in html and "rgba(208,59,59,1.000)" in html
 
 
 def test_latent_attribution_token_mask(setup):

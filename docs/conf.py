@@ -38,7 +38,7 @@ napoleon_use_ivar = True  # attributes as fields, so dataclass members are not d
 html_theme = "furo"
 html_title = "innards"
 html_theme_options = {
-    "source_repository": "https://github.com/VoErik/sparse-autoencoder",
+    "source_repository": "https://github.com/VoErik/innards",
     "source_branch": "main",
     "source_directory": "docs/",
     "light_css_variables": {"color-brand-primary": "#c2410c", "color-brand-content": "#c2410c"},

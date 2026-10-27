@@ -170,7 +170,7 @@ class TrainerConfig:
     seed: int = 0
 
     loggers: tuple[str, ...] = ()
-    project: str = "sae"
+    project: str = "innards"
     run_name: str | None = None
     log_dir: str = "runs"
     log_every: int = 100

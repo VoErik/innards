@@ -1,0 +1,94 @@
+# innards: clean, publication-style matplotlib figures.
+#
+# Use with ``innards.style.use()`` (or ``with innards.style.context(): ...``),
+# which also registers the colormaps innards_seq / innards_div; plain
+# ``plt.style.use(path)`` works too, without the colormap default.
+#
+# Sizes are for print: a single-column figure is 3.5 in wide, text 7-8 pt.
+
+# figure and saving
+figure.figsize: 3.5, 2.6
+figure.dpi: 150
+figure.facecolor: white
+figure.constrained_layout.use: True
+savefig.dpi: 300
+savefig.facecolor: white
+savefig.bbox: tight
+savefig.pad_inches: 0.02
+savefig.format: pdf
+pdf.fonttype: 42
+ps.fonttype: 42
+svg.fonttype: none
+
+# text: one sans throughout, ink colors (never the data colors)
+font.family: sans-serif
+font.sans-serif: Helvetica Neue, Helvetica, Arial, Inter, Liberation Sans, DejaVu Sans
+font.size: 8
+text.color: 0b0b0b
+axes.titlesize: 8
+axes.titleweight: semibold
+axes.titlelocation: left
+axes.titlepad: 6
+axes.labelsize: 8
+axes.labelcolor: 52514e
+axes.labelpad: 3
+xtick.labelsize: 7
+ytick.labelsize: 7
+xtick.labelcolor: 52514e
+ytick.labelcolor: 52514e
+legend.fontsize: 7
+legend.title_fontsize: 7
+legend.frameon: False
+legend.handlelength: 1.2
+legend.handletextpad: 0.5
+legend.borderaxespad: 0.3
+legend.labelspacing: 0.3
+mathtext.default: regular
+
+# axes: recessive hairlines, left and bottom only
+axes.facecolor: white
+axes.edgecolor: c3c2b7
+axes.linewidth: 0.6
+axes.spines.top: False
+axes.spines.right: False
+axes.axisbelow: True
+axes.xmargin: 0.02
+axes.ymargin: 0.05
+xtick.color: c3c2b7
+ytick.color: c3c2b7
+xtick.major.size: 3
+ytick.major.size: 3
+xtick.major.width: 0.6
+ytick.major.width: 0.6
+xtick.minor.size: 1.5
+ytick.minor.size: 1.5
+xtick.minor.width: 0.4
+ytick.minor.width: 0.4
+xtick.direction: out
+ytick.direction: out
+
+# grid: solid hairlines, off by default (plots switch on the axis they need)
+axes.grid: False
+grid.color: e1e0d9
+grid.linewidth: 0.5
+grid.linestyle: -
+
+# marks: thin lines, small markers, no outlines
+lines.linewidth: 1.5
+lines.markersize: 4
+lines.solid_capstyle: round
+lines.solid_joinstyle: round
+lines.dash_capstyle: round
+patch.linewidth: 0
+patch.edgecolor: white
+scatter.marker: o
+scatter.edgecolors: face
+errorbar.capsize: 0
+boxplot.flierprops.markersize: 2
+hist.bins: auto
+
+# categorical colors in fixed order (validated for color-vision deficiencies)
+axes.prop_cycle: cycler("color", ["2a78d6", "eb6834", "1baf7a", "eda100", "e87ba4", "008300", "6250d6", "e34948"])
+
+image.interpolation: nearest
+image.origin: upper
