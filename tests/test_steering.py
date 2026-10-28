@@ -78,10 +78,65 @@ def test_piecewise_linear_between_crossings(setup):
     torch.testing.assert_close(step[~crossed], path.slopes[:, :-1][~crossed], atol=1e-4, rtol=1e-4)
     # projections: an index picks a class, a readout vector projects
     torch.testing.assert_close(slope_jumps(path, 2), slope_jumps(path, torch.eye(5)[2]))
-    where, jump, segs = decisive(path, target=2, k=3)
-    assert where.shape == jump.shape == segs.shape == (3, 3)
+    path = steer_path(net, x, "lin1", v, alphas, target=2)
+    where, jump, idx = decisive(path, k=3)
+    assert where.shape == jump.shape == idx.shape == (3, 3) and (idx >= 0).all()
     assert (jump.abs()[:, :-1] >= jump.abs()[:, 1:]).all()
-    assert ((alphas[segs] <= where + 1e-6) & (where <= alphas[segs + 1] + 1e-6)).all()
+    torch.testing.assert_close(path.crossings.alpha[idx], where)
+    assert (path.crossings.example[idx] == torch.arange(3)[:, None]).all()
+
+
+def _reference_crossings(net, x, v, lo, hi, n=200_001):
+    """Crossings of act1 / act2 from a very fine grid: {(example, layer, unit): sorted alphas}."""
+    a = torch.linspace(lo, hi, n)
+    h = net.lin1(x).detach()
+    out = {}
+    with torch.no_grad():
+        for e in range(x.shape[0]):
+            z1 = h[e].reshape(1, -1) + a[:, None] * v.repeat(4)[None]  # (n, 4 * 16), token-major
+            z2 = net.lin2(net.act1(z1.reshape(n, 4, 16))).reshape(n, -1)
+            for li, z in enumerate((z1, z2)):
+                t, u = ((z[1:] > 0) != (z[:-1] > 0)).nonzero(as_tuple=True)
+                for ti, ui in zip(t.tolist(), u.tolist()):
+                    z0_, z1_ = z[ti, ui], z[ti + 1, ui]
+                    out.setdefault((e, li, ui), []).append(float(a[ti] - z0_ / (z1_ - z0_) * (a[1] - a[0])))
+    return out
+
+
+def test_refinement_finds_double_crossings_and_attributes_kinks(setup):
+    net, x, v, _ = setup
+    alphas = torch.linspace(-6, 6, 7)  # coarse: many kinks per segment
+    path = steer_path(net, x, "lin1", v, alphas, target=2, refine=20)
+    assert path.layers == ["act1", "act2"] and path.resolved.all()
+    c = path.crossings
+    assert c.exact.all() and not c.jump.isnan().any()
+    found = {}
+    for e, li, u, a in zip(c.example.tolist(), c.layer.tolist(), c.unit.tolist(), c.alpha.tolist()):
+        if li >= 0:
+            found.setdefault((e, li, u), []).append(a)
+    ref = _reference_crossings(net, x, v, -6, 6)
+    assert found.keys() == ref.keys()
+    for key in ref:
+        assert len(found[key]) == len(ref[key]), key
+        torch.testing.assert_close(torch.tensor(sorted(found[key])), torch.tensor(ref[key]), atol=1e-3, rtol=0)
+    # units switching twice inside one coarse segment are found
+    twice = [(e, li, u, s) for (e, li, u), s in
+             {(e, li, u): torch.tensor(a) for (e, li, u), a in found.items()}.items()
+             if len(s) > 1 and len(set(torch.bucketize(s, alphas).tolist())) < len(s)]
+    assert twice, "the example should contain double crossings within a segment"
+    # the per-crossing slope changes add up to each segment's slope change
+    seg_sum = torch.zeros(3, len(alphas) - 1).index_put_((c.example, c.segment), c.jump, accumulate=True)
+    torch.testing.assert_close(seg_sum, slope_jumps(path, 2), atol=1e-4, rtol=1e-4)
+    # tracking only act2: act1's kinks are attributed to untracked units (layer -1), sums unchanged
+    part = steer_path(net, x, "lin1", v, alphas, layers=["act2"], target=2, refine=20)
+    assert part.resolved.all() and (part.crossings.layer == -1).any()
+    pc = part.crossings
+    seg_sum = torch.zeros(3, len(alphas) - 1).index_put_((pc.example, pc.segment), pc.jump, accumulate=True)
+    torch.testing.assert_close(seg_sum, slope_jumps(part, 2), atol=1e-4, rtol=1e-4)
+    # without refinement, unresolved segments are flagged and fall back to sign changes
+    flat = steer_path(net, x, "lin1", v, alphas, refine=0)
+    assert not flat.resolved.all() and not flat.crossings.exact.all()
+    assert flat.crossings.jump[~flat.crossings.exact].isnan().all()
 
 
 def test_soft_codes_and_transition_mass():
@@ -147,3 +202,25 @@ def test_spline_steer_is_gradient_ascent_on_a_linear_model():
     deltas, _ = spline_steer(lin, x, "0", metrics.logit(1), steps=5, step_size=0.5)
     w = lin[2].weight[1].detach()
     torch.testing.assert_close(deltas[:, -1], (2.5 * w / w.norm()).expand(2, -1), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_refinement_is_exact_across_networks(seed):
+    net = TokenMLP(seed=seed).eval()
+    x = torch.randn(3, 4, 8, generator=torch.Generator().manual_seed(100 + seed))
+    v = torch.randn(16, generator=torch.Generator().manual_seed(200 + seed))
+    alphas = torch.linspace(-6, 6, 7)
+    path = steer_path(net, x, "lin1", v, alphas, target=1, refine=20)
+    assert path.resolved.float().mean() >= 0.9  # crossings closer than float32 can separate stay unresolved
+    c = path.crossings
+    found = {}
+    for e, li, u, a in zip(c.example.tolist(), c.layer.tolist(), c.unit.tolist(), c.alpha.tolist()):
+        found.setdefault((e, li, u), []).append(a)
+    ref = _reference_crossings(net, x, v, -6, 6)
+    assert found.keys() == ref.keys()
+    for key in ref:
+        torch.testing.assert_close(torch.tensor(sorted(found[key])), torch.tensor(ref[key]), atol=1e-3, rtol=0)
+    seg_sum = torch.zeros(3, len(alphas) - 1).index_put_((c.example, c.segment), c.jump, accumulate=True)
+    done = path.resolved
+    torch.testing.assert_close(seg_sum[done], slope_jumps(path, 1)[done], atol=1e-5, rtol=1e-5)
+    assert c.exact[done[c.example, c.segment]].all() and c.jump[~c.exact].isnan().all()
