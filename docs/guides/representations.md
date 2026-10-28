@@ -59,6 +59,33 @@ sv = SP.jacobian_spectrum(model, images, "layer4", src="layer2", k=10)
 For GELU / SiLU models (ViTs, ConvNeXts) codes and Jacobians are
 approximations; `SP.is_piecewise_linear(model)` says which case applies.
 
+## Steering through the partition
+
+Along a steering path `h + α v` the rest of a piecewise-linear network is
+exactly piecewise linear in `α`: it bends where the path crosses a unit's
+boundary, and between crossings its slope is the region's Jacobian applied
+to `v`. {mod}`~innards.analysis.steering` follows such paths; for GELU / SiLU
+networks the crossings are soft (`soft=True`: units move probability between
+their pieces, see `spline.gate`).
+
+```python
+from innards.analysis import steering as St
+from innards.analysis.spline import activation_layers
+
+layers = activation_layers(model, r"layer4")                       # units after the steered layer
+path = St.steer_path(model, images, "layer3", v, torch.linspace(0, 20, 201), layers)
+path.outputs, path.slopes, path.flips, path.crossings              # exact dy/dα, flips per segment, where units switch
+jumps = St.slope_jumps(path, target=cls)                           # how much each segment's crossings change the class logit's slope
+where, size, seg = St.decisive(path, target=cls, k=3)              # the decisive crossings per example
+ids, logits, (u, w) = St.activation_slice(model, images[0], "layer3", v, v2, layers)   # partition on a plane in activation space
+deltas, values = St.spline_steer(model, images, "layer3", metrics.logit(cls), steps=20, step_size=0.5)
+```
+
+`spline_steer` re-solves its direction from the local Jacobian at every step
+(for piecewise-linear networks, the exact best direction in the current
+region), optionally inside a subspace (`basis=`, e.g. SAE atoms); apply its
+result with `run(model, x, {"layer3": St.shift(deltas[:, -1])})`.
+
 ## Causal effects
 
 ```python
