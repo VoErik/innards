@@ -70,16 +70,25 @@ their pieces, see `spline.gate`).
 
 ```python
 from innards.analysis import steering as St
-from innards.analysis.spline import activation_layers
 
-layers = activation_layers(model, r"layer4")                       # units after the steered layer
-path = St.steer_path(model, images, "layer3", v, torch.linspace(0, 20, 201), layers)
-path.outputs, path.slopes, path.flips, path.crossings              # exact dy/dα, flips per segment, where units switch
-jumps = St.slope_jumps(path, target=cls)                           # how much each segment's crossings change the class logit's slope
-where, size, seg = St.decisive(path, target=cls, k=3)              # the decisive crossings per example
-ids, logits, (u, w) = St.activation_slice(model, images[0], "layer3", v, v2, layers)   # partition on a plane in activation space
+path = St.steer_path(model, images, "layer3", v, torch.linspace(0, 20, 401), target=cls)   # all units after layer3
+path.outputs, path.slopes                                          # outputs and exact dy/dα at the grid points
+jumps = St.slope_jumps(path, target=cls)                           # how much each grid segment bends the class logit
+c = path.crossings                                                 # every crossing: example, layer, unit, α, jump, exact
+where, size, idx = St.decisive(path, k=3)                          # the crossings that bend it most, per example
+ids, logits, (u, w) = St.activation_slice(model, images[0], "layer3", v, v2, activation_layers(model, r"layer4"))  # partition on a plane
 deltas, values = St.spline_steer(model, images, "layer3", metrics.logit(cls), steps=20, step_size=0.5)
 ```
+
+Between grid points, segments are checked for a single crossing using the
+exact derivatives of every tracked pre-activation, and bisected otherwise
+(`refine=`): resolved segments give every crossing exactly, including units
+that switch on and off again, with the slope change it causes
+(`crossings.jump`; they sum to `slope_jumps`). The cost is about two path
+points per crossing. Small networks resolve whole paths; ResNet stages have
+~10^5 crossings per unit `α`, so there locate the decisive segments with
+`slope_jumps` on a fine grid first and refine only those intervals
+(`path.resolved` marks what is exact).
 
 `spline_steer` re-solves its direction from the local Jacobian at every step
 (for piecewise-linear networks, the exact best direction in the current
