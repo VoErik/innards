@@ -38,7 +38,8 @@ Other extras: `wandb`, `mlflow`, `tensorboard` (SAE training logs), `umap`,
 | `innards.analysis.geometry`, `.similarity` | dimensionality, spectra, intrinsic dimension, neural collapse; CKA, RSA, Procrustes, SVCCA, mutual kNN |
 | `innards.analysis.directions` | class means, probes, LDA, INLP |
 | `innards.analysis.causal`, `.metrics` | effects and sweeps with per-example values and bootstrap CIs, activation / attribution patching, relevant subspaces |
-| `innards.analysis.spline` | the spline view of ReLU networks: activation regions, local complexity, partitions on input slices, Jacobian spectra |
+| `innards.analysis.spline` | the spline view of ReLU networks: activation regions (hard and soft codes), local complexity, partitions on input slices, Jacobian spectra |
+| `innards.analysis.steering` | steering paths through the partition: crossings, exact slopes, slope jumps, activation-space slices, region-aware steering |
 | `innards.analysis.interp` | top examples, spatial maps, integrated gradients, logit lens, attention maps and rollout |
 | `innards.analysis.units`, `.dashboard` | what each unit (neuron, channel, direction, SAE latent) responds to over a dataset: statistics, top examples, a sparse cache, HTML dashboards |
 | `innards.analysis.plot`, `innards.style` | publication-style figures for all of the above, one matplotlib style |

@@ -22,10 +22,16 @@ its activation code, the on/off pattern of all units.
   LeCun, 2021).
 
 Smooth activations (GELU, SiLU, as in ViTs and ConvNeXts) are not piecewise
-linear and softmax attention and normalisation layers are not affine, so for
-those models codes describe where units are mostly on or off and Jacobians
-are local linearisations, not exact affine pieces (see
-:func:`is_piecewise_linear`).
+linear, but they have a probabilistic spline reading (Balestriero &
+Baraniuk, 2019): ReLU is *hard* vector quantisation (a unit picks its "on" or
+"off" affine piece), and SiLU ``x sigmoid(x)`` and GELU ``x Phi(x)`` are its
+soft version, each unit taking the "on" piece with probability
+``sigmoid(z)`` or ``Phi(z)``. :func:`codes` with ``soft=True`` returns these
+probabilities (:func:`gate`), hard codes their most likely piece. Softmax
+attention is soft quantisation as well; normalisation layers fit neither
+reading, so there Jacobians are local linearisations, not affine pieces (see
+:func:`is_piecewise_linear`). Steering paths through the partition are in
+:mod:`innards.analysis.steering`.
 
 Typical usage::
 
@@ -45,6 +51,9 @@ References:
         Always Grok and Here is Why. ICML 2024. (Local complexity.)
     Balestriero, R., Pesenti, J. & LeCun, Y. (2021). Learning in High
         Dimension Always Amounts to Extrapolation. arXiv:2110.09485.
+    Balestriero, R. & Baraniuk, R. (2019). From Hard to Soft: Understanding
+        Deep Network Nonlinearities via Vector Quantization and Statistical
+        Inference. ICLR 2019. (Soft codes.)
 """
 
 from __future__ import annotations
@@ -136,8 +145,54 @@ def is_piecewise_linear(model: Model) -> bool:
     return all(type(module.get_submodule(n)).__name__ in PIECEWISE_LINEAR for n in activation_layers(model))
 
 
+def _sigmoid_gate(beta: float = 1.0) -> Callable[[Tensor], Tensor]:
+    return lambda z: torch.sigmoid(beta * z)
+
+
+_GATES: dict[str, Callable[[nn.Module], Callable[[Tensor], Tensor]]] = {
+    "GELU": lambda m: lambda z: 0.5 * (1 + torch.erf(z / 2 ** 0.5)),
+    "GELUTanh": lambda m: lambda z: 0.5 * (1 + torch.erf(z / 2 ** 0.5)),
+    "QuickGELU": lambda m: _sigmoid_gate(1.702),
+    "SiLU": lambda m: _sigmoid_gate(),
+    "Swish": lambda m: _sigmoid_gate(),
+    "Mish": lambda m: lambda z: torch.tanh(torch.nn.functional.softplus(z)),
+    "Hardswish": lambda m: lambda z: ((z + 3) / 6).clamp(0, 1),
+    "HardSwish": lambda m: lambda z: ((z + 3) / 6).clamp(0, 1),
+    "Softplus": lambda m: _sigmoid_gate(getattr(m, "beta", 1.0)),
+    "ELU": lambda m: lambda z: torch.where(z > 0, torch.ones_like(z), torch.exp(z)),
+    "CELU": lambda m: lambda z: torch.where(z > 0, torch.ones_like(z), torch.exp(z / getattr(m, "alpha", 1.0))),
+    "SELU": lambda m: lambda z: torch.where(z > 0, torch.ones_like(z), torch.exp(z)),
+}
+
+
+def gate(module: nn.Module) -> Callable[[Tensor], Tensor]:
+    """
+    The soft code of an activation module: ``fn(pre_activation) -> P(on)`` in [0, 1].
+
+    Gated units ``x g(x)`` (SiLU, GELU, QuickGELU, Mish, Hardswish) use their
+    gate ``g`` (the posterior of the "on" piece in the soft vector
+    quantisation reading; Balestriero & Baraniuk, 2019); Softplus, the soft
+    maximum of ``0`` and ``z``, uses its derivative ``sigmoid(beta z)``; the
+    exponential units use their slope ``exp(z)`` below 0. Piecewise-linear and
+    unknown activations get the hard code ``z > 0``.
+
+    Args:
+        module: The activation module.
+
+    Returns:
+        The gate function.
+    """
+    make = _GATES.get(type(module).__name__)
+    return make(module) if make is not None else (lambda z: (z > 0).to(z.dtype))
+
+
+def _gates(model: Envoy, layers: list[str]) -> dict[str, Callable[[Tensor], Tensor]]:
+    module = unwrap(model)
+    return {n: gate(module.get_submodule(n)) for n in layers}
+
+
 def _signs(model: Envoy, batch: Any, layers: list[str], input_fn: Callable,
-           edits: dict[str, Edit] | None = None) -> dict[str, Tensor]:
+           edits: dict[str, Edit] | None = None, soft: bool = False) -> dict[str, Tensor]:
     edits = edits or {}
     order, layouts = plan(model, batch, list(dict.fromkeys([*layers, *edits])), input_fn=input_fn)
     last = max(order.index(n) for n in layers)
@@ -145,11 +200,15 @@ def _signs(model: Envoy, batch: Any, layers: list[str], input_fn: Callable,
     out: dict[str, Tensor] = {}
     with torch.no_grad(), model.trace(*args, **kwargs) as tracer:
         for name in order[: last + 1]:
-            if name in layers:
-                out[name] = (model.get(name).input > 0).save()  # read before in-place activations overwrite it
+            if name in layers:  # read before in-place activations overwrite it
+                pre = model.get(name).input
+                out[name] = (pre.clone() if soft else pre > 0).save()
             if name in edits:
                 edit_output(model.get(name), edits[name], layouts[name])
         tracer.stop()
+    if soft:
+        gates = _gates(model, layers)
+        return {n: gates[n](to_tokens(out[n], layouts[n]).float()) for n in layers}
     return {n: to_tokens(out[n], layouts[n]) for n in layers}
 
 
@@ -160,13 +219,17 @@ def codes(
     edits: dict[str, Edit] | None = None,
     input_fn: Callable[[Any], tuple[tuple, dict]] = default_input_fn,
     device: torch.device | str | None = None,
+    soft: bool = False,
 ) -> dict[str, Tensor]:
     """
     Activation codes: which units are on (pre-activation > 0), per input.
 
     With ``edits`` the codes are those of the edited model, e.g. under
     steering: ``hamming(codes(m, x, L), codes(m, x, L, edits={...}))`` is the
-    fraction of downstream units an intervention switches.
+    fraction of downstream units an intervention switches. With ``soft`` the
+    codes are the probabilities of the "on" piece (:func:`gate`), e.g. for
+    GELU networks; ``(c_a - c_b).abs().sum(-1)`` is then the probability mass
+    moved between pieces.
 
     Args:
         model: An nnsight model or a plain module.
@@ -175,16 +238,17 @@ def codes(
         edits: Optional edits (see :mod:`innards.edits`) applied while reading.
         input_fn: Maps a batch to model ``(args, kwargs)``.
         device: Device the batches are moved to; defaults to the model's.
+        soft: Soft codes in [0, 1] instead of booleans.
 
     Returns:
-        Layer name -> boolean codes ``(n, tokens, units)`` (one token per
-        spatial position for feature maps).
+        Layer name -> boolean (or float) codes ``(n, tokens, units)`` (one
+        token per spatial position for feature maps).
     """
     model, layers = wrap(model), _as_list(layers)
     device = device if device is not None else next(unwrap(model).parameters()).device
     parts: dict[str, list[Tensor]] = {n: [] for n in layers}
     for batch in batches:
-        for n, c in _signs(model, to_device(batch, device), layers, input_fn, edits).items():
+        for n, c in _signs(model, to_device(batch, device), layers, input_fn, edits, soft).items():
             parts[n].append(c.cpu())
     return {n: torch.cat(p) for n, p in parts.items()}
 

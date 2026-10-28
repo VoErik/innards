@@ -8,7 +8,11 @@ Analysis of representations: geometry, causality and interpretation.
 * :mod:`innards.analysis.directions`: finding directions (class means, probes,
   LDA, INLP).
 * :mod:`innards.analysis.spline`: the partition of input space into regions
-  and the local affine maps (spline theory of deep networks).
+  and the local affine maps (spline theory of deep networks), hard and soft
+  activation codes.
+* :mod:`innards.analysis.steering`: the partition along steering paths in
+  activation space: crossings, exact slopes, activation-space slices and
+  region-aware steering.
 * :mod:`innards.analysis.causal`: effects of interventions, activation and
   attribution patching, causally relevant directions.
 * :mod:`innards.analysis.metrics`: targets and comparisons for the causal tools.
@@ -35,5 +39,6 @@ from . import (
     metrics,
     similarity,
     spline,
+    steering,
     units
 )

@@ -22,6 +22,7 @@ analysis_geometry
 analysis_similarity
 analysis_directions
 analysis_spline
+analysis_steering
 analysis_causal
 analysis_metrics
 analysis_interp
